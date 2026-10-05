@@ -5,7 +5,7 @@ import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import com.alsekretary.app.domain.LifeArea
 
-class SecretaryDatabase(context: Context) : SQLiteOpenHelper(context, "alsekretary.db", null, 6) {
+class SecretaryDatabase(context: Context) : SQLiteOpenHelper(context, "alsekretary.db", null, 7) {
     override fun onCreate(db: SQLiteDatabase) {
         createV1Tables(db)
         createV2Tables(db)
@@ -14,6 +14,7 @@ class SecretaryDatabase(context: Context) : SQLiteOpenHelper(context, "alsekreta
         createV4Tables(db)
         createV5Tables(db)
         createV6Tables(db)
+        createV7Tables(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -22,6 +23,7 @@ class SecretaryDatabase(context: Context) : SQLiteOpenHelper(context, "alsekreta
         if (oldVersion < 4) createV4Tables(db)
         if (oldVersion < 5) createV5Tables(db)
         if (oldVersion < 6) createV6Tables(db)
+        if (oldVersion < 7) createV7Tables(db)
     }
 
     private fun createV1Tables(db: SQLiteDatabase) {
@@ -197,6 +199,12 @@ class SecretaryDatabase(context: Context) : SQLiteOpenHelper(context, "alsekreta
     private fun createV6Tables(db: SQLiteDatabase) {
         db.execSQL("CREATE TABLE assistant_messages(id TEXT PRIMARY KEY,role TEXT NOT NULL CHECK(role IN ('USER','ASSISTANT')),content TEXT NOT NULL,created_at INTEGER NOT NULL)")
         db.execSQL("CREATE TABLE assistant_actions(id TEXT PRIMARY KEY,payload TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('PENDING','DONE','CANCELLED')),created_at INTEGER NOT NULL,executed_at INTEGER,result TEXT)")
+    }
+
+    private fun createV7Tables(db: SQLiteDatabase) {
+        db.execSQL("ALTER TABLE goals ADD COLUMN horizon TEXT NOT NULL DEFAULT 'YEAR' CHECK(horizon IN ('LIFETIME','TEN_YEARS','YEAR','MONTH','WEEK','DAY'))")
+        db.execSQL("ALTER TABLE goals ADD COLUMN parent_goal_id TEXT")
+        db.execSQL("CREATE INDEX idx_goal_parent ON goals(parent_goal_id)")
     }
 
     private fun seedAreas(db: SQLiteDatabase) {

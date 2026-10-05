@@ -38,7 +38,7 @@ class AndroidStorageTest {
         return Uri.fromFile(f)
     }
     @Test fun freshDatabaseHasOnlyAreasAndUnknownRecovery() {
-        assertEquals(6, db.readableDatabase.version)
+        assertEquals(7, db.readableDatabase.version)
         db.readableDatabase.rawQuery("SELECT COUNT(*) FROM areas", null).use { assertTrue(it.moveToFirst()); assertEquals(4, it.getInt(0)) }
         assertTrue(repo.listTodayTasks(true).isEmpty())
         assertTrue(repo.listGoals(true).isEmpty())
@@ -140,6 +140,6 @@ class AndroidStorageTest {
         db = SecretaryDatabase(context); repo = SecretaryRepository(db)
         assertEquals("saved", repo.taskById("legacy")!!.title)
         assertEquals(123L, repo.listGoals(true).single().startedAt)
-        assertEquals(6, db.readableDatabase.version)
+        assertEquals(7, db.readableDatabase.version)
     }
 }

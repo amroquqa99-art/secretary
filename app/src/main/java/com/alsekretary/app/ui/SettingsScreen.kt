@@ -29,6 +29,6 @@ fun SettingsScreen(state: MainUiState,vm: MainViewModel) {
         }}
         item{GlassCard{Text("مواقع مشتتة أثناء الالتزام",style=MaterialTheme.typography.titleLarge);OutlinedTextField(domains,{domains=it},label={Text("نطاق واحد في كل سطر")},modifier=Modifier.fillMaxWidth());Button(onClick={vm.setBlockedDomains(domains)}){Text("حفظ المواقع")};Text("يعمل بمرشح DNS محلي أثناء جلسة صارمة. يحتاج إذن VPN؛ Secure DNS في المتصفح أو VPN آخر قد يتجاوز الحجب.")}}
         item{GlassCard{Text("الخصوصية",style=MaterialTheme.typography.titleLarge);Text("بيانات الحياة والملاحظات محلية. رموز الدخول مشفرة بمفتاح الجهاز. لا يرسل التعاون محتوى الملاحظات أو المهام تلقائياً.")}}
-        item{GlassCard{Text("وضع التشغيل");Text("المرحلة الثالثة: تطبيق محلي مع تعاون اختياري. أضيف أساس الأوامر المحلية. الصوت والنماذج المحلية ما زالا قيد التنفيذ.");Text("إصدار 0.4.0 • قاعدة بيانات v6")}}
+        item{GlassCard{Text("وضع التشغيل");Text("المرحلة الثالثة: تطبيق محلي مع تعاون اختياري. أضيف هرم الأهداف والمراجعة وخطة الأسبوع والصوت داخل الشاشة عند توفر الحزم المحلية. النموذج العصبي وكلمة التنبيه ما زالا قيد التنفيذ.");Text("إصدار 0.5.0 • قاعدة بيانات v7")}}
     }
 }

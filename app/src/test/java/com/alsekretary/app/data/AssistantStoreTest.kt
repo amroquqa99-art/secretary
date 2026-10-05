@@ -43,7 +43,7 @@ class AssistantStoreTest {
         val buffer=java.io.ByteArrayOutputStream()
         java.util.zip.ZipInputStream(java.io.ByteArrayInputStream(plain)).use{input->java.util.zip.ZipOutputStream(buffer).use{out->
             while(true){val entry=input.nextEntry ?: break;var bytes=input.readBytes()
-                if(entry.name=="database.json"){val j=org.json.JSONObject(String(bytes,Charsets.UTF_8));j.put("schema",5);j.getJSONObject("tables").remove("assistant_messages");j.getJSONObject("tables").remove("assistant_actions");bytes=j.toString().toByteArray(Charsets.UTF_8)}
+                if(entry.name=="database.json"){val j=org.json.JSONObject(String(bytes,Charsets.UTF_8));j.put("schema",5);val goals=j.getJSONObject("tables").getJSONArray("goals");for(i in 0 until goals.length()){goals.getJSONObject(i).remove("horizon");goals.getJSONObject(i).remove("parent_goal_id")};j.getJSONObject("tables").remove("assistant_messages");j.getJSONObject("tables").remove("assistant_actions");bytes=j.toString().toByteArray(Charsets.UTF_8)}
                 out.putNextEntry(java.util.zip.ZipEntry(entry.name));out.write(bytes);out.closeEntry()
             }
         }}
@@ -58,6 +58,6 @@ class AssistantStoreTest {
             old.execSQL("INSERT INTO tasks(id,title,status,created_at,updated_at) VALUES('old','kept','INBOX',123,123)");old.version=5
         }
         db=SecretaryDatabase(context);store=AssistantStore(db);repo=SecretaryRepository(db)
-        assertEquals("kept",repo.taskById("old")!!.title);assertEquals(6,db.readableDatabase.version);assertTrue(store.messages().isEmpty())
+        assertEquals("kept",repo.taskById("old")!!.title);assertEquals(7,db.readableDatabase.version);assertTrue(store.messages().isEmpty())
     }
 }

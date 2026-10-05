@@ -49,7 +49,7 @@ object LocalAssistant {
             val hits = tasks.filter { normalize(it.title).contains(query) }.take(10).map { "مهمة: ${it.title} [${it.id}]" } + notes.filter { normalize(it.title+" "+it.markdown).contains(query) }.take(10).map { "ملاحظة: ${it.title} [${it.id}]" }
             return AssistantReply(if(hits.isEmpty()) "لا توجد نتائج محلية لهذا البحث." else hits.joinToString("\n"))
         }
-        return AssistantReply("الأوامر المحلية المتاحة:\n• أضف مهمة عنوان المهمة\n• أكمل مهمة العنوان الكامل\n• ابدأ تركيز العنوان الكامل\n• احفظ ملاحظة العنوان | المحتوى\n• خطط يومي\n• ما مهامي\n• ابحث كلمة\nالردود الحالية تعمل بقواعد محلية؛ نموذج المحادثة المحلي لم يدمج بعد.")
+        return AssistantReply("الأوامر المحلية المتاحة:\n• أضف مهمة عنوان المهمة\n• أكمل مهمة العنوان الكامل\n• ابدأ تركيز العنوان الكامل\n• احفظ ملاحظة العنوان | المحتوى\n• خطط يومي / خطط أسبوعي\n• راجع حياتي / راجع أهدافي\n• ما مهامي\n• ابحث كلمة\nالردود الحالية تعمل بقواعد محلية؛ نموذج المحادثة المحلي لم يدمج بعد.")
     }
     private fun plan(tasks: List<Task>, budget: Int): String {
         require(budget in 1..1440) { "ميزانية اليوم من 1 إلى 1440 دقيقة" }

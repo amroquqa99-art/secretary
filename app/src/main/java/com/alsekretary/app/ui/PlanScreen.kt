@@ -51,7 +51,7 @@ fun PlanScreen(
         Box(Modifier.weight(1f)) {
             when (section) {
                 PlanSection.CALENDAR -> CalendarPanel(state.calendarEntries, onSaveCalendar, onDeleteCalendar)
-                PlanSection.GOALS -> GoalsPanel(state.goals, onSaveGoal, onCancelGoal)
+                PlanSection.GOALS -> GoalsPanel(state.goalHierarchy, onSaveGoal, onCancelGoal)
                 PlanSection.PROJECTS -> ProjectsPanel(state.projects, state.goals, onSaveProject, onArchiveProject)
             }
         }
@@ -232,22 +232,24 @@ private fun CalendarEntryDialog(initialDate: LocalDate, initial: CalendarEntry?,
 private fun GoalsPanel(goals: List<Goal>, onSave: (Goal) -> Unit, onCancel: (String) -> Unit) {
     var editing by remember { mutableStateOf<Goal?>(null) }
     var create by remember { mutableStateOf(false) }
+    val visible=goals.filter { it.status!=GoalStatus.CANCELLED }
     androidx.compose.foundation.lazy.LazyColumn(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(10.dp), contentPadding = PaddingValues(bottom = 24.dp)) {
         item { Row(verticalAlignment = Alignment.CenterVertically) { SectionLabel("أهداف SMART"); Spacer(Modifier.weight(1f)); FilledTonalButton(onClick = { create = true }) { Icon(Icons.Default.Add, null); Text("هدف") } } }
-        if (goals.isEmpty()) item { GlassCard { Text("لا توجد أهداف بعد.") } }
-        items(goals.size) { i -> GoalCard(goals[i], onClick = { editing = goals[i] }) }
+        if (visible.isEmpty()) item { GlassCard { Text("لا توجد أهداف بعد.") } }
+        items(visible.size) { i -> GoalCard(visible[i], goals, onClick = { editing = visible[i] }) }
     }
-    if (create) GoalDialog(null, { create = false }, { onSave(it); create = false })
-    editing?.let { goal -> GoalDialog(goal, { editing = null }, { onSave(it); editing = null }, { onCancel(goal.id); editing = null }) }
+    if (create) GoalDialog(null, goals, { create = false }, { onSave(it); create = false })
+    editing?.let { goal -> GoalDialog(goal, goals, { editing = null }, { onSave(it); editing = null }, { onCancel(goal.id); editing = null }) }
 }
 
 @Composable
-private fun GoalCard(goal: Goal, onClick: () -> Unit) {
+private fun GoalCard(goal: Goal, goals: List<Goal>, onClick: () -> Unit) {
     val validation = SmartGoalValidator.validate(goal)
     val ratio = if ((goal.targetValue ?: 0.0) <= 0) 0f else ((goal.currentValue ?: 0.0) / goal.targetValue!!).toFloat().coerceIn(0f,1f)
     Card(onClick = onClick, colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), shape = RoundedCornerShape(22.dp)) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
             Row { Text(goal.title, Modifier.weight(1f), fontWeight = FontWeight.Bold); AssistChip(onClick={}, label={Text("SMART ${validation.score}/5")}) }
+            Text(GoalHierarchy.lineage(goal, goals).joinToString(" ← ") { "${it.horizon.label}: ${it.title}${if(it.status==GoalStatus.CANCELLED) " (ملغى)" else ""}" },fontSize=12.sp)
             LinearProgressIndicator(progress = { ratio }, modifier = Modifier.fillMaxWidth())
             Text("${(ratio*100).toInt()}% • ${goal.area.arabicName} • ${goal.deadlineEpochMillis?.let(::formatDate) ?: "بدون موعد"}", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 12.sp)
         }
@@ -255,7 +257,7 @@ private fun GoalCard(goal: Goal, onClick: () -> Unit) {
 }
 
 @Composable
-private fun GoalDialog(initial: Goal?, onDismiss: () -> Unit, onSave: (Goal) -> Unit, onCancel: (() -> Unit)? = null) {
+private fun GoalDialog(initial: Goal?, goals: List<Goal>, onDismiss: () -> Unit, onSave: (Goal) -> Unit, onCancel: (() -> Unit)? = null) {
     var title by remember(initial) { mutableStateOf(initial?.title.orEmpty()) }
     var area by remember(initial) { mutableStateOf(initial?.area ?: LifeArea.MENTAL) }
     var specific by remember(initial) { mutableStateOf(initial?.specific.orEmpty()) }
@@ -266,13 +268,27 @@ private fun GoalDialog(initial: Goal?, onDismiss: () -> Unit, onSave: (Goal) -> 
     var deadline by remember(initial) { mutableStateOf(initial?.deadlineEpochMillis?.let(::formatDate).orEmpty()) }
     var relevant by remember(initial) { mutableStateOf(initial?.relevantReason.orEmpty()) }
     var achievable by remember(initial) { mutableStateOf(initial?.achievableNote.orEmpty()) }
-    val candidate = Goal(initial?.id ?: "preview", title, area, specific, metric, target.toDoubleOrNull(), current.toDoubleOrNull(), unit.ifBlank{null}, parseDateStart(deadline), relevant, achievable, initial?.status ?: GoalStatus.ACTIVE)
+    var horizon by remember(initial) { mutableStateOf(initial?.horizon ?: GoalHorizon.YEAR) }
+    var parentGoalId by remember(initial) { mutableStateOf(initial?.parentGoalId) }
+    val parents=goals.filter { it.id!=initial?.id && it.area==area && it.horizon.ordinal<horizon.ordinal && it.status!=GoalStatus.CANCELLED }
+    val candidate = Goal(initial?.id ?: "preview", title, area, specific, metric, target.toDoubleOrNull(), current.toDoubleOrNull(), unit.ifBlank{null}, parseDateStart(deadline), relevant, achievable, initial?.status ?: GoalStatus.ACTIVE, initial?.startedAt, horizon, parentGoalId)
+    val hierarchyError=runCatching { GoalHierarchy.validate(goals.filterNot { it.id==candidate.id } + candidate) }.exceptionOrNull()?.message
     val validation = SmartGoalValidator.validate(candidate)
 
     AlertDialog(onDismissRequest = onDismiss, title = { Text(if(initial==null) "هدف SMART جديد" else "تعديل الهدف") }, text = {
         Column(Modifier.heightIn(max=560.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             OutlinedTextField(title,{title=it},label={Text("الهدف")},modifier=Modifier.fillMaxWidth())
             Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(5.dp)) { LifeArea.entries.forEach { a -> FilterChip(selected=area==a,onClick={area=a},label={Text(a.arabicName)}) } }
+            Text("أفق الهدف")
+            Row(Modifier.horizontalScroll(rememberScrollState()),horizontalArrangement=Arrangement.spacedBy(5.dp)) { GoalHorizon.entries.forEach { h -> FilterChip(selected=horizon==h,onClick={horizon=h;parentGoalId=null},label={Text(h.label)}) } }
+            Text("الهدف الأعلى — اختياري")
+            Row(Modifier.horizontalScroll(rememberScrollState()),horizontalArrangement=Arrangement.spacedBy(5.dp)) {
+                FilterChip(selected=parentGoalId==null,onClick={parentGoalId=null},label={Text("مستقل")})
+                parents.forEach { p -> FilterChip(selected=parentGoalId==p.id,onClick={parentGoalId=p.id},label={Text(p.title)}) }
+            }
+            goals.firstOrNull { it.id==parentGoalId && it.status==GoalStatus.CANCELLED }?.let { Text("الهدف الأعلى ملغى: ${it.title}. يمكنك فك الارتباط أو اختيار هدف آخر.",color=MaterialTheme.colorScheme.error) }
+            hierarchyError?.let { Text(it,color=MaterialTheme.colorScheme.error) }
+            Text("الربط يوضح الغرض؛ تقدم الأب يقاس بمقياسه الخاص ولا يجمع وحدات الأبناء.",fontSize=12.sp)
             OutlinedTextField(specific,{specific=it},label={Text("Specific — النتيجة المحددة")},modifier=Modifier.fillMaxWidth())
             OutlinedTextField(metric,{metric=it},label={Text("مقياس التقدم")},modifier=Modifier.fillMaxWidth())
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -287,7 +303,7 @@ private fun GoalDialog(initial: Goal?, onDismiss: () -> Unit, onSave: (Goal) -> 
             listOf(validation.specific, validation.measurable, validation.achievable, validation.relevant, validation.timeBound).forEach { Text((if(it.ok) "✓ " else "• ") + it.reason, fontSize=12.sp, color=MaterialTheme.colorScheme.onSurfaceVariant) }
             if(onCancel != null) TextButton(onClick=onCancel){Text("إلغاء الهدف")}
         }
-    }, confirmButton = { Button(onClick = { onSave(candidate.copy(id = initial?.id ?: UUID.randomUUID().toString())) }, enabled = title.isNotBlank()) { Text("حفظ") } }, dismissButton = { TextButton(onClick=onDismiss){Text("رجوع")} })
+    }, confirmButton = { Button(onClick = { onSave(candidate.copy(id = initial?.id ?: UUID.randomUUID().toString())) }, enabled = title.isNotBlank() && title.length<=300 && hierarchyError==null) { Text("حفظ") } }, dismissButton = { TextButton(onClick=onDismiss){Text("رجوع")} })
 }
 
 @Composable

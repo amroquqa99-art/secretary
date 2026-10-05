@@ -186,16 +186,29 @@ class SecretaryRepository(private val db: SecretaryDatabase) {
     fun listGoals(includeCancelled: Boolean = false): List<Goal> {
         val where = if (includeCancelled) "" else "WHERE status!='CANCELLED'"
         return db.readableDatabase.rawQuery(
-            "SELECT id,title,area_code,specific,metric_name,target_value,current_value,unit,deadline,relevant_reason,achievable_note,status,started_at FROM goals $where ORDER BY updated_at DESC",
+            "SELECT id,title,area_code,specific,metric_name,target_value,current_value,unit,deadline,relevant_reason,achievable_note,status,started_at,horizon,parent_goal_id FROM goals $where ORDER BY updated_at DESC",
             null
         ).use { c -> generateSequence { if (c.moveToNext()) c else null }.map(::rowToGoal).toList() }
     }
 
     fun saveGoal(goal: Goal) {
+        require(goal.title.isNotBlank() && goal.title.length <= 300) { "عنوان الهدف من 1 إلى 300 حرف" }
+        require(listOfNotNull(goal.targetValue,goal.currentValue).all { it.isFinite() }) { "قيمة الهدف غير صالحة" }
+        val all=listGoals(true)
+        GoalHierarchy.validate(all.filterNot { it.id == goal.id } + goal)
+        if(goal.parentGoalId!=all.firstOrNull { it.id==goal.id }?.parentGoalId && goal.parentGoalId!=null) {
+            require(all.any { it.id==goal.parentGoalId && it.status!=GoalStatus.CANCELLED }) { "لا تربط هدفاً جديداً بهدف ملغى" }
+        }
+        val database=db.writableDatabase;database.beginTransaction()
+        try { saveGoalInsideTransaction(goal);database.setTransactionSuccessful() } finally {database.endTransaction()}
+    }
+
+    private fun saveGoalInsideTransaction(goal: Goal) {
         val now = System.currentTimeMillis()
         val prior = listGoals(true).firstOrNull{it.id==goal.id}
         val existing = prior != null
         val values = ContentValues().apply {
+            put("horizon",goal.horizon.name);putNullable("parent_goal_id",goal.parentGoalId)
             put("id", goal.id); put("title", goal.title); put("area_code", goal.area.name); put("specific", goal.specific)
             put("metric_name", goal.metricName); putNullable("target_value", goal.targetValue); putNullable("current_value", goal.currentValue)
             putNullable("unit", goal.unit); putNullable("deadline", goal.deadlineEpochMillis); put("relevant_reason", goal.relevantReason)
@@ -256,8 +269,8 @@ class SecretaryRepository(private val db: SecretaryDatabase) {
     // Calendar --------------------------------------------------------------
     fun listCalendarEntries(from: Long, to: Long): List<CalendarEntry> {
         val events = db.readableDatabase.rawQuery(
-            "SELECT id,title,type,start_at,end_at,all_day,linked_entity_type,linked_entity_id,notes FROM calendar_events WHERE start_at>=? AND start_at<? ORDER BY start_at ASC",
-            arrayOf(from.toString(), to.toString())
+            "SELECT id,title,type,start_at,end_at,all_day,linked_entity_type,linked_entity_id,notes FROM calendar_events WHERE start_at<? AND COALESCE(end_at,start_at+1800000)>? ORDER BY start_at ASC",
+            arrayOf(to.toString(), from.toString())
         ).use { c -> generateSequence { if (c.moveToNext()) c else null }.map(::rowToCalendar).toMutableList() }
 
         db.readableDatabase.rawQuery(
@@ -477,7 +490,7 @@ class SecretaryRepository(private val db: SecretaryDatabase) {
     private fun rowToGoal(c: Cursor) = Goal(
         id=c.getString(0), title=c.getString(1), area=LifeArea.valueOf(c.getString(2)), specific=c.getString(3), metricName=c.getString(4),
         targetValue=c.getDoubleOrNull(5), currentValue=c.getDoubleOrNull(6), unit=c.getStringOrNull(7), deadlineEpochMillis=c.getLongOrNull(8),
-        relevantReason=c.getString(9), achievableNote=c.getString(10), status=GoalStatus.valueOf(c.getString(11)), startedAt=c.getLongOrNull(12)
+        relevantReason=c.getString(9), achievableNote=c.getString(10), status=GoalStatus.valueOf(c.getString(11)), startedAt=c.getLongOrNull(12), horizon=GoalHorizon.valueOf(c.getString(13)), parentGoalId=c.getStringOrNull(14)
     )
 
     private fun rowToProject(c: Cursor) = Project(

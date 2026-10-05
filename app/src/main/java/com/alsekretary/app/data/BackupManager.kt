@@ -28,7 +28,7 @@ class BackupManager(private val context: Context,private val db: SecretaryDataba
         context.contentResolver.openOutputStream(uri,"wt")!!.use{it.write(bytes)}
     }
     fun pack(password: CharArray): ByteArray {
-        val payload=JSONObject().put("schema",6);val data=JSONObject()
+        val payload=JSONObject().put("schema",7);val data=JSONObject()
         val database=db.readableDatabase;database.beginTransaction()
         try {
             tables.forEach{table->val rows=JSONArray();database.rawQuery("SELECT * FROM $table",null).use { c ->
@@ -58,9 +58,13 @@ class BackupManager(private val context: Context,private val db: SecretaryDataba
             require(entry.name=="database.json" || (entry.name.startsWith("attachments/") && entry.name.removePrefix("attachments/").matches(Regex("[A-Za-z0-9_-]{1,100}")))){"مسار مرفق غير صالح"}
             require(entry.name !in entries){"عنصر مكرر"};val bytes=bounded(zip,80*1024*1024);total+=bytes.size;require(total<=100*1024*1024);entries[entry.name]=bytes
         }}
-        val payload=JSONObject(String(entries["database.json"] ?: error("بيانات النسخة غير موجودة"),Charsets.UTF_8));require(payload.getInt("schema") in 5..6){"نسخة قاعدة غير مدعومة"}
+        val payload=JSONObject(String(entries["database.json"] ?: error("بيانات النسخة غير موجودة"),Charsets.UTF_8));require(payload.getInt("schema") in 5..7){"نسخة قاعدة غير مدعومة"}
         val data=payload.getJSONObject("tables")
         if(payload.getInt("schema")==5){require(!data.has("assistant_messages") && !data.has("assistant_actions"));data.put("assistant_messages",JSONArray());data.put("assistant_actions",JSONArray())}
+        if(payload.getInt("schema")<7) {
+            val goals=data.getJSONArray("goals")
+            for(i in 0 until goals.length()) { val g=goals.getJSONObject(i);require(!g.has("horizon") && !g.has("parent_goal_id"));g.put("horizon","YEAR");g.put("parent_goal_id",JSONObject.NULL) }
+        }
         require(data.keys().asSequence().toSet()==tables.toSet())
         // Keep an encrypted rollback copy; credentials and social state are not replaced.
         val prior=File(context.filesDir,"backups").apply{mkdirs()}
@@ -93,7 +97,8 @@ class BackupManager(private val context: Context,private val db: SecretaryDataba
             }
             val repo=SecretaryRepository(db);val tasks=repo.listTodayTasks(true)
             TaskPlanning.validateGraph(tasks.map{it.id}.toSet(),repo.planningDependencies())
-            require(repo.listGoals(true).all{it.targetValue==null || it.targetValue.isFinite()})
+            require(repo.listGoals(true).all{listOfNotNull(it.targetValue,it.currentValue).all(Double::isFinite)})
+            GoalHierarchy.validate(repo.listGoals(true))
             require(repo.activeFocus()==null){"النسخة تحتوي جلسة نشطة؛ أنهها قبل إنشاء النسخة"}
             AssistantStore(db).validateStoredActions() // Reject unknown tool payloads before committing.
             database.execSQL("UPDATE assistant_actions SET status='CANCELLED' WHERE status='PENDING'")

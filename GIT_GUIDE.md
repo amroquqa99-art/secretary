@@ -6,6 +6,7 @@
 
 - `release/v0.3.0`: مصدر المرحلة الثالثة قبل إضافة السكرتير المحلي.
 - `release/v0.4.0`: السكرتير المحلي بقواعد واضحة وذاكرة وبوابة تأكيد؛ 48 اختبار Android ناجحاً.
+- `release/v0.5.0`: هرم الأهداف، المراجعة وخطة الأسبوع والصوت المحلي داخل الشاشة.
 - `main`: أحدث تطوير. نقاط الرجوع فروع ثابتة؛ ليست Git tags.
 
 للتطوير:
@@ -36,7 +37,7 @@ python checks/verify_v4.py
 python checks/verify_v5.py
 ```
 
-APK الناتج: `app/build/outputs/apk/debug/app-debug.apk`. اقرأ README وRELEASE_0_4_0 وFINAL_RELEASE_ROADMAP للتفاصيل وحدود الاختبارات.
+APK الناتج: `app/build/outputs/apk/debug/app-debug.apk`. اقرأ README وRELEASE_0_5_0 وFINAL_RELEASE_ROADMAP للتفاصيل وحدود الاختبارات.
 
 ## استرجاع بياناتك الشخصية
 

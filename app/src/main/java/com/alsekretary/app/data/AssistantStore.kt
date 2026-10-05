@@ -13,10 +13,21 @@ class AssistantStore(private val db: SecretaryDatabase) {
     private fun decode(payload: String): AssistantCall { val j=JSONObject(payload);return AssistantCall(AssistantTool.valueOf(j.getString("tool")),j.getString("title"),j.getString("target"),j.getString("body"),j.getString("expected")) }
     private fun message(role: String,text: String) { db.writableDatabase.insertOrThrow("assistant_messages",null,ContentValues().apply { put("id",UUID.randomUUID().toString());put("role",role);put("content",text);put("created_at",System.currentTimeMillis()) }) }
     fun submit(input: String,budget: Int = 120): AssistantReply {
+        require(input.isNotBlank() && input.length<=2000) { "اكتب أمراً من 1 إلى 2000 حرف" }
         val tasks=repo.listTodayTasks(true)
         val edges=repo.planningDependencies()
         val ready=tasks.filter { TaskPlanning.unmet(it.id,tasks,edges).isEmpty() }
-        val reply=LocalAssistant.respond(input,if(LocalAssistant.normalize(input) in setOf("خطط يومي","خطط اليوم","plan today"))ready else tasks,repo.listNotes(),budget)
+        val now=System.currentTimeMillis();val zone=java.time.ZoneId.systemDefault()
+        val command=LocalAssistant.normalize(input)
+        val reply=when(command) {
+            "خطط اسبوعي", "خطط الاسبوع", "plan week" -> {
+                val from=java.time.Instant.ofEpochMilli(now).atZone(zone).toLocalDate().atStartOfDay(zone).toInstant().toEpochMilli()
+                val to=java.time.Instant.ofEpochMilli(now).atZone(zone).toLocalDate().plusDays(7).atStartOfDay(zone).toInstant().toEpochMilli()
+                AssistantReply(AssistantPlanning.render(AssistantPlanning.week(tasks,edges,repo.listCalendarEntries(from,to),budget,now,zone),budget,zone))
+            }
+            "راجع حياتي", "راجع اهدافي", "سياقي", "review life", "review goals", "my context" -> AssistantReply(AssistantLifeReview.render(AssistantLifeContext(repo.listGoals(true),repo.listProjects(true),tasks,repo.listProjectItems(),repo.listDailyChecks()),now,zone))
+            else -> LocalAssistant.respond(input,if(LocalAssistant.normalize(input) in setOf("خطط يومي","خطط اليوم","plan today"))ready else tasks,repo.listNotes(),budget)
+        }
         val d=db.writableDatabase;d.beginTransaction()
         try {
             message("USER",input.trim());message("ASSISTANT",reply.text)

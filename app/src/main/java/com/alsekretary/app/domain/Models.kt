@@ -7,6 +7,7 @@ enum class LifeArea(val arabicName: String) {
     SPIRITUAL("الروحي")
 }
 
+enum class GoalHorizon(val label: String) { LIFETIME("العمر"), TEN_YEARS("10 سنوات"), YEAR("سنة"), MONTH("شهر"), WEEK("أسبوع"), DAY("يوم") }
 enum class GoalStatus { DRAFT, ACTIVE, PAUSED, COMPLETED, CANCELLED }
 enum class ProjectStatus { IDEA, PLANNED, ACTIVE, WAITING, BLOCKED, PAUSED, AT_RISK, COMPLETED, CANCELLED, ARCHIVED }
 enum class TaskStatus { INBOX, PLANNED, ACTIVE, BLOCKED, DONE, DROPPED }
@@ -28,7 +29,9 @@ data class Goal(
     val relevantReason: String,
     val achievableNote: String,
     val status: GoalStatus = GoalStatus.ACTIVE,
-    val startedAt: Long? = null
+    val startedAt: Long? = null,
+    val horizon: GoalHorizon = GoalHorizon.YEAR,
+    val parentGoalId: String? = null
 )
 
 data class Project(
