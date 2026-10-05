@@ -12,7 +12,8 @@ class AssistantStore(private val db: SecretaryDatabase) {
     private fun encode(call: AssistantCall) = JSONObject().put("tool",call.tool.name).put("title",call.title).put("target",call.targetId).put("body",call.body).put("expected",call.expected).toString()
     private fun decode(payload: String): AssistantCall { val j=JSONObject(payload);return AssistantCall(AssistantTool.valueOf(j.getString("tool")),j.getString("title"),j.getString("target"),j.getString("body"),j.getString("expected")) }
     private fun message(role: String,text: String) { db.writableDatabase.insertOrThrow("assistant_messages",null,ContentValues().apply { put("id",UUID.randomUUID().toString());put("role",role);put("content",text);put("created_at",System.currentTimeMillis()) }) }
-    fun submit(input: String,budget: Int = 120): AssistantReply {
+    fun submit(input: String,budget: Int = 120): AssistantReply = rememberReply(input,evaluate(input,budget))
+    fun evaluate(input: String,budget: Int = 120): AssistantReply {
         require(input.isNotBlank() && input.length<=2000) { "اكتب أمراً من 1 إلى 2000 حرف" }
         val tasks=repo.listTodayTasks(true)
         val edges=repo.planningDependencies()
@@ -28,6 +29,10 @@ class AssistantStore(private val db: SecretaryDatabase) {
             "راجع حياتي", "راجع اهدافي", "سياقي", "review life", "review goals", "my context" -> AssistantReply(AssistantLifeReview.render(AssistantLifeContext(repo.listGoals(true),repo.listProjects(true),tasks,repo.listProjectItems(),repo.listDailyChecks()),now,zone))
             else -> LocalAssistant.respond(input,if(LocalAssistant.normalize(input) in setOf("خطط يومي","خطط اليوم","plan today"))ready else tasks,repo.listNotes(),budget)
         }
+        return reply
+    }
+    fun rememberReply(input: String,reply: AssistantReply): AssistantReply {
+        require(input.isNotBlank() && input.length<=2000)
         val d=db.writableDatabase;d.beginTransaction()
         try {
             message("USER",input.trim());message("ASSISTANT",reply.text)
