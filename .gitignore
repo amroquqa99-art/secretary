@@ -1,0 +1,26 @@
+# Generated Android/Gradle files
+.gradle/
+.gradle-dist/
+.kotlin/
+**/build/
+local.properties
+.idea/
+*.iml
+# Local secrets and signing material
+.env
+.env.*
+!.env.example
+*.jks
+*.keystore
+*.p12
+*.pem
+# Personal/runtime data and generated packages
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.apk
+*.aab
+__pycache__/
+*.pyc
+.venv/
