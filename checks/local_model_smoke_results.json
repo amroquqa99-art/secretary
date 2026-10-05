@@ -1,0 +1,28 @@
+{
+  "model": "Qwen3-0.6B_dynamic_wi4b32_afp32.litertlm",
+  "model_sha256": "03e7da1eb1108b50dffaa9bb52cc7bcbad2eb0c66ca990267f480c1e545d2856",
+  "runtime": "LiteRT-LM JVM 0.17.1",
+  "host": "Linux x86_64, JDK 21.0.12.1; not an Android phone",
+  "backend": "CPU",
+  "threads": 2,
+  "context_tokens": 2048,
+  "max_output_tokens": 128,
+  "automatic_tool_calling": false,
+  "tool_smoke": {
+    "load_ms": 4055,
+    "request": "Please propose a task titled Read chapter one.",
+    "output_tool": "create_task",
+    "output_arguments": {"title": "Read chapter one"},
+    "response_ms": 2769,
+    "automatic_executions": 0,
+    "process_peak_rss_kb": 2226012
+  },
+  "chat_smoke": {
+    "english_study_plan": "Produced a short text study plan when action tools were not advertised.",
+    "arabic_greeting": "Repeated part of the request rather than giving a useful greeting.",
+    "arabic_study_plan": "Repeated the request; quality check failed.",
+    "automatic_executions": 0,
+    "process_peak_rss_kb": 2252256
+  },
+  "conclusion": "Runtime and manual proposals work on the host. Arabic quality is inadequate in these smoke cases, and memory use is high. Experimental and opt-in; not approved as the final Arabic assistant or benchmarked on the target phone."
+}

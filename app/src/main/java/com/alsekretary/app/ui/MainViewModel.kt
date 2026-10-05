@@ -16,6 +16,8 @@ import com.alsekretary.app.domain.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import com.alsekretary.app.localmodel.*
+import java.util.concurrent.atomic.AtomicBoolean
 
 private const val RANGE_PAST_DAYS = 45L
 private const val RANGE_FUTURE_DAYS = 120L
@@ -55,6 +57,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val database = SecretaryDatabase(application)
     private val repo = SecretaryRepository(database)
     private val assistantStore = com.alsekretary.app.data.AssistantStore(database)
+    private val modelStore=ModelStore(application)
+    private val modelRunner=ModelRunner(application,modelStore)
+    private val modelBusy=AtomicBoolean(false)
+    private val modelLock=Any()
+    private var modelToken: AtomicBoolean?=null
+    private val _model=MutableStateFlow(ModelUiState(installed=modelStore.selected(),enabled=modelStore.enabled))
+    val model: StateFlow<ModelUiState> = _model.asStateFlow()
     private val socialSync = com.alsekretary.app.social.SocialSync(application,database)
     private val reminderScheduler = com.alsekretary.app.reminders.ReminderScheduler(application)
     private val strictStore = StrictModeStore(application)
@@ -110,10 +119,79 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         )
     }
 
-    fun assistantSubmit(text: String,budget: Int) = operation { assistantStore.submit(text,budget);refreshNow() }
+    private fun modelOperation(label: String,block: suspend (AtomicBoolean)->String) {
+        if(!modelBusy.compareAndSet(false,true)){_notice.value="انتظر انتهاء عملية النموذج أو أوقفها";return}
+        val token=AtomicBoolean(false)
+        synchronized(modelLock){modelToken=token}
+        _model.value=_model.value.copy(busy=true,progress=null,status=label)
+        viewModelScope.launch(Dispatchers.IO) {
+            var result="توقفت العملية"
+            try { result=block(token) }
+            catch(e: java.util.concurrent.CancellationException){result="توقفت العملية؛ لم يحفظ رد أو اقتراح جديد"}
+            catch(e: Exception){result=e.message ?: "تعذر تشغيل النموذج";_error.value=result}
+            catch(e: LinkageError){result="محرك النموذج غير مدعوم على هذا الجهاز";_error.value=result}
+            finally {
+                synchronized(modelLock){if(modelToken===token)modelToken=null}
+                _model.value=ModelUiState(modelStore.selected(),modelStore.enabled,false,null,result)
+                modelBusy.set(false)
+            }
+        }
+    }
+    fun cancelModel() {
+        synchronized(modelLock){modelToken?.set(true)}
+        if(modelBusy.get()) {
+            _model.value=_model.value.copy(status="جارٍ الإيقاف؛ تحميل المحرك قد يحتاج وقتاً لينتهي")
+            viewModelScope.launch(Dispatchers.IO){modelRunner.cancel()}
+        }
+    }
+    fun modelDownload()=modelOperation("تنزيل النموذج؛ تبقى الشاشة مفتوحة") { token ->
+        modelStore.download(token) { bytes -> _model.value=_model.value.copy(progress=bytes) }
+        "اكتمل التنزيل والتحقق. فعّل المحادثة المحلية إن أردت تجربتها."
+    }
+    fun modelImport(uri: android.net.Uri)=modelOperation("نسخ النموذج والتحقق منه") { token ->
+        modelStore.importUri(getApplication(),uri,token)
+        "تم الاستيراد. توافق الملف لا يتأكد إلا عند التشغيل."
+    }
+    fun modelEnable(enabled: Boolean) {
+        if(modelBusy.get()){_notice.value="أوقف العملية الحالية أولاً";return}
+        operation {
+            if(enabled){require(modelStore.selected()!=null) { "نزّل النموذج أو استورده أولاً" };modelRunner.checkResources()}
+            modelStore.enabled=enabled
+            _model.value=_model.value.copy(enabled=enabled,status=if(enabled)"الحوار المحلي التجريبي مفعّل" else "الأوامر المكتوبة مفعّلة؛ النموذج متوقف")
+        }
+    }
+    fun modelRemove()=modelOperation("إزالة ملفات النماذج") { _ -> modelStore.remove();"أزيلت ملفات النماذج؛ بيانات حياتك محفوظة" }
+    fun assistantSubmit(text: String,budget: Int)=modelOperation("جارٍ إعداد الرد") { token ->
+        var snapshot: List<Task> = emptyList()
+        var prompt=""
+        val selected=operationMutex.withLock {
+            val reply=assistantStore.evaluate(text,budget)
+            if(reply.handled || !modelStore.enabled) {
+                synchronized(modelLock){if(token.get())throw java.util.concurrent.CancellationException();assistantStore.rememberReply(text,reply)}
+                refreshNow();null
+            } else {
+                val weights=requireNotNull(modelStore.selected()) { "النموذج غير موجود؛ أعد تنزيله" }
+                snapshot=repo.listTodayTasks(true)
+                prompt=ModelPrompt.build(text,snapshot,repo.listGoals())
+                weights
+            }
+        }
+        if(selected==null) "اكتمل الرد بالأوامر المحلية" else {
+            _model.value=_model.value.copy(status="النموذج يولد الرد محلياً؛ يمكنك إيقافه")
+            val generated=modelRunner.run(prompt,selected,token,ModelPrompt.requestsAction(text))
+            operationMutex.withLock {
+                synchronized(modelLock) {
+                    if(token.get() || !modelStore.enabled || modelStore.selected()?.sha!=selected.sha)throw java.util.concurrent.CancellationException()
+                    assistantStore.rememberReply(text,ModelProposals.review(generated.answer,snapshot,ModelPrompt.requestsAction(text)))
+                }
+                refreshNow()
+            }
+            "اكتمل الرد في ${generated.elapsedMs/1000} ث؛ ذاكرة العملية المقاسة ${generated.processPssKb/1024} ميغابايت (ليست ذروة الاستهلاك)"
+        }
+    }
     fun assistantConfirm(id: String) = operation { assistantStore.confirm(id);refreshNow() }
     fun assistantCancel(id: String) = operation { assistantStore.cancel(id);refreshNow() }
-    fun assistantClear() = operation { assistantStore.clear();refreshNow() }
+    fun assistantClear() { cancelModel();operation { assistantStore.clear();refreshNow() } }
 
     fun setBlockedDomains(text: String) = operation {
         val domains=text.lines().map{it.trim().lowercase().removePrefix("https://").removePrefix("http://").substringBefore('/').trimEnd('.')}.filter{it.isNotBlank()}.toSet()
@@ -121,7 +199,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         strictStore.blockedDomains=domains;refreshNow()
     }
     fun exportBackup(uri: android.net.Uri,password: String) = operation { val chars=password.toCharArray();try{com.alsekretary.app.data.BackupManager(getApplication(),database).export(uri,chars);_notice.value="تم تصدير النسخة المشفرة"}finally{chars.fill('\u0000')} }
-    fun restoreBackup(uri: android.net.Uri,password: String) = operation { val chars=password.toCharArray();try{com.alsekretary.app.data.BackupManager(getApplication(),database).restore(uri,chars);refreshNow();_notice.value="تمت الاستعادة"}finally{chars.fill('\u0000')} }
+    fun restoreBackup(uri: android.net.Uri,password: String) { cancelModel();operation { val chars=password.toCharArray();try{com.alsekretary.app.data.BackupManager(getApplication(),database).restore(uri,chars);refreshNow();_notice.value="تمت الاستعادة"}finally{chars.fill('\u0000')} } }
     fun socialLogin(url: String,username: String,password: String,name: String,register: Boolean) = operation { try{socialSync.login(url,username,password,name,register)}finally{refreshNow()} }
     fun socialLogout() = operation { socialSync.logout();_state.value=_state.value.copy(socialSearch=emptyList());refreshNow() }
     fun searchSocial(name: String) = operation { _state.value=_state.value.copy(socialSearch=socialSync.searchUser(name).objects()) }
@@ -181,6 +259,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         strictStore.activeFocusId = null
         refreshNow()
     }
+
+    override fun onCleared() { synchronized(modelLock){modelToken?.set(true)};modelRunner.cancel();super.onCleared() }
 
     private fun queryLaunchableApps(): List<AppCandidate> {
         val pm = getApplication<Application>().packageManager

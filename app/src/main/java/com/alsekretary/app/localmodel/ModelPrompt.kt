@@ -4,6 +4,7 @@ import com.alsekretary.app.domain.*
 import com.google.gson.Gson
 
 object ModelPrompt {
+    fun requestsAction(input: String): Boolean = Regex("^(?:please |ممكن |بدي |اريد )?(?:create|add|save|complete|start|اضف|ضيف|انشئ|احفظ|سجل|اكمل|ابدا|تضيف|تحفظ|تكمل|تبدا)(?:\\s|$)").containsMatchIn(LocalAssistant.normalize(input))
     /** Explicitly bounded context; notes and attachments are not implicitly read. */
     fun build(input: String,tasks: List<Task>,goals: List<Goal>): String {
         require(input.length<=800) { "رسالة النموذج لا تتجاوز 800 حرف؛ الأوامر المعتادة تقبل 2000" }

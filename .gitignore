@@ -21,6 +21,8 @@ local.properties
 *.sqlite3
 *.apk
 *.aab
+*.litertlm
+*.gguf
 __pycache__/
 *.pyc
 .venv/

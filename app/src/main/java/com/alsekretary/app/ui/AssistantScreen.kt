@@ -19,9 +19,11 @@ import android.content.pm.PackageManager
 import androidx.core.content.ContextCompat
 import android.os.SystemClock
 import com.alsekretary.app.voice.LocalVoice
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 
 @Composable
 fun AssistantScreen(state: MainUiState, vm: MainViewModel) {
+    val model by vm.model.collectAsStateWithLifecycle()
     var input by remember { mutableStateOf("") }
     var budget by remember { mutableStateOf("120") }
     var clearConfirm by remember { mutableStateOf(false) }
@@ -40,14 +42,15 @@ fun AssistantScreen(state: MainUiState, vm: MainViewModel) {
         permission.launch(Manifest.permission.RECORD_AUDIO);return false
     }
     DisposableEffect(voice,owner) {
-        val observer=LifecycleEventObserver { _,event -> if(event==Lifecycle.Event.ON_STOP){gate.clear();voice.stop()} }
+        val observer=LifecycleEventObserver { _,event -> if(event==Lifecycle.Event.ON_STOP){gate.clear();voice.stop();vm.cancelModel()} }
         owner.lifecycle.addObserver(observer)
-        onDispose { owner.lifecycle.removeObserver(observer);gate.clear();voice.close() }
+        onDispose { owner.lifecycle.removeObserver(observer);gate.clear();voice.close();vm.cancelModel() }
     }
     Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement=Arrangement.spacedBy(10.dp)) {
         Text("السكرتير المحلي",style=MaterialTheme.typography.headlineMedium)
-        Text("أوامر ومراجعة أهداف وخطة أسبوع محلية. الردود بقواعد محددة؛ نموذج المحادثة لم يدمج بعد. الصوت يعتمد على الحزم المحلية المثبتة في الهاتف.",style=MaterialTheme.typography.bodySmall)
+        Text("أوامر ومراجعة أهداف وخطة أسبوع محلية، مع محادثة تجريبية اختيارية. الصوت يعتمد على الحزم المحلية المثبتة في الهاتف.",style=MaterialTheme.typography.bodySmall)
         LazyColumn(Modifier.weight(1f),verticalArrangement=Arrangement.spacedBy(10.dp)) {
+            item { ModelSettings(model,vm) }
             item { GlassCard {
                 Text("الصوت المحلي داخل هذه الشاشة",style=MaterialTheme.typography.titleSmall)
                 Row { FilterChip(selected=language=="ar",onClick={gate.clear();voice.stop();language="ar"},label={Text("العربية")});FilterChip(selected=language=="en-US",onClick={gate.clear();voice.stop();language="en-US"},label={Text("English")}) }
@@ -88,12 +91,12 @@ fun AssistantScreen(state: MainUiState, vm: MainViewModel) {
         OutlinedTextField(budget,{budget=it},label={Text("ميزانية المهام المقترحة / اليوم بالدقائق")},singleLine=true,modifier=Modifier.fillMaxWidth())
         OutlinedTextField(input,{input=it},label={Text("اكتب أمرك")},modifier=Modifier.fillMaxWidth(),maxLines=4)
         Row {
-            Button(onClick={vm.assistantSubmit(input,budget.toIntOrNull() ?: 120);input=""},enabled=input.isNotBlank() && input.length<=2000 && (budget.toIntOrNull() ?: 0) in 1..1440){Text("إرسال")}
-            TextButton(onClick={vm.assistantSubmit("خطط يومي",budget.toIntOrNull() ?: 120)},enabled=(budget.toIntOrNull() ?: 0) in 1..1440){Text("خطة اليوم")}
+            Button(onClick={vm.assistantSubmit(input,budget.toIntOrNull() ?: 120);input=""},enabled=!model.busy && input.isNotBlank() && input.length<=2000 && (budget.toIntOrNull() ?: 0) in 1..1440){Text("إرسال")}
+            TextButton(onClick={vm.assistantSubmit("خطط يومي",budget.toIntOrNull() ?: 120)},enabled=!model.busy && (budget.toIntOrNull() ?: 0) in 1..1440){Text("خطة اليوم")}
         }
         Row {
-            TextButton(onClick={vm.assistantSubmit("خطط أسبوعي",budget.toIntOrNull() ?: 120)},enabled=(budget.toIntOrNull() ?: 0) in 1..1440){Text("خطة الأسبوع")}
-            TextButton(onClick={vm.assistantSubmit("راجع حياتي",120)}){Text("مراجعة حياتي")}
+            TextButton(onClick={vm.assistantSubmit("خطط أسبوعي",budget.toIntOrNull() ?: 120)},enabled=!model.busy && (budget.toIntOrNull() ?: 0) in 1..1440){Text("خطة الأسبوع")}
+            TextButton(onClick={vm.assistantSubmit("راجع حياتي",120)},enabled=!model.busy){Text("مراجعة حياتي")}
             TextButton(onClick={gate.clear();voice.stop();clearConfirm=true}){Text("مسح السجل")}
         }
     }

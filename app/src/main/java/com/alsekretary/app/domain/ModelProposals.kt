@@ -10,8 +10,9 @@ data class ModelAnswer(val text: String, val calls: List<ModelToolCall> = emptyL
 
 /** Model output is untrusted. This adapter can only prepare a typed proposal. */
 object ModelProposals {
-    fun review(answer: ModelAnswer, snapshot: List<Task>): AssistantReply {
+    fun review(answer: ModelAnswer, snapshot: List<Task>,allowActions: Boolean=true): AssistantReply {
         require(answer.text.length<=6000 && answer.calls.size<=1) { "اقتراح النموذج غير صالح؛ لم ينفذ أي إجراء" }
+        require(allowActions || answer.calls.isEmpty()) { "لم تطلب إجراءً صريحاً؛ رفضت اقتراح النموذج" }
         val prefix="اقتراح من النموذج المحلي؛ لم ينفّذ أي إجراء.\n"
         if(answer.calls.isEmpty()) return AssistantReply(prefix+answer.text.ifBlank { "لم يقدم النموذج جواباً؛ حاول صياغة أقصر." })
         val raw=answer.calls.single()
