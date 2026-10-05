@@ -17,7 +17,7 @@ import java.util.zip.ZipEntry
 import java.util.UUID
 
 class BackupManager(private val context: Context,private val db: SecretaryDatabase) {
-    private val tables=listOf("areas","goals","projects","tasks","behavior_events","decisions","calendar_events","notes","focus_sessions","project_feedback","habits","habit_checks","weekly_reviews","preferences","task_dependencies","milestones","goal_observations","daily_checks","project_items","task_failures")
+    private val tables=listOf("areas","goals","projects","tasks","behavior_events","decisions","calendar_events","notes","focus_sessions","project_feedback","habits","habit_checks","weekly_reviews","preferences","task_dependencies","milestones","goal_observations","daily_checks","project_items","task_failures","assistant_messages","assistant_actions")
     private fun bounded(input: java.io.InputStream,max: Int): ByteArray {
         val out=ByteArrayOutputStream();val buffer=ByteArray(8192)
         while(true){val n=input.read(buffer);if(n<0)break;require(out.size()+n<=max){"ملف أكبر من الحد"};out.write(buffer,0,n)}
@@ -28,7 +28,7 @@ class BackupManager(private val context: Context,private val db: SecretaryDataba
         context.contentResolver.openOutputStream(uri,"wt")!!.use{it.write(bytes)}
     }
     fun pack(password: CharArray): ByteArray {
-        val payload=JSONObject().put("schema",5);val data=JSONObject()
+        val payload=JSONObject().put("schema",6);val data=JSONObject()
         val database=db.readableDatabase;database.beginTransaction()
         try {
             tables.forEach{table->val rows=JSONArray();database.rawQuery("SELECT * FROM $table",null).use { c ->
@@ -58,8 +58,10 @@ class BackupManager(private val context: Context,private val db: SecretaryDataba
             require(entry.name=="database.json" || (entry.name.startsWith("attachments/") && entry.name.removePrefix("attachments/").matches(Regex("[A-Za-z0-9_-]{1,100}")))){"مسار مرفق غير صالح"}
             require(entry.name !in entries){"عنصر مكرر"};val bytes=bounded(zip,80*1024*1024);total+=bytes.size;require(total<=100*1024*1024);entries[entry.name]=bytes
         }}
-        val payload=JSONObject(String(entries["database.json"] ?: error("بيانات النسخة غير موجودة"),Charsets.UTF_8));require(payload.getInt("schema")==5){"نسخة قاعدة غير مدعومة"}
-        val data=payload.getJSONObject("tables");require(data.keys().asSequence().toSet()==tables.toSet())
+        val payload=JSONObject(String(entries["database.json"] ?: error("بيانات النسخة غير موجودة"),Charsets.UTF_8));require(payload.getInt("schema") in 5..6){"نسخة قاعدة غير مدعومة"}
+        val data=payload.getJSONObject("tables")
+        if(payload.getInt("schema")==5){require(!data.has("assistant_messages") && !data.has("assistant_actions"));data.put("assistant_messages",JSONArray());data.put("assistant_actions",JSONArray())}
+        require(data.keys().asSequence().toSet()==tables.toSet())
         // Keep an encrypted rollback copy; credentials and social state are not replaced.
         val prior=File(context.filesDir,"backups").apply{mkdirs()}
         File(prior,"before-restore.skr").writeBytes(pack(password))
@@ -93,6 +95,8 @@ class BackupManager(private val context: Context,private val db: SecretaryDataba
             TaskPlanning.validateGraph(tasks.map{it.id}.toSet(),repo.planningDependencies())
             require(repo.listGoals(true).all{it.targetValue==null || it.targetValue.isFinite()})
             require(repo.activeFocus()==null){"النسخة تحتوي جلسة نشطة؛ أنهها قبل إنشاء النسخة"}
+            AssistantStore(db).validateStoredActions() // Reject unknown tool payloads before committing.
+            database.execSQL("UPDATE assistant_actions SET status='CANCELLED' WHERE status='PENDING'")
             database.setTransactionSuccessful()
         } catch(e: Exception){created.forEach{it.delete()};throw e}finally{database.endTransaction()}
     }

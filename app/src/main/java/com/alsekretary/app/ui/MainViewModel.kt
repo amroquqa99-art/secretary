@@ -21,6 +21,8 @@ private const val RANGE_PAST_DAYS = 45L
 private const val RANGE_FUTURE_DAYS = 120L
 
 data class MainUiState(
+    val assistantMessages: List<AssistantMessage> = emptyList(),
+    val assistantProposals: List<AssistantProposal> = emptyList(),
     val blockedDomains: Set<String> = emptySet(),
     val social: com.alsekretary.app.social.SocialState = com.alsekretary.app.social.SocialState(),
     val socialSearch: List<org.json.JSONObject> = emptyList(),
@@ -51,6 +53,7 @@ data class MainUiState(
 class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val database = SecretaryDatabase(application)
     private val repo = SecretaryRepository(database)
+    private val assistantStore = com.alsekretary.app.data.AssistantStore(database)
     private val socialSync = com.alsekretary.app.social.SocialSync(application,database)
     private val reminderScheduler = com.alsekretary.app.reminders.ReminderScheduler(application)
     private val strictStore = StrictModeStore(application)
@@ -87,6 +90,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val to = now + RANGE_FUTURE_DAYS * 86_400_000L
         reminderScheduler.sync(repo)
         _state.value = MainUiState(
+            assistantMessages = assistantStore.messages(), assistantProposals = assistantStore.proposals(),
             blockedDomains = strictStore.blockedDomains,
             social = socialSync.state(), socialSearch = _state.value.socialSearch,
             projectItems = repo.listProjectItems(), dailyChecks = repo.listDailyChecks(),
@@ -104,6 +108,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             launchableApps = queryLaunchableApps()
         )
     }
+
+    fun assistantSubmit(text: String,budget: Int) = operation { assistantStore.submit(text,budget);refreshNow() }
+    fun assistantConfirm(id: String) = operation { assistantStore.confirm(id);refreshNow() }
+    fun assistantCancel(id: String) = operation { assistantStore.cancel(id);refreshNow() }
+    fun assistantClear() = operation { assistantStore.clear();refreshNow() }
 
     fun setBlockedDomains(text: String) = operation {
         val domains=text.lines().map{it.trim().lowercase().removePrefix("https://").removePrefix("http://").substringBefore('/').trimEnd('.')}.filter{it.isNotBlank()}.toSet()

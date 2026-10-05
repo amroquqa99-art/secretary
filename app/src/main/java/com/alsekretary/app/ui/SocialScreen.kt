@@ -18,8 +18,8 @@ val socialMetrics=listOf("LEARNING" to "التعلم","RELIABILITY" to "الال
 fun PersonalHub(state: MainUiState,vm: MainViewModel) {
     var tab by remember {mutableStateOf(0)}
     Column(Modifier.fillMaxSize()) {
-        Row { listOf("متابعة","التعاون","الإعدادات").forEachIndexed{i,label->TextButton(onClick={tab=i}){Text(if(tab==i)"• $label" else label)}} }
-        Box(Modifier.weight(1f)) {when(tab){0->LifeManagementScreen(state,vm);1->SocialScreen(state,vm);else->SettingsScreen(state,vm)}}
+        Row { listOf("السكرتير","متابعة","التعاون","الإعدادات").forEachIndexed{i,label->TextButton(onClick={tab=i}){Text(if(tab==i)"• $label" else label)}} }
+        Box(Modifier.weight(1f)) {when(tab){0->AssistantScreen(state,vm);1->LifeManagementScreen(state,vm);2->SocialScreen(state,vm);else->SettingsScreen(state,vm)}}
     }
 }
 @Composable

@@ -5,7 +5,7 @@ import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import com.alsekretary.app.domain.LifeArea
 
-class SecretaryDatabase(context: Context) : SQLiteOpenHelper(context, "alsekretary.db", null, 5) {
+class SecretaryDatabase(context: Context) : SQLiteOpenHelper(context, "alsekretary.db", null, 6) {
     override fun onCreate(db: SQLiteDatabase) {
         createV1Tables(db)
         createV2Tables(db)
@@ -13,6 +13,7 @@ class SecretaryDatabase(context: Context) : SQLiteOpenHelper(context, "alsekreta
         createV3Tables(db)
         createV4Tables(db)
         createV5Tables(db)
+        createV6Tables(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -20,6 +21,7 @@ class SecretaryDatabase(context: Context) : SQLiteOpenHelper(context, "alsekreta
         if (oldVersion < 3) createV3Tables(db)
         if (oldVersion < 4) createV4Tables(db)
         if (oldVersion < 5) createV5Tables(db)
+        if (oldVersion < 6) createV6Tables(db)
     }
 
     private fun createV1Tables(db: SQLiteDatabase) {
@@ -190,6 +192,11 @@ class SecretaryDatabase(context: Context) : SQLiteOpenHelper(context, "alsekreta
         db.execSQL("CREATE TABLE social_cache(key TEXT PRIMARY KEY,json TEXT NOT NULL,updated_at INTEGER NOT NULL)")
         db.execSQL("CREATE INDEX idx_goal_observations ON goal_observations(goal_id,at)")
         db.execSQL("CREATE INDEX idx_task_failures ON task_failures(at)")
+    }
+
+    private fun createV6Tables(db: SQLiteDatabase) {
+        db.execSQL("CREATE TABLE assistant_messages(id TEXT PRIMARY KEY,role TEXT NOT NULL CHECK(role IN ('USER','ASSISTANT')),content TEXT NOT NULL,created_at INTEGER NOT NULL)")
+        db.execSQL("CREATE TABLE assistant_actions(id TEXT PRIMARY KEY,payload TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('PENDING','DONE','CANCELLED')),created_at INTEGER NOT NULL,executed_at INTEGER,result TEXT)")
     }
 
     private fun seedAreas(db: SQLiteDatabase) {
