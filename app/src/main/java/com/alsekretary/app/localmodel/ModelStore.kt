@@ -55,8 +55,14 @@ class ModelStore(context: Context,private val minimumBytes: Long=16L*1024*1024) 
         val sha=digest(part)
         require(expected==null || sha==expected) { "فشل التحقق من النموذج؛ لم يتغير النموذج السابق" }
         checkCancelled(cancel)
-        val model=InstalledModel(sha,name.take(120),part.length())
+        var model=InstalledModel(sha,name.take(120),part.length())
         val destination=File(root,sha)
+        val cached=if(destination.exists())runCatching {
+            val metadata=JSONObject(File(destination,"info.json").readText())
+            InstalledModel(sha,metadata.getString("name"),metadata.getLong("bytes")).also { require(it.bytes==model.bytes);verify(it) }
+        }.getOrNull() else null
+        // Replace only a corrupt owned cache after the incoming copy has passed verification.
+        if(destination.exists() && cached==null)require(destination.deleteRecursively())
         if(!destination.exists()) {
             val staging=File(root,"install-${UUID.randomUUID()}").apply { mkdirs() }
             try {
@@ -64,7 +70,7 @@ class ModelStore(context: Context,private val minimumBytes: Long=16L*1024*1024) 
                 File(staging,"info.json").writeText(JSONObject().put("name",model.name).put("bytes",model.bytes).toString())
                 require(staging.renameTo(destination))
             } finally { staging.deleteRecursively() }
-        } else { verify(model);part.delete() }
+        } else { model=requireNotNull(cached);part.delete() }
         checkCancelled(cancel)
         val output=selection.startWrite()
         try { output.write(JSONObject().put("sha",sha).toString().toByteArray());selection.finishWrite(output) }

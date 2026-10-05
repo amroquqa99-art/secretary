@@ -44,6 +44,10 @@ android {
     }
 }
 
+kotlin {
+    compilerOptions { jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17) }
+}
+
 dependencies {
     implementation("com.google.ai.edge.litertlm:litertlm-android:0.17.1")
     val composeBom = platform("androidx.compose:compose-bom:2026.09.00")
