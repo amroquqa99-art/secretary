@@ -41,3 +41,57 @@ fun ModelSettings(model: ModelUiState,vm: MainViewModel) {
     }
     if(remove)AlertDialog(onDismissRequest={remove=false},title={Text("إزالة النماذج المحلية؟")},text={Text("يحذف كل أوزان النماذج المستوردة وملف التنزيل الجزئي. مهامك وملاحظاتك وسجل محادثتك تبقى محفوظة.")},confirmButton={TextButton(onClick={vm.modelRemove();remove=false}){Text("إزالة")}},dismissButton={TextButton(onClick={remove=false}){Text("إلغاء")}})
 }
+
+
+@Composable
+fun SemanticMemorySettings(memory: SemanticMemoryUiState,vm: MainViewModel) {
+    var remove by remember { mutableStateOf(false) }
+    val importer=rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> if(uri!=null)vm.semanticImport(uri) }
+    GlassCard {
+        Text("الذاكرة الدلالية — تجريبية",style=MaterialTheme.typography.titleMedium)
+        Text(memory.installed?.name ?: "${EmbeddingModelCatalog.NAME} • تنزيل ${EmbeddingModelCatalog.SIZE/(1024*1024)} ميغابايت")
+        Text(
+            "تستخدم embeddings محلية لاختيار المهام والأهداف والملاحظات والرسائل الأكثر ارتباطاً بالسؤال. لا تُرسل بياناتك إلى خادم، والفهرس مشتق ويمكن إعادة بنائه.",
+            style=MaterialTheme.typography.bodySmall
+        )
+        Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.SpaceBetween) {
+            Text("استخدام الذاكرة الدلالية",Modifier.weight(1f))
+            Switch(
+                checked=memory.enabled,
+                onCheckedChange=vm::semanticEnable,
+                enabled=!memory.busy && memory.installed!=null
+            )
+        }
+        Text("الفهرس: ${memory.indexedDocuments} / ${memory.totalDocuments} عنصر",style=MaterialTheme.typography.bodySmall)
+        if(memory.busy) {
+            val progress=memory.progress
+            if(progress!=null) {
+                LinearProgressIndicator(progress={ (progress.toFloat()/EmbeddingModelCatalog.SIZE).coerceIn(0f,1f) },modifier=Modifier.fillMaxWidth())
+                Text("${progress/(1024*1024)} / ${EmbeddingModelCatalog.SIZE/(1024*1024)} ميغابايت")
+            } else LinearProgressIndicator(Modifier.fillMaxWidth())
+            TextButton(onClick=vm::cancelSemanticMemory){Text("إيقاف العملية")}
+        } else {
+            Row(horizontalArrangement=Arrangement.spacedBy(4.dp)) {
+                TextButton(onClick=vm::semanticDownload){Text(if(memory.installed==null)"تنزيل نموذج الذاكرة" else "إعادة تنزيل الرسمي")}
+                TextButton(onClick={importer.launch(arrayOf("application/octet-stream","*/*"))}){Text("استيراد .gguf")}
+            }
+            Button(
+                onClick=vm::semanticRebuild,
+                enabled=memory.enabled && memory.installed!=null && memory.totalDocuments>0
+            ){Text("بناء / تحديث الفهرس")}
+            TextButton(onClick={remove=true}){Text("إزالة نموذج الذاكرة والفهرس")}
+        }
+        Text(memory.status,style=MaterialTheme.typography.bodySmall)
+        Text(
+            "بعد تغييرات كبيرة في المهام أو الملاحظات أعد بناء الفهرس. إذا كان العنصر معدلاً ولم تعد بصمته تطابق الفهرس فلن يُستخدم vector قديم له.",
+            style=MaterialTheme.typography.bodySmall
+        )
+    }
+    if(remove)AlertDialog(
+        onDismissRequest={remove=false},
+        title={Text("إزالة الذاكرة الدلالية؟")},
+        text={Text("سيُحذف نموذج الـembedding والفهرس المشتق فقط. المهام والأهداف والملاحظات وسجل المحادثة الأصلي لا يُحذف.")},
+        confirmButton={TextButton(onClick={vm.semanticRemove();remove=false}){Text("إزالة")}},
+        dismissButton={TextButton(onClick={remove=false}){Text("إلغاء")}}
+    )
+}
