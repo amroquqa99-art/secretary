@@ -6,7 +6,7 @@ plugins {
 
 android {
     namespace = "com.alsekretary.app"
-    compileSdk = 36
+    compileSdk = 37
     ndkVersion = "30.0.16248370"
 
     defaultConfig {
