@@ -27,7 +27,7 @@ object MemoryRetrieval {
         "من","في","على","الى","إلى","عن","مع","هذا","هذه","ذلك","التي","الذي","انا","أنا",
         "هو","هي","ما","ماذا","شو","بدي","اريد","أريد","ممكن","please","the","a","an","to",
         "of","in","on","for","my","me","i","is","are","and","or"
-    ).map { LocalAssistant.normalize(it) }.toSet()
+    ).map { searchNormalize(it) }.toSet()
 
     fun select(
         query: String,
@@ -41,11 +41,11 @@ object MemoryRetrieval {
         maxMessages: Int = 4
     ): RetrievedMemory {
         require(maxTasks in 0..20 && maxGoals in 0..10 && maxNotes in 0..10 && maxMessages in 0..10)
-        val normalizedQuery = LocalAssistant.normalize(query)
+        val normalizedQuery = searchNormalize(query)
         val tokens = tokens(normalizedQuery)
 
         fun score(text: String, recency: Long? = null): Int {
-            val normalized = LocalAssistant.normalize(text)
+            val normalized = searchNormalize(text)
             if (normalized.isBlank()) return 0
             var result = 0
             if (normalizedQuery.length >= 3 && normalized.contains(normalizedQuery)) result += 20
@@ -91,6 +91,12 @@ object MemoryRetrieval {
             messages = ranked(recentMessages, maxMessages, { it.text }, { it.at })
         )
     }
+
+    private fun searchNormalize(text: String): String = LocalAssistant.normalize(text)
+        .replace('ة','ه')
+        .replace('ؤ','و')
+        .replace('ئ','ي')
+        .replace("ـ","")
 
     private fun tokens(normalized: String): Set<String> = normalized
         .split(Regex("[^\\p{L}\\p{N}]+"))
