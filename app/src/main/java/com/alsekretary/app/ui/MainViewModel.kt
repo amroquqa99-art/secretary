@@ -59,11 +59,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val assistantStore = com.alsekretary.app.data.AssistantStore(database)
     private val modelStore=ModelStore(application)
     private val modelRunner=ModelRunner(application,modelStore)
+    private val embeddingStore=EmbeddingModelStore(application)
+    private val embeddingRunner=EmbeddingRunner(application,embeddingStore)
+    private val semanticMemory=SemanticMemory(application,embeddingStore,embeddingRunner)
+    private val aiBusy=AtomicBoolean(false)
     private val modelBusy=AtomicBoolean(false)
+    private val semanticBusy=AtomicBoolean(false)
     private val modelLock=Any()
+    private val semanticLock=Any()
     private var modelToken: AtomicBoolean?=null
+    private var semanticToken: AtomicBoolean?=null
     private val _model=MutableStateFlow(ModelUiState(installed=modelStore.selected(),enabled=modelStore.enabled))
     val model: StateFlow<ModelUiState> = _model.asStateFlow()
+    private val _semantic=MutableStateFlow(SemanticMemoryUiState(installed=embeddingStore.selected(),enabled=embeddingStore.enabled))
+    val semantic: StateFlow<SemanticMemoryUiState> = _semantic.asStateFlow()
     private val socialSync = com.alsekretary.app.social.SocialSync(application,database)
     private val reminderScheduler = com.alsekretary.app.reminders.ReminderScheduler(application)
     private val strictStore = StrictModeStore(application)
@@ -117,10 +126,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             activeFocus = repo.activeFocus(),
             launchableApps = queryLaunchableApps()
         )
+        val memoryStats=semanticMemory.stats(_state.value.tasks,_state.value.goals,_state.value.notes,_state.value.assistantMessages)
+        _semantic.value=_semantic.value.copy(
+            installed=embeddingStore.selected(),
+            enabled=embeddingStore.enabled,
+            indexedDocuments=memoryStats.indexed,
+            totalDocuments=memoryStats.documents
+        )
     }
 
     private fun modelOperation(label: String,block: suspend (AtomicBoolean)->String) {
-        if(!modelBusy.compareAndSet(false,true)){_notice.value="انتظر انتهاء عملية النموذج أو أوقفها";return}
+        if(!aiBusy.compareAndSet(false,true)){_notice.value="انتظر انتهاء عملية الذكاء المحلي أو أوقفها";return}
+        modelBusy.set(true)
         val token=AtomicBoolean(false)
         synchronized(modelLock){modelToken=token}
         _model.value=_model.value.copy(busy=true,progress=null,status=label)
@@ -134,6 +151,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 synchronized(modelLock){if(modelToken===token)modelToken=null}
                 _model.value=ModelUiState(modelStore.selected(),modelStore.enabled,false,null,result)
                 modelBusy.set(false)
+                aiBusy.set(false)
             }
         }
     }
@@ -161,9 +179,81 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
     fun modelRemove()=modelOperation("إزالة ملفات النماذج") { _ -> modelStore.remove();"أزيلت ملفات النماذج؛ بيانات حياتك محفوظة" }
+
+    private fun semanticOperation(label: String,block: suspend (AtomicBoolean)->String) {
+        if(!aiBusy.compareAndSet(false,true)){_notice.value="انتظر انتهاء عملية الذكاء المحلي أو أوقفها";return}
+        semanticBusy.set(true)
+        val token=AtomicBoolean(false)
+        synchronized(semanticLock){semanticToken=token}
+        _semantic.value=_semantic.value.copy(busy=true,progress=null,status=label)
+        viewModelScope.launch(Dispatchers.IO) {
+            var result="توقفت العملية"
+            try { result=block(token) }
+            catch(e: java.util.concurrent.CancellationException){result="توقفت عملية الذاكرة؛ لم تتغير بيانات حياتك"}
+            catch(e: Exception){result=e.message ?: "تعذر تشغيل الذاكرة الدلالية";_error.value=result}
+            catch(e: LinkageError){result="محرك الذاكرة غير مدعوم على هذا الجهاز";_error.value=result}
+            finally {
+                synchronized(semanticLock){if(semanticToken===token)semanticToken=null}
+                val s=_state.value
+                val stats=semanticMemory.stats(s.tasks,s.goals,s.notes,s.assistantMessages)
+                _semantic.value=SemanticMemoryUiState(
+                    installed=embeddingStore.selected(),enabled=embeddingStore.enabled,busy=false,progress=null,
+                    indexedDocuments=stats.indexed,totalDocuments=stats.documents,status=result
+                )
+                semanticBusy.set(false)
+                aiBusy.set(false)
+            }
+        }
+    }
+    fun cancelSemanticMemory() {
+        synchronized(semanticLock){semanticToken?.set(true)}
+        if(semanticBusy.get()) {
+            _semantic.value=_semantic.value.copy(status="جارٍ إيقاف عملية الذاكرة")
+            viewModelScope.launch(Dispatchers.IO){embeddingRunner.cancel()}
+        }
+    }
+    fun semanticDownload()=semanticOperation("تنزيل نموذج الذاكرة الدلالية؛ تبقى الشاشة مفتوحة") { token ->
+        embeddingStore.download(token) { bytes -> _semantic.value=_semantic.value.copy(progress=bytes) }
+        "اكتمل تنزيل نموذج الذاكرة والتحقق من بصمته. فعّله ثم ابنِ الفهرس."
+    }
+    fun semanticImport(uri: android.net.Uri)=semanticOperation("نسخ نموذج الذاكرة والتحقق منه") { token ->
+        embeddingStore.importUri(getApplication(),uri,token)
+        "تم استيراد نموذج الذاكرة. توافقه يتأكد عند بناء الفهرس."
+    }
+    fun semanticEnable(enabled: Boolean) {
+        if(aiBusy.get()){_notice.value="أوقف عملية الذكاء المحلي الحالية أولاً";return}
+        operation {
+            if(enabled){require(embeddingStore.selected()!=null){"نزّل نموذج الذاكرة أو استورده أولاً"};embeddingRunner.checkResources()}
+            embeddingStore.enabled=enabled
+            _semantic.value=_semantic.value.copy(
+                installed=embeddingStore.selected(),enabled=enabled,
+                status=if(enabled)"الذاكرة الدلالية مفعّلة؛ ابنِ الفهرس بعد تغييرات كبيرة" else "الذاكرة الدلالية متوقفة؛ سيستخدم السكرتير الاسترجاع النصي"
+            )
+        }
+    }
+    fun semanticRebuild()=semanticOperation("بناء فهرس الذاكرة الدلالية محلياً") { token ->
+        var tasks: List<Task> = emptyList()
+        var goals: List<Goal> = emptyList()
+        var notes: List<Note> = emptyList()
+        var messages: List<AssistantMessage> = emptyList()
+        operationMutex.withLock {
+            tasks=repo.listTodayTasks(true)
+            goals=repo.listGoals()
+            notes=repo.listNotes()
+            messages=assistantStore.messages()
+        }
+        val stats=semanticMemory.rebuild(tasks,goals,notes,messages,token)
+        "اكتمل بناء ${stats.indexed} عنصر ذاكرة محلياً."
+    }
+    fun semanticRemove()=semanticOperation("إزالة نموذج الذاكرة والفهرس المشتق") { _ ->
+        embeddingStore.remove();semanticMemory.clear()
+        "أزيل نموذج الذاكرة والفهرس المشتق؛ بياناتك الأصلية لم تُحذف."
+    }
     fun assistantSubmit(text: String,budget: Int)=modelOperation("جارٍ إعداد الرد") { token ->
         var snapshot: List<Task> = emptyList()
-        var prompt=""
+        var goals: List<Goal> = emptyList()
+        var notes: List<Note> = emptyList()
+        var messages: List<AssistantMessage> = emptyList()
         val selected=operationMutex.withLock {
             val reply=assistantStore.evaluate(text,budget)
             if(reply.handled || !modelStore.enabled) {
@@ -172,11 +262,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             } else {
                 val weights=requireNotNull(modelStore.selected()) { "النموذج غير موجود؛ أعد تنزيله" }
                 snapshot=repo.listTodayTasks(true)
-                prompt=ModelPrompt.build(text,snapshot,repo.listGoals(),repo.listNotes(),assistantStore.messages())
+                goals=repo.listGoals()
+                notes=repo.listNotes()
+                messages=assistantStore.messages()
                 weights
             }
         }
         if(selected==null) "اكتمل الرد بالأوامر المحلية" else {
+            var semantic: RetrievedMemory?=null
+            if(embeddingStore.enabled && _semantic.value.indexedDocuments>0) {
+                _model.value=_model.value.copy(status="يبحث محلياً في الذاكرة الدلالية")
+                try { semantic=semanticMemory.retrieve(text,snapshot,goals,notes,messages,token) }
+                catch(e: java.util.concurrent.CancellationException){throw e}
+                catch(_: Exception) { semantic=null }
+            }
+            val prompt=ModelPrompt.build(text,snapshot,goals,notes,messages,semantic)
             _model.value=_model.value.copy(status="النموذج يولد الرد محلياً؛ يمكنك إيقافه")
             val generated=modelRunner.run(prompt,selected,token,ModelPrompt.requestsAction(text),text)
             operationMutex.withLock {
@@ -199,7 +299,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         strictStore.blockedDomains=domains;refreshNow()
     }
     fun exportBackup(uri: android.net.Uri,password: String) = operation { val chars=password.toCharArray();try{com.alsekretary.app.data.BackupManager(getApplication(),database).export(uri,chars);_notice.value="تم تصدير النسخة المشفرة"}finally{chars.fill('\u0000')} }
-    fun restoreBackup(uri: android.net.Uri,password: String) { cancelModel();operation { val chars=password.toCharArray();try{com.alsekretary.app.data.BackupManager(getApplication(),database).restore(uri,chars);refreshNow();_notice.value="تمت الاستعادة"}finally{chars.fill('\u0000')} } }
+    fun restoreBackup(uri: android.net.Uri,password: String) { cancelModel();cancelSemanticMemory();operation { val chars=password.toCharArray();try{com.alsekretary.app.data.BackupManager(getApplication(),database).restore(uri,chars);semanticMemory.clear();refreshNow();_notice.value="تمت الاستعادة؛ أُفرغ فهرس الذاكرة المشتق ويحتاج إعادة بناء"}finally{chars.fill('\u0000')} } }
     fun socialLogin(url: String,username: String,password: String,name: String,register: Boolean) = operation { try{socialSync.login(url,username,password,name,register)}finally{refreshNow()} }
     fun socialLogout() = operation { socialSync.logout();_state.value=_state.value.copy(socialSearch=emptyList());refreshNow() }
     fun searchSocial(name: String) = operation { _state.value=_state.value.copy(socialSearch=socialSync.searchUser(name).objects()) }
@@ -260,7 +360,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         refreshNow()
     }
 
-    override fun onCleared() { synchronized(modelLock){modelToken?.set(true)};modelRunner.cancel();super.onCleared() }
+    override fun onCleared() {
+        synchronized(modelLock){modelToken?.set(true)}
+        synchronized(semanticLock){semanticToken?.set(true)}
+        modelRunner.cancel();embeddingRunner.cancel();super.onCleared()
+    }
 
     private fun queryLaunchableApps(): List<AppCandidate> {
         val pm = getApplication<Application>().packageManager
