@@ -126,7 +126,7 @@ class SemanticMemory(
         }
         if(scored.isEmpty())return null
 
-        fun ids(kind: MemoryKind,limit: Int): Set<String> = scored.asSequence()
+        fun ids(kind: MemoryKind,limit: Int): List<String> = scored.asSequence()
             .filter { it.first.kind==kind && it.second>=0.35f }
             .sortedByDescending { it.second }
             .take(limit)
