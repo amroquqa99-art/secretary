@@ -57,7 +57,7 @@ object MemoryRetrieval {
                 val matched = tokens.count { normalized.contains(it) }
                 if (matched >= 2) result += matched * 2
             }
-            if (recency != null) {
+            if (result > 0 && recency != null) {
                 val ageDays = ((System.currentTimeMillis() - recency).coerceAtLeast(0L) / 86_400_000L).toInt()
                 result += when {
                     ageDays <= 1 -> 3
