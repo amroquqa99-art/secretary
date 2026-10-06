@@ -41,7 +41,8 @@ jobs:
           fi
           test -x "$SDKMANAGER"
           yes | "$SDKMANAGER" --licenses >/dev/null || true
-          "$SDKMANAGER"             "platforms;android-36"             "build-tools;36.0.0"             "ndk;30.0.16248370"             "cmake;3.22.1"
+          "$SDKMANAGER"             "platforms;android-37"             "build-tools;36.0.0"             "ndk;30.0.16248370"             "cmake;3.22.1" \
+            --channel=3
 
       - name: Verify database migrations and server
         shell: bash
