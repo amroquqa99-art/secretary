@@ -65,9 +65,14 @@ private class MemoryVectorCache(context: Context) : SQLiteOpenHelper(context,"se
         )
     }
     fun clear() = writableDatabase.delete("vectors",null,null)
-    fun count(modelSha: String): Int = readableDatabase.rawQuery(
-        "SELECT COUNT(*) FROM vectors WHERE model_sha=?",arrayOf(modelSha)
-    ).use { c -> c.moveToFirst();c.getInt(0) }
+    fun current(document: MemoryDocument,modelSha: String): Boolean =
+        readableDatabase.rawQuery(
+            "SELECT revision FROM vectors WHERE kind=? AND item_id=? AND model_sha=?",
+            arrayOf(document.kind.name,document.id,modelSha)
+        ).use { c -> c.moveToFirst() && c.getString(0)==document.revision }
+    fun pruneOtherModels(modelSha: String) {
+        writableDatabase.delete("vectors","model_sha!=?",arrayOf(modelSha))
+    }
 }
 
 class SemanticMemory(
@@ -82,7 +87,7 @@ class SemanticMemory(
     fun stats(tasks: List<Task>,goals: List<Goal>,notes: List<Note>,messages: List<AssistantMessage>): SemanticMemoryStats {
         val docs=documents(tasks,goals,notes,messages)
         val sha=modelStore.selected()?.sha
-        return SemanticMemoryStats(docs.size,sha?.let(cache::count) ?: 0,sha)
+        return SemanticMemoryStats(docs.size,sha?.let { modelSha -> docs.count { cache.current(it,modelSha) } } ?: 0,sha)
     }
 
     fun rebuild(
@@ -90,20 +95,24 @@ class SemanticMemory(
         goals: List<Goal>,
         notes: List<Note>,
         messages: List<AssistantMessage>,
-        token: AtomicBoolean
+        token: AtomicBoolean,
+        onProgress: (Int,Int)->Unit = { _,_ -> }
     ): SemanticMemoryStats {
         val model=requireNotNull(modelStore.selected()) { "نزّل نموذج الذاكرة أولاً" }
         require(modelStore.enabled) { "فعّل الذاكرة الدلالية أولاً" }
         val docs=documents(tasks,goals,notes,messages)
         require(docs.isNotEmpty()) { "لا توجد بيانات قابلة للفهرسة" }
-        cache.clear()
-        val vectors=runner.embedDocuments(docs.map { it.text },model,token)
-        require(vectors.size==docs.size)
-        docs.zip(vectors).forEach { (doc,vector) ->
-            if(token.get())throw java.util.concurrent.CancellationException("توقفت الفهرسة")
-            cache.put(doc,model.sha,vector)
+        cache.pruneOtherModels(model.sha)
+        val pending=docs.filterNot { cache.current(it,model.sha) }
+        if(pending.isNotEmpty()) {
+            runner.embedDocuments(pending.map { it.text },model,token) { index,vector ->
+                if(token.get())throw java.util.concurrent.CancellationException("توقفت الفهرسة")
+                cache.put(pending[index],model.sha,vector)
+                onProgress(index+1,pending.size)
+            }
         }
-        return SemanticMemoryStats(docs.size,docs.size,model.sha)
+        val indexed=docs.count { cache.current(it,model.sha) }
+        return SemanticMemoryStats(docs.size,indexed,model.sha)
     }
 
     fun retrieve(
@@ -131,7 +140,7 @@ class SemanticMemory(
             .sortedByDescending { it.second }
             .take(limit)
             .map { it.first.id }
-            .toSet()
+            .toList()
 
         val taskIds=ids(MemoryKind.TASK,8)
         val goalIds=ids(MemoryKind.GOAL,4)
@@ -153,7 +162,7 @@ class SemanticMemory(
         messages: List<AssistantMessage>
     ): List<MemoryDocument> = buildList {
         tasks.filter { it.status !in setOf(TaskStatus.DONE,TaskStatus.DROPPED) }.take(150).forEach { task ->
-            val text=listOfNotNull(task.title,task.definitionOfDone,task.failureReason).joinToString("\n").take(4000)
+            val text=listOfNotNull(task.title,task.definitionOfDone,task.failureReason).joinToString("\n").take(1800)
             add(document(MemoryKind.TASK,task.id,text))
         }
         goals.filter { it.status==GoalStatus.ACTIVE }.take(60).forEach { goal ->
@@ -161,7 +170,7 @@ class SemanticMemory(
             add(document(MemoryKind.GOAL,goal.id,text))
         }
         notes.sortedByDescending { it.updatedAt }.take(150).forEach { note ->
-            add(document(MemoryKind.NOTE,note.id,(note.title+"\n"+note.markdown).take(4000)))
+            add(document(MemoryKind.NOTE,note.id,(note.title+"\n"+note.markdown).take(1800)))
         }
         messages.takeLast(120).forEach { message ->
             add(document(MemoryKind.MESSAGE,message.id,(message.role+"\n"+message.text).take(4000)))
@@ -181,11 +190,5 @@ class SemanticMemory(
         var sum=0f
         for(i in a.indices)sum+=a[i]*b[i]
         return max(-1f,sum.coerceAtMost(1f))
-    }
-
-    private fun <T> Set<T>.indexOf(value: T): Int {
-        var i=0
-        for(item in this){if(item==value)return i;i++}
-        return Int.MAX_VALUE
     }
 }

@@ -12,7 +12,7 @@ bool Session::stopped() const {return cancelled.load() || std::chrono::steady_cl
 void Session::check() const {if(stopped())throw std::runtime_error("Cancelled or timed out");}
 bool Session::abort(void* data){return static_cast<Session*>(data)->stopped();}
 bool Session::progress(float,void* data){return !static_cast<Session*>(data)->stopped();}
-Session::Session(const std::string& path,bool embedding_mode):embedding_mode(embedding_mode),deadline(std::chrono::steady_clock::now()+std::chrono::seconds(120)) {
+Session::Session(const std::string& path,bool embedding_mode):embedding_mode(embedding_mode),deadline(std::chrono::steady_clock::now()+std::chrono::seconds(embedding_mode?600:120)) {
     std::call_once(initialized,[]{llama_backend_init();});
     try {
         auto parameters=llama_model_default_params();
@@ -97,10 +97,11 @@ std::vector<float> Session::embed(const std::string& text) {
     check();
     const auto* vocab=llama_model_get_vocab(model);
     int count=llama_tokenize(vocab,text.data(),text.size(),nullptr,0,true,true);
-    if(count>=0 || -count>1024)throw std::runtime_error("Embedding input is too long");
+    if(count>=0 || -count>8192)throw std::runtime_error("Embedding tokenization failed");
     std::vector<llama_token> tokens(-count);
     count=llama_tokenize(vocab,text.data(),text.size(),tokens.data(),tokens.size(),true,true);
     if(count<=0)throw std::runtime_error("Embedding tokenization failed");
+    if(count>1024){count=1024;tokens.resize(count);}
 
     llama_memory_clear(llama_get_memory(context),true);
     llama_batch batch=llama_batch_init(count,0,1);

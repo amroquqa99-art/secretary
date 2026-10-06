@@ -33,28 +33,39 @@ class EmbeddingRunner(private val context: Context,private val store: EmbeddingM
 
     fun embedQuery(query: String,model: InstalledModel,token: AtomicBoolean): FloatArray {
         val instruction="Instruct: Retrieve the most relevant private personal-memory item for this user request.\nQuery: "
-        return embedAll(listOf(instruction+query),model,token).single()
+        return embedAll(listOf(instruction+query),model,token,120).single()
     }
 
-    fun embedDocuments(texts: List<String>,model: InstalledModel,token: AtomicBoolean): List<FloatArray> =
-        embedAll(texts,model,token)
+    fun embedDocuments(
+        texts: List<String>,
+        model: InstalledModel,
+        token: AtomicBoolean,
+        onVector: (Int,FloatArray)->Unit = { _,_ -> }
+    ): List<FloatArray> = embedAll(texts,model,token,600,onVector)
 
-    private fun embedAll(texts: List<String>,model: InstalledModel,token: AtomicBoolean): List<FloatArray> {
+    private fun embedAll(
+        texts: List<String>,
+        model: InstalledModel,
+        token: AtomicBoolean,
+        timeoutSeconds: Long,
+        onVector: (Int,FloatArray)->Unit = { _,_ -> }
+    ): List<FloatArray> {
         require(texts.isNotEmpty() && texts.size<=500) { "عدد عناصر الفهرسة كبير" }
         require(texts.all { it.isNotBlank() && it.length<=4000 && '\u0000' !in it }) { "نص ذاكرة غير صالح" }
         checkCancelled(token);checkResources(model=model)
         val weights=store.verify(model);checkCancelled(token)
         val watchdog=Executors.newSingleThreadScheduledExecutor()
         var handle=0L
-        watchdog.schedule({token.set(true);cancel()},120,TimeUnit.SECONDS)
+        watchdog.schedule({token.set(true);cancel()},timeoutSeconds,TimeUnit.SECONDS)
         try {
             handle=NativeBridge.openEmbedding(weights.absolutePath)
             synchronized(lock) { require(activeHandle==0L);activeHandle=handle }
             checkCancelled(token);checkResources(false,model)
-            return texts.map { text ->
+            return texts.mapIndexed { index,text ->
                 checkCancelled(token)
                 NativeBridge.embed(handle,text.toByteArray(Charsets.UTF_8)).also { vector ->
                     require(vector.isNotEmpty() && vector.size<=8192 && vector.all { it.isFinite() }) { "أعاد نموذج الذاكرة متجهاً غير صالح" }
+                    onVector(index,vector)
                 }
             }
         } catch(e: Exception) {

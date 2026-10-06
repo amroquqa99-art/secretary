@@ -159,7 +159,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         synchronized(modelLock){modelToken?.set(true)}
         if(modelBusy.get()) {
             _model.value=_model.value.copy(status="جارٍ الإيقاف؛ تحميل المحرك قد يحتاج وقتاً لينتهي")
-            viewModelScope.launch(Dispatchers.IO){modelRunner.cancel()}
+            viewModelScope.launch(Dispatchers.IO){modelRunner.cancel();embeddingRunner.cancel()}
         }
     }
     fun modelDownload()=modelOperation("تنزيل النموذج؛ تبقى الشاشة مفتوحة") { token ->
@@ -171,7 +171,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         "تم الاستيراد. توافق الملف لا يتأكد إلا عند التشغيل."
     }
     fun modelEnable(enabled: Boolean) {
-        if(modelBusy.get()){_notice.value="أوقف العملية الحالية أولاً";return}
+        if(aiBusy.get()){_notice.value="أوقف عملية الذكاء المحلي الحالية أولاً";return}
         operation {
             if(enabled){require(modelStore.selected()!=null) { "نزّل النموذج أو استورده أولاً" };modelRunner.checkResources()}
             modelStore.enabled=enabled
@@ -242,8 +242,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             notes=repo.listNotes()
             messages=assistantStore.messages()
         }
-        val stats=semanticMemory.rebuild(tasks,goals,notes,messages,token)
-        "اكتمل بناء ${stats.indexed} عنصر ذاكرة محلياً."
+        val stats=semanticMemory.rebuild(tasks,goals,notes,messages,token) { done,total ->
+            _semantic.value=_semantic.value.copy(status="فهرسة الذاكرة: $done / $total")
+        }
+        "اكتمل بناء ${stats.indexed} من ${stats.documents} عنصر ذاكرة محلياً."
     }
     fun semanticRemove()=semanticOperation("إزالة نموذج الذاكرة والفهرس المشتق") { _ ->
         embeddingStore.remove();semanticMemory.clear()
