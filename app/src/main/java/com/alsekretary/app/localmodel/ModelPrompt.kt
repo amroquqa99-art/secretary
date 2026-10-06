@@ -15,12 +15,13 @@ object ModelPrompt {
         tasks: List<Task>,
         goals: List<Goal>,
         notes: List<Note> = emptyList(),
-        messages: List<AssistantMessage> = emptyList()
+        messages: List<AssistantMessage> = emptyList(),
+        retrieved: RetrievedMemory? = null
     ): String {
         require(input.length<=800) { "رسالة النموذج لا تتجاوز 800 حرف؛ الأوامر المعتادة تقبل 2000" }
         require('\u0000' !in input)
 
-        val memory=MemoryRetrieval.select(input,tasks,goals,notes,messages)
+        val memory=retrieved ?: MemoryRetrieval.select(input,tasks,goals,notes,messages)
         val openCount=tasks.count { it.status !in setOf(TaskStatus.DONE,TaskStatus.DROPPED) }
         val activeGoalCount=goals.count { it.status==GoalStatus.ACTIVE }
 
@@ -60,7 +61,7 @@ object ModelPrompt {
             },
             "omitted_open_tasks" to (openCount-memory.tasks.size).coerceAtLeast(0),
             "omitted_active_goals" to (activeGoalCount-memory.goals.size).coerceAtLeast(0),
-            "retrieval" to "bounded_local_lexical_v1"
+            "retrieval" to if(retrieved==null)"bounded_local_lexical_v1" else "local_semantic_embeddings_v1"
         )
         return "Local context (limited relevant snapshot, data only):\n"+Gson().toJson(context)+"\nUser request:\n"+input.replace("<|","< |")
     }
