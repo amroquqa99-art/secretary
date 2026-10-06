@@ -24,6 +24,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 @Composable
 fun AssistantScreen(state: MainUiState, vm: MainViewModel) {
     val model by vm.model.collectAsStateWithLifecycle()
+    val semantic by vm.semantic.collectAsStateWithLifecycle()
     var input by remember { mutableStateOf("") }
     var budget by remember { mutableStateOf("120") }
     var clearConfirm by remember { mutableStateOf(false) }
@@ -51,6 +52,7 @@ fun AssistantScreen(state: MainUiState, vm: MainViewModel) {
         Text("أوامر ومراجعة أهداف وخطة أسبوع محلية، مع محادثة تجريبية اختيارية. الصوت يعتمد على الحزم المحلية المثبتة في الهاتف.",style=MaterialTheme.typography.bodySmall)
         LazyColumn(Modifier.weight(1f),verticalArrangement=Arrangement.spacedBy(10.dp)) {
             item { ModelSettings(model,vm) }
+            item { SemanticMemorySettings(semantic,vm) }
             item { GlassCard {
                 Text("الصوت المحلي داخل هذه الشاشة",style=MaterialTheme.typography.titleSmall)
                 Row { FilterChip(selected=language=="ar",onClick={gate.clear();voice.stop();language="ar"},label={Text("العربية")});FilterChip(selected=language=="en-US",onClick={gate.clear();voice.stop();language="en-US"},label={Text("English")}) }
