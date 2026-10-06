@@ -50,7 +50,7 @@ class ModelStore(context: Context,private val minimumBytes: Long=16L*1024*1024) 
         require(it.length()==model.bytes && digest(it)==model.sha) { "ملف النموذج تالف؛ أعد تنزيله أو استيراده" }
     }
     internal fun commit(part: File,name: String,expected: String?=null,cancel: AtomicBoolean=AtomicBoolean()): InstalledModel {
-        require(part.length() in minimumBytes..750L*1024*1024) { "حجم النموذج غير مدعوم" }
+        require(part.length() in minimumBytes..1500L*1024*1024) { "حجم النموذج غير مدعوم" }
         val header=ByteArray(8);DataInputStream(part.inputStream()).use { it.readFully(header) }
         require(String(header.copyOfRange(0,4),Charsets.US_ASCII)=="GGUF" && header[4].toInt() in 2..3 && header.sliceArray(5..7).all { it.toInt()==0 }) { "اختر ملف GGUF مدعوماً؛ ملفات LiteRT السابقة لا تعمل بالمحرك الجديد" }
         val sha=digest(part)
@@ -84,7 +84,7 @@ class ModelStore(context: Context,private val minimumBytes: Long=16L*1024*1024) 
         try {
             input.use { source -> part.outputStream().use { sink ->
                 val buffer=ByteArray(262144);var total=0L
-                while(true){checkCancelled(cancel);val n=source.read(buffer);if(n<0)break;total+=n;require(total<=750L*1024*1024 && root.usableSpace>=8L*1024*1024) { "لا توجد مساحة كافية أو الملف أكبر من الحد" };sink.write(buffer,0,n)}
+                while(true){checkCancelled(cancel);val n=source.read(buffer);if(n<0)break;total+=n;require(total<=1500L*1024*1024 && root.usableSpace>=8L*1024*1024) { "لا توجد مساحة كافية أو الملف أكبر من الحد" };sink.write(buffer,0,n)}
             } }
             return commit(part,name,cancel=cancel)
         } finally { part.delete() }

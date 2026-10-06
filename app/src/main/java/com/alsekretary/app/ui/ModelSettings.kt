@@ -16,7 +16,7 @@ fun ModelSettings(model: ModelUiState,vm: MainViewModel) {
     GlassCard {
         Text("نموذج المحادثة — تجريبي",style=MaterialTheme.typography.titleMedium)
         Text(model.installed?.name ?: "${ModelCatalog.NAME} • تنزيل ${ModelCatalog.SIZE/(1024*1024)} ميغابايت")
-        Text("يعمل محلياً بعد التنزيل. يحتاج نظام 64 بت وذاكرة متاحة كافية. النموذج قد يخطئ؛ راجع ردوده واقتراحاته. أداء هاتفك لم يُختبر بعد.",style=MaterialTheme.typography.bodySmall)
+        Text("يعمل محلياً بعد التنزيل. يحتاج نظام 64 بت وذاكرة متاحة كافية. جودة العربية ما زالت ضعيفة وتجريبية؛ راجع الردود والاقتراحات. أداء هاتفك لم يُختبر بعد.",style=MaterialTheme.typography.bodySmall)
         Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.SpaceBetween) {
             Text("المحادثة المحلية الاختيارية",Modifier.weight(1f))
             Switch(checked=model.enabled,onCheckedChange=vm::modelEnable,enabled=!model.busy && model.installed?.format==ModelFormat.GGUF)

@@ -1,4 +1,4 @@
-> سجل تحقق لإصدار 0.3.0. نتائج الإصدار الحالي في RELEASE_0_6_0.md وchecks/android-test-results.json.
+> سجل تحقق لإصدار 0.3.0. نتائج الإصدار الحالي في RELEASE_0_7_0.md وchecks/android-test-results.json.
 
 # التحقق الإضافي من Android — 2026-10-05
 

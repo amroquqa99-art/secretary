@@ -25,7 +25,7 @@ class ModelRunner(private val context: Context,private val store: ModelStore) {
         if(checkMemory) {
             val memory=ActivityManager.MemoryInfo()
             (context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager).getMemoryInfo(memory)
-            val required=maxOf(1_200_000_000L,requireNotNull(model).bytes*2+200_000_000L)
+            val required=maxOf(1_200_000_000L,requireNotNull(model).bytes*18/10+300_000_000L)
             require(!memory.lowMemory && memory.availMem>=required) { "الذاكرة المتاحة قليلة لتشغيل هذا النموذج؛ أغلق بعض التطبيقات أو استخدم الأوامر المكتوبة" }
         }
         if(Build.VERSION.SDK_INT>=29)require((context.getSystemService(Context.POWER_SERVICE) as PowerManager).currentThermalStatus<PowerManager.THERMAL_STATUS_SEVERE) { "الهاتف ساخن؛ انتظر قبل تشغيل النموذج" }
