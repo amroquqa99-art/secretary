@@ -1,0 +1,49 @@
+name: Android CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android toolchain
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null
+          sdkmanager             "platforms;android-37"             "build-tools;36.0.0"             "ndk;30.0.16248370"             "cmake;3.22.1"
+
+      - name: Verify database migrations and server
+        shell: bash
+        run: |
+          python3 checks/verify_migration.py
+          python3 checks/verify_v4.py
+          python3 checks/verify_v5.py
+          python3 -m unittest discover -s server -p 'test_*.py' -v
+
+      - name: Unit tests, APK and lint
+        shell: bash
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon --stacktrace :app:testDebugUnitTest :app:assembleDebug :app:lintDebug
