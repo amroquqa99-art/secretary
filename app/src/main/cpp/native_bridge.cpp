@@ -21,22 +21,34 @@ std::shared_ptr<secretary::Session> get(jlong handle) {
     if(found==sessions.end())throw std::invalid_argument("Model session is closed");
     return found->second;
 }
+jlong open(JNIEnv* env,jstring path,bool embedding) {
+    if(!path)throw std::invalid_argument("Missing model path");
+    const char* encoded=env->GetStringUTFChars(path,nullptr);
+    if(!encoded)throw std::runtime_error("Cannot read model path");
+    std::string filename(encoded);env->ReleaseStringUTFChars(path,encoded);
+    auto session=std::make_shared<secretary::Session>(filename,embedding);
+    std::lock_guard<std::mutex> guard(lock);jlong id=++sequence;sessions.emplace(id,std::move(session));return id;
+}
 void fail(JNIEnv* env,const std::exception& error){if(!env->ExceptionCheck())env->ThrowNew(env->FindClass("java/lang/IllegalStateException"),error.what());}
 }
 extern "C" JNIEXPORT jlong JNICALL Java_com_alsekretary_app_localmodel_NativeBridge_open(JNIEnv* env,jobject,jstring path) {
-    try {
-        if(!path)throw std::invalid_argument("Missing model path");
-        const char* encoded=env->GetStringUTFChars(path,nullptr);
-        if(!encoded)throw std::runtime_error("Cannot read model path");
-        std::string filename(encoded);env->ReleaseStringUTFChars(path,encoded);
-        auto session=std::make_shared<secretary::Session>(filename);
-        std::lock_guard<std::mutex> guard(lock);jlong id=++sequence;sessions.emplace(id,std::move(session));return id;
-    } catch(const std::exception& error){fail(env,error);return 0;}
+    try {return open(env,path,false);} catch(const std::exception& error){fail(env,error);return 0;}
+}
+extern "C" JNIEXPORT jlong JNICALL Java_com_alsekretary_app_localmodel_NativeBridge_openEmbedding(JNIEnv* env,jobject,jstring path) {
+    try {return open(env,path,true);} catch(const std::exception& error){fail(env,error);return 0;}
 }
 extern "C" JNIEXPORT jbyteArray JNICALL Java_com_alsekretary_app_localmodel_NativeBridge_generate(JNIEnv* env,jobject,jlong id,jbyteArray system,jbyteArray user,jbyteArray grammar,jint maximum) {
     try {
         auto result=get(id)->generate(bytes(env,system),bytes(env,user),bytes(env,grammar),maximum);
         auto output=env->NewByteArray(result.size());if(output)env->SetByteArrayRegion(output,0,result.size(),reinterpret_cast<const jbyte*>(result.data()));return output;
+    } catch(const std::exception& error){fail(env,error);return nullptr;}
+}
+extern "C" JNIEXPORT jfloatArray JNICALL Java_com_alsekretary_app_localmodel_NativeBridge_embed(JNIEnv* env,jobject,jlong id,jbyteArray text) {
+    try {
+        auto result=get(id)->embed(bytes(env,text));
+        auto output=env->NewFloatArray(result.size());
+        if(output)env->SetFloatArrayRegion(output,0,result.size(),result.data());
+        return output;
     } catch(const std::exception& error){fail(env,error);return nullptr;}
 }
 extern "C" JNIEXPORT void JNICALL Java_com_alsekretary_app_localmodel_NativeBridge_cancel(JNIEnv*,jobject,jlong id) {try{get(id)->cancel();}catch(const std::exception&){} }
