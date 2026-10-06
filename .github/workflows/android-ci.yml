@@ -32,17 +32,25 @@ jobs:
           java-version: "21"
           cache: gradle
 
-      - name: Install Android toolchain
+      - name: Install current Android CLI and toolchain
         shell: bash
         run: |
-          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
-          if [ ! -x "$SDKMANAGER" ]; then
-            SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager | sort | tail -n 1)"
-          fi
+          CLI_ZIP="$RUNNER_TEMP/android-command-line-tools.zip"
+          curl --fail --location --retry 3 \
+            "https://dl.google.com/android/repository/commandlinetools-linux-15859902_latest.zip" \
+            --output "$CLI_ZIP"
+          echo "4e4c464f145a7512b57d088ac6c278c03c9eea610886b35a5e0804e74eedf583  $CLI_ZIP" | sha256sum --check -
+          rm -rf "$RUNNER_TEMP/android-cli"
+          mkdir -p "$RUNNER_TEMP/android-cli"
+          unzip -q "$CLI_ZIP" -d "$RUNNER_TEMP/android-cli"
+          SDKMANAGER="$RUNNER_TEMP/android-cli/cmdline-tools/bin/sdkmanager"
           test -x "$SDKMANAGER"
-          yes | "$SDKMANAGER" --licenses >/dev/null || true
-          "$SDKMANAGER"             "platforms;android-37"             "build-tools;36.0.0"             "ndk;30.0.16248370"             "cmake;3.22.1" \
-            --channel=3
+          yes | "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --licenses >/dev/null || true
+          "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --channel=3 \
+            "platforms;android-37" \
+            "build-tools;36.0.0" \
+            "ndk;30.0.16248370" \
+            "cmake;3.22.1"
 
       - name: Verify database migrations and server
         shell: bash
