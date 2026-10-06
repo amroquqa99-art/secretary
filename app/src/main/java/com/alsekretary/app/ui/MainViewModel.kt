@@ -172,7 +172,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             } else {
                 val weights=requireNotNull(modelStore.selected()) { "النموذج غير موجود؛ أعد تنزيله" }
                 snapshot=repo.listTodayTasks(true)
-                prompt=ModelPrompt.build(text,snapshot,repo.listGoals())
+                prompt=ModelPrompt.build(text,snapshot,repo.listGoals(),repo.listNotes(),assistantStore.messages())
                 weights
             }
         }
