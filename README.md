@@ -18,7 +18,7 @@
 
 ## بناء Android
 
-يتطلب JDK 21 وAndroid SDK Platform 36 وBuild Tools 36.0.0 وNDK `30.0.16248370` وCMake `3.22.1`. ضع مسار SDK في `local.properties` على جهازك، أو استخدم Android Studio.
+يتطلب JDK 21 وAndroid SDK Platform 37 (Android 17 Preview channel) وBuild Tools 36.0.0 وNDK `30.0.16248370` وCMake `3.22.1`. ضع مسار SDK في `local.properties` على جهازك، أو استخدم Android Studio.
 
 ```bash
 ./gradlew clean --no-build-cache :app:testDebugUnitTest :app:assembleDebug :app:lintDebug
