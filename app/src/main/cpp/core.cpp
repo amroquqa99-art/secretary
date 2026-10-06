@@ -1,5 +1,6 @@
 #include "core.h"
 #include <algorithm>
+#include <cmath>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -11,7 +12,7 @@ bool Session::stopped() const {return cancelled.load() || std::chrono::steady_cl
 void Session::check() const {if(stopped())throw std::runtime_error("Cancelled or timed out");}
 bool Session::abort(void* data){return static_cast<Session*>(data)->stopped();}
 bool Session::progress(float,void* data){return !static_cast<Session*>(data)->stopped();}
-Session::Session(const std::string& path):deadline(std::chrono::steady_clock::now()+std::chrono::seconds(120)) {
+Session::Session(const std::string& path,bool embedding_mode):embedding_mode(embedding_mode),deadline(std::chrono::steady_clock::now()+std::chrono::seconds(120)) {
     std::call_once(initialized,[]{llama_backend_init();});
     try {
         auto parameters=llama_model_default_params();
@@ -23,9 +24,15 @@ Session::Session(const std::string& path):deadline(std::chrono::steady_clock::no
         if(!model)throw std::runtime_error("Cannot load this GGUF model");
         check();
         auto settings=llama_context_default_params();
-        settings.n_ctx=2048;settings.n_batch=128;settings.n_ubatch=128;
+        settings.n_ctx=embedding_mode?1024:2048;
+        settings.n_batch=embedding_mode?1024:128;
+        settings.n_ubatch=embedding_mode?1024:128;
         settings.n_threads=2;settings.n_threads_batch=2;
         settings.abort_callback=abort;settings.abort_callback_data=this;
+        if(embedding_mode) {
+            settings.embeddings=true;
+            settings.pooling_type=LLAMA_POOLING_TYPE_LAST;
+        }
         context=llama_init_from_model(model,settings);
         if(!context)throw std::runtime_error("Cannot allocate model context");
         check();
@@ -34,6 +41,7 @@ Session::Session(const std::string& path):deadline(std::chrono::steady_clock::no
 Session::~Session(){cleanup();}
 void Session::cleanup(){if(context){llama_free(context);context=nullptr;}if(model){llama_model_free(model);model=nullptr;}}
 std::string Session::generate(const std::string& system,const std::string& user,const std::string& grammar,int maximum) {
+    if(embedding_mode)throw std::runtime_error("Embedding session cannot generate text");
     bool expected=false;
     if(!generating.compare_exchange_strong(expected,true))throw std::runtime_error("Generation already running");
     struct Guard {std::atomic<bool>& flag;~Guard(){flag.store(false);}} guard{generating};
@@ -79,5 +87,49 @@ std::string Session::generate(const std::string& system,const std::string& user,
         if(llama_decode(context,llama_batch_get_one(&next,1))!=0){check();throw std::runtime_error("Model decoding failed");}
     }
     check();return output;
+}
+std::vector<float> Session::embed(const std::string& text) {
+    if(!embedding_mode)throw std::runtime_error("Text generation session cannot create embeddings");
+    bool expected=false;
+    if(!generating.compare_exchange_strong(expected,true))throw std::runtime_error("Embedding already running");
+    struct Guard {std::atomic<bool>& flag;~Guard(){flag.store(false);}} guard{generating};
+    if(text.empty() || text.size()>8192 || text.find('\0')!=std::string::npos)throw std::invalid_argument("Invalid embedding input");
+    check();
+    const auto* vocab=llama_model_get_vocab(model);
+    int count=llama_tokenize(vocab,text.data(),text.size(),nullptr,0,true,true);
+    if(count>=0 || -count>1024)throw std::runtime_error("Embedding input is too long");
+    std::vector<llama_token> tokens(-count);
+    count=llama_tokenize(vocab,text.data(),text.size(),tokens.data(),tokens.size(),true,true);
+    if(count<=0)throw std::runtime_error("Embedding tokenization failed");
+
+    llama_memory_clear(llama_get_memory(context),true);
+    llama_batch batch=llama_batch_init(count,0,1);
+    if(!batch.token || !batch.pos || !batch.n_seq_id || !batch.seq_id || !batch.logits) {
+        llama_batch_free(batch);
+        throw std::runtime_error("Cannot allocate embedding batch");
+    }
+    batch.n_tokens=count;
+    for(int i=0;i<count;i++) {
+        batch.token[i]=tokens[i];
+        batch.pos[i]=i;
+        batch.n_seq_id[i]=1;
+        batch.seq_id[i][0]=0;
+        batch.logits[i]=1;
+    }
+    const int rc=llama_decode(context,batch);
+    llama_batch_free(batch);
+    if(rc!=0){check();throw std::runtime_error("Embedding decode failed");}
+    check();
+    float* source=llama_get_embeddings_seq(context,0);
+    if(!source)throw std::runtime_error("Model does not expose pooled embeddings");
+    const int dim=llama_model_n_embd_out(model);
+    if(dim<1 || dim>8192)throw std::runtime_error("Invalid embedding dimension");
+    std::vector<float> result(source,source+dim);
+    double sum=0.0;
+    for(float value:result)sum+=static_cast<double>(value)*value;
+    const double norm=std::sqrt(sum);
+    if(!std::isfinite(norm) || norm<=0.0)throw std::runtime_error("Invalid embedding vector");
+    for(float& value:result)value=static_cast<float>(value/norm);
+    return result;
 }
 }
