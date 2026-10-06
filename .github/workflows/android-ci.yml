@@ -43,14 +43,13 @@ jobs:
           rm -rf "$RUNNER_TEMP/android-cli"
           mkdir -p "$RUNNER_TEMP/android-cli"
           unzip -q "$CLI_ZIP" -d "$RUNNER_TEMP/android-cli"
-          SDKMANAGER="$RUNNER_TEMP/android-cli/cmdline-tools/bin/sdkmanager"
-          test -x "$SDKMANAGER"
-          yes | "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --licenses >/dev/null || true
-          "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --channel=3 \
-            "platforms;android-37" \
-            "build-tools;36.0.0" \
-            "ndk;30.0.16248370" \
-            "cmake;3.22.1"
+          ANDROID_CLI="$RUNNER_TEMP/android-cli/cmdline-tools/bin/android"
+          test -x "$ANDROID_CLI"
+          "$ANDROID_CLI" --sdk="$ANDROID_HOME" sdk install --canary \
+            platforms/android-37 \
+            build-tools/36.0.0 \
+            ndk/30.0.16248370 \
+            cmake/3.22.1
 
       - name: Verify database migrations and server
         shell: bash
