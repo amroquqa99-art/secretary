@@ -178,7 +178,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         if(selected==null) "اكتمل الرد بالأوامر المحلية" else {
             _model.value=_model.value.copy(status="النموذج يولد الرد محلياً؛ يمكنك إيقافه")
-            val generated=modelRunner.run(prompt,selected,token,ModelPrompt.requestsAction(text))
+            val generated=modelRunner.run(prompt,selected,token,ModelPrompt.requestsAction(text),text)
             operationMutex.withLock {
                 synchronized(modelLock) {
                     if(token.get() || !modelStore.enabled || modelStore.selected()?.sha!=selected.sha)throw java.util.concurrent.CancellationException()

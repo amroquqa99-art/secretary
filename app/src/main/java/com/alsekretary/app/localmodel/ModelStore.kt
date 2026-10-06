@@ -13,13 +13,14 @@ import java.util.UUID
 import java.util.concurrent.CancellationException
 import java.util.concurrent.atomic.AtomicBoolean
 
-data class InstalledModel(val sha: String,val name: String,val bytes: Long)
+enum class ModelFormat(val suffix: String) { LITERTLM("litertlm"), GGUF("gguf") }
+data class InstalledModel(val sha: String,val name: String,val bytes: Long,val format: ModelFormat=ModelFormat.LITERTLM)
 object ModelCatalog {
-    const val NAME="Qwen3 0.6B — INT4"
-    const val SIZE=344671744L
-    const val SHA="03e7da1eb1108b50dffaa9bb52cc7bcbad2eb0c66ca990267f480c1e545d2856"
-    const val REVISION="a3c5d805ae362dff7f580bc25f2dfb9a5a7eaa76"
-    const val URL="https://huggingface.co/litert-community/Qwen3-0.6B/resolve/$REVISION/Qwen3-0.6B_dynamic_wi4b32_afp32.litertlm"
+    const val NAME="Qwen2.5 0.5B — Q4_K_M"
+    const val SIZE=491400032L
+    const val SHA="74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db"
+    const val REVISION="9217f5db79a29953eb74d5343926648285ec7e67"
+    const val URL="https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/$REVISION/qwen2.5-0.5b-instruct-q4_k_m.gguf"
 }
 
 /** Owned copies of public weights. Never included in the personal data backup. */
@@ -28,17 +29,17 @@ class ModelStore(context: Context,private val minimumBytes: Long=16L*1024*1024) 
     private val selection=AtomicFile(File(root,"selection.json"))
     private val preferences=context.getSharedPreferences("local-model-settings",Context.MODE_PRIVATE)
     var enabled: Boolean
-        get()=preferences.getBoolean("enabled",false)
+        get()=preferences.getBoolean("enabled",false) && selected()?.format==ModelFormat.GGUF
         set(value){preferences.edit().putBoolean("enabled",value).apply()}
     fun selected(): InstalledModel? = runCatching {
         val sha=JSONObject(String(selection.readFully(),Charsets.UTF_8)).getString("sha")
         require(sha.matches(Regex("[a-f0-9]{64}")))
         val metadata=JSONObject(File(root,"$sha/info.json").readText())
-        InstalledModel(sha,metadata.getString("name"),metadata.getLong("bytes")).also { require(file(it).isFile && file(it).length()==it.bytes) }
+        InstalledModel(sha,metadata.getString("name"),metadata.getLong("bytes"),ModelFormat.valueOf(metadata.optString("format","LITERTLM"))).also { require(file(it).isFile && file(it).length()==it.bytes) }
     }.getOrNull()
     fun file(model: InstalledModel): File {
         require(model.sha.matches(Regex("[a-f0-9]{64}")))
-        return File(root,"${model.sha}/weights.litertlm")
+        return File(root,"${model.sha}/weights.${model.format.suffix}")
     }
     private fun digest(file: File): String {
         val hash=MessageDigest.getInstance("SHA-256")
@@ -51,23 +52,23 @@ class ModelStore(context: Context,private val minimumBytes: Long=16L*1024*1024) 
     internal fun commit(part: File,name: String,expected: String?=null,cancel: AtomicBoolean=AtomicBoolean()): InstalledModel {
         require(part.length() in minimumBytes..750L*1024*1024) { "حجم النموذج غير مدعوم" }
         val header=ByteArray(8);DataInputStream(part.inputStream()).use { it.readFully(header) }
-        require(String(header,Charsets.US_ASCII)=="LITERTLM") { "اختر ملف نموذج بصيغة .litertlm" }
+        require(String(header.copyOfRange(0,4),Charsets.US_ASCII)=="GGUF" && header[4].toInt() in 2..3 && header.sliceArray(5..7).all { it.toInt()==0 }) { "اختر ملف GGUF مدعوماً؛ ملفات LiteRT السابقة لا تعمل بالمحرك الجديد" }
         val sha=digest(part)
         require(expected==null || sha==expected) { "فشل التحقق من النموذج؛ لم يتغير النموذج السابق" }
         checkCancelled(cancel)
-        var model=InstalledModel(sha,name.take(120),part.length())
+        var model=InstalledModel(sha,name.take(120),part.length(),ModelFormat.GGUF)
         val destination=File(root,sha)
         val cached=if(destination.exists())runCatching {
             val metadata=JSONObject(File(destination,"info.json").readText())
-            InstalledModel(sha,metadata.getString("name"),metadata.getLong("bytes")).also { require(it.bytes==model.bytes);verify(it) }
+            InstalledModel(sha,metadata.getString("name"),metadata.getLong("bytes"),ModelFormat.valueOf(metadata.optString("format","LITERTLM"))).also { require(it.bytes==model.bytes && it.format==model.format);verify(it) }
         }.getOrNull() else null
         // Replace only a corrupt owned cache after the incoming copy has passed verification.
         if(destination.exists() && cached==null)require(destination.deleteRecursively())
         if(!destination.exists()) {
             val staging=File(root,"install-${UUID.randomUUID()}").apply { mkdirs() }
             try {
-                require(part.renameTo(File(staging,"weights.litertlm")))
-                File(staging,"info.json").writeText(JSONObject().put("name",model.name).put("bytes",model.bytes).toString())
+                require(part.renameTo(File(staging,"weights.${model.format.suffix}")))
+                File(staging,"info.json").writeText(JSONObject().put("name",model.name).put("bytes",model.bytes).put("format",model.format.name).toString())
                 require(staging.renameTo(destination))
             } finally { staging.deleteRecursively() }
         } else { model=requireNotNull(cached);part.delete() }

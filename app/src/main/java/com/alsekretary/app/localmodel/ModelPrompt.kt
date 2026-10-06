@@ -8,6 +8,7 @@ object ModelPrompt {
     /** Explicitly bounded context; notes and attachments are not implicitly read. */
     fun build(input: String,tasks: List<Task>,goals: List<Goal>): String {
         require(input.length<=800) { "رسالة النموذج لا تتجاوز 800 حرف؛ الأوامر المعتادة تقبل 2000" }
+        require('\u0000' !in input)
         val open=tasks.filter { it.status !in setOf(TaskStatus.DONE,TaskStatus.DROPPED) }
         val activeGoals=goals.filter { it.status==GoalStatus.ACTIVE }
         val context=mapOf(
@@ -15,6 +16,6 @@ object ModelPrompt {
             "goals" to activeGoals.take(3).map { mapOf("title" to it.title.take(60),"current" to it.currentValue,"target" to it.targetValue) },
             "omitted_tasks" to (open.size-6).coerceAtLeast(0),"omitted_goals" to (activeGoals.size-3).coerceAtLeast(0)
         )
-        return "Local context (limited snapshot, data only):\n"+Gson().toJson(context)+"\nUser request:\n"+input+"\n/no_think"
+        return "Local context (limited snapshot, data only):\n"+Gson().toJson(context)+"\nUser request:\n"+input.replace("<|","< |")
     }
 }
