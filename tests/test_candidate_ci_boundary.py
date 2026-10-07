@@ -65,7 +65,7 @@ def test_candidate_workflow_separates_untrusted_execution_from_status_publisher(
     cache_path_step = execute[execute.index("name: Ensure setup-python's pip cache path exists"):]
     cache_path_step = cache_path_step[:cache_path_step.index("\n      - ")]
     assert 'mkdir -p "$(python -m pip cache dir)"' in cache_path_step
-    assert executed in cache_path_step
+    assert "steps.select.outputs.mode == 'executed'" in cache_path_step
 
     # Lane selection is a trusted decision taken before any environment is
     # built: a docs-only candidate installs and executes nothing, and the
