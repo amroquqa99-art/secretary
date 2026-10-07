@@ -90,7 +90,7 @@
             width: var(--sidebar-width);
             height: 100%;
             background: var(--bg-secondary);
-            border-right: 1px solid var(--border);
+            border-inline-end: 1px solid var(--border);
             display: flex;
             flex-direction: column;
             flex-shrink: 0;
@@ -386,6 +386,11 @@
             border-radius: 12px;
             line-height: 1.6;
             position: relative;
+        }
+
+        .message-content,
+        #inputField {
+            text-align: start;
         }
 
         .message.user {
@@ -1663,6 +1668,18 @@
             }
 
             .sidebar.open {
+                transform: translateX(0);
+            }
+
+            html[dir="rtl"] .sidebar {
+                left: auto;
+                right: 0;
+                transform: translateX(100%);
+                padding-left: 0;
+                padding-right: var(--safe-right);
+            }
+
+            html[dir="rtl"] .sidebar.open {
                 transform: translateX(0);
             }
 
