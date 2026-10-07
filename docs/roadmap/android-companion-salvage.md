@@ -20,7 +20,7 @@ companion for device-local capabilities.
 | Accessibility app blocking | Do not ship by default | High-permission, UX/policy/security risk |
 | DNS VPN focus blocking | Do not copy as-is | Network security/TLS/DNS correctness requires a dedicated design |
 | Old Room/SQLite life schema | Do not merge | Competes with LifeOS data model and creates dual authority |
-| Legacy local assistant/router | Do not merge wholesale | Provider/agent orchestration now belongs to LifeOS |
+| Legacy local assistant/router | Do not merge wholesale | Provider/agent orchestration is a LifeOS server responsibility |
 
 ## 2. Keystore secret storage
 
@@ -229,9 +229,9 @@ The public-Internet auth protocol remains a later security phase.
 - no secret or message body in default logs;
 - no Accessibility or VPN permission in the base companion manifest.
 
-## 11. What is preserved from the old project
+## 11. Archived project reference
 
-The old implementation remains permanently inspectable at:
+The archived implementation is available at:
 
 ```
 archive/pre-lifeos-2026-10-07
