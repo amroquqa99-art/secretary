@@ -2985,22 +2985,22 @@
     <aside class="sidebar" id="sidebar">
         <div class="sidebar-header">
             <h1>LifeOS</h1>
-            <button class="new-chat-btn" onclick="newChat()" title="New chat">+</button>
+            <button class="new-chat-btn" onclick="newChat()" title="New chat" data-i18n-title="new_chat">+</button>
         </div>
         <div class="conversation-search">
-            <input type="text" class="conversation-search-input" id="conversationSearch" placeholder="Search conversations..." oninput="filterConversations()">
+            <input type="text" class="conversation-search-input" id="conversationSearch" placeholder="Search conversations..." data-i18n-placeholder="search_conversations" oninput="filterConversations()">
         </div>
         <div class="conversations-list" id="conversationsList">
-            <div class="empty-conversations">No conversations yet</div>
+            <div class="empty-conversations" data-i18n="no_conversations">No conversations yet</div>
         </div>
         <!-- Agent threads: in-flight + completed agent sessions, replyable -->
         <div class="agents-panel" id="agentsPanel">
             <div class="agents-panel-header">
-                <span>Agent threads</span>
-                <button class="agents-refresh" onclick="loadAgentThreads()" title="Refresh">⟳</button>
+                <span data-i18n="agent_threads">Agent threads</span>
+                <button class="agents-refresh" onclick="loadAgentThreads()" title="Refresh" data-i18n-title="refresh">⟳</button>
             </div>
             <div class="agents-threads-list" id="agentsThreadsList">
-                <div class="empty-conversations">No agent threads</div>
+                <div class="empty-conversations" data-i18n="no_agent_threads">No agent threads</div>
             </div>
         </div>
     </aside>
@@ -3012,48 +3012,52 @@
             <div class="header-left">
                 <button class="menu-btn" id="menuBtn" onclick="toggleSidebar()">☰</button>
                 <nav class="header-nav">
-                    <a href="/chat" class="nav-link active" title="Chat">💬 <span class="nav-label">Chat</span></a>
-                    <a href="/crm" class="nav-link" title="CRM">👥 <span class="nav-label">CRM</span></a>
-                    <a href="/agents" class="nav-link" title="Agents">🛠️ <span class="nav-label">Agents</span></a>
+                    <a href="/chat" class="nav-link active" title="Chat" data-i18n-title="chat">💬 <span class="nav-label" data-i18n="chat">Chat</span></a>
+                    <a href="/crm" class="nav-link" title="CRM" data-i18n-title="crm">👥 <span class="nav-label" data-i18n="crm">CRM</span></a>
+                    <a href="/agents" class="nav-link" title="Agents" data-i18n-title="agents">🛠️ <span class="nav-label" data-i18n="agents">Agents</span></a>
                 </nav>
             </div>
             <div class="header-right">
                 <span class="chat-title" id="chatTitle" hidden></span>
-                <button class="remember-btn" onclick="openRememberModal()" title="Remember something">
-                    <span>💭</span> <span class="btn-label">Remember</span>
+                <button class="remember-btn" onclick="openRememberModal()" title="Remember something" data-i18n-title="remember_something">
+                    <span>💭</span> <span class="btn-label" data-i18n="remember">Remember</span>
                 </button>
-                <div class="cost-display" id="costDisplay" onclick="openUsageModal()" title="Click to view usage stats">
-                    <span class="label">Session:</span> <span class="amount" id="sessionCost">$0.00</span>
+                <div class="cost-display" id="costDisplay" onclick="openUsageModal()" title="Click to view usage stats" data-i18n-title="usage_stats">
+                    <span class="label" data-i18n="session">Session:</span> <span class="amount" id="sessionCost">$0.00</span>
                 </div>
                 <div class="status">
                     <span class="status-dot" id="statusDot"></span>
-                    <span class="status-text" id="statusText">Ready</span>
+                    <span class="status-text" id="statusText" data-i18n="ready">Ready</span>
                 </div>
             </div>
         </header>
 
         <!-- Top-of-chat selector toolbar: persona + routing + backend + mode -->
         <div class="chat-toolbar">
-            <select class="persona-picker" id="personaPicker" onchange="onPersonaChange()" title="Choose persona" aria-label="Persona"></select>
-            <span class="orchestrates-badge" id="orchestratesBadge" hidden title="This persona runs on LifeOS as a background Claude Code session">⚙️ Runs on LifeOS</span>
-            <select id="modelPicker" class="persona-picker" onchange="onModelChange()" title="Model for this chat" aria-label="Chat model">
-                <option value="auto">🤖 Auto</option>
+            <select class="persona-picker" id="localePicker" title="Language" aria-label="Language" data-i18n-title="language" data-i18n-aria-label="language">
+                <option value="en">English</option>
+                <option value="ar">العربية</option>
+            </select>
+            <select class="persona-picker" id="personaPicker" onchange="onPersonaChange()" title="Choose persona" aria-label="Persona" data-i18n-title="choose_persona" data-i18n-aria-label="persona"></select>
+            <span class="orchestrates-badge" id="orchestratesBadge" hidden title="This persona runs on LifeOS as a background Claude Code session" data-i18n-title="orchestrates_title" data-i18n="runs_on_lifeos">⚙️ Runs on LifeOS</span>
+            <select id="modelPicker" class="persona-picker" onchange="onModelChange()" title="Model for this chat" aria-label="Chat model" data-i18n-title="model_for_chat" data-i18n-aria-label="chat_model">
+                <option value="auto" data-i18n="model_auto">🤖 Auto</option>
                 <option value="sonnet">Sonnet</option>
                 <option value="opus">Opus</option>
-                <option value="gemma">Gemma (local)</option>
-                <option value="remote" id="modelOptionRemote" hidden>Remote</option>
+                <option value="gemma" data-i18n="gemma_local">Gemma (local)</option>
+                <option value="remote" id="modelOptionRemote" hidden data-i18n="remote">Remote</option>
                 <option value="claude_code">💻 Claude Code</option>
             </select>
-            <div class="backend-toggle" role="group" aria-label="Text backend">
-                <button class="backend-option active" id="backendLifeos" type="button" title="LifeOS backend">LifeOS</button>
-                <button class="backend-option" id="backendAgent" type="button" title="Agent backend">Agent</button>
-                <button class="backend-option" id="backendHermes" type="button" title="Hermes backend">Hermes</button>
+            <div class="backend-toggle" role="group" aria-label="Text backend" data-i18n-aria-label="text_backend">
+                <button class="backend-option active" id="backendLifeos" type="button" title="LifeOS backend" data-i18n-title="lifeos_backend">LifeOS</button>
+                <button class="backend-option" id="backendAgent" type="button" title="Agent backend" data-i18n-title="agent_backend">Agent</button>
+                <button class="backend-option" id="backendHermes" type="button" title="Hermes backend" data-i18n-title="hermes_backend">Hermes</button>
             </div>
             <!-- Text|Voice input-mode selector: replaces the old mic/keyboard
                  icon toggle with a pill matching .backend-toggle above. -->
-            <div class="mode-toggle-group" role="group" aria-label="Input mode">
-                <button class="mode-toggle-option active" id="modeTextBtn" type="button" title="Text input">Text</button>
-                <button class="mode-toggle-option" id="modeVoiceBtn" type="button" title="Voice input">Voice</button>
+            <div class="mode-toggle-group" role="group" aria-label="Input mode" data-i18n-aria-label="input_mode">
+                <button class="mode-toggle-option active" id="modeTextBtn" type="button" title="Text input" data-i18n-title="text_input" data-i18n="text">Text</button>
+                <button class="mode-toggle-option" id="modeVoiceBtn" type="button" title="Voice input" data-i18n-title="voice_input" data-i18n="voice">Voice</button>
             </div>
         </div>
 
@@ -3061,12 +3065,12 @@
             <main class="messages" id="messages">
                 <div class="welcome">
                     <div class="welcome-icon">🧠</div>
-                    <h2>Welcome to LifeOS</h2>
-                    <p>Your personal knowledge assistant. Ask about your notes, calendar, emails, or anything in your vault.</p>
+                    <h2 data-i18n="welcome_title">Welcome to LifeOS</h2>
+                    <p data-i18n="welcome_body">Your personal knowledge assistant. Ask about your notes, calendar, emails, or anything in your vault.</p>
                     <div class="suggestions">
-                        <button class="suggestion" onclick="askQuestion('What\'s on my calendar tomorrow?')">📅 Calendar tomorrow</button>
-                        <button class="suggestion" onclick="askQuestion('What are my open action items?')">✅ Open action items</button>
-                        <button class="suggestion" onclick="askQuestion('Summarize my recent meeting notes')">📝 Recent meetings</button>
+                        <button class="suggestion" onclick="askQuestion('What\'s on my calendar tomorrow?')" data-i18n="calendar_tomorrow">📅 Calendar tomorrow</button>
+                        <button class="suggestion" onclick="askQuestion('What are my open action items?')" data-i18n="open_action_items">✅ Open action items</button>
+                        <button class="suggestion" onclick="askQuestion('Summarize my recent meeting notes')" data-i18n="recent_meetings">📝 Recent meetings</button>
                     </div>
                 </div>
             </main>
@@ -3080,35 +3084,35 @@
             <div class="input-container">
                 <input type="file" id="fileInput" class="file-input" multiple
                        accept="image/png,image/jpeg,image/jpg,image/gif,image/webp,application/pdf,text/plain,text/markdown,text/csv,application/json">
-                <button class="attach-btn" id="attachBtn" onclick="openFilePicker()" title="Attach files" aria-label="Attach files">+</button>
+                <button class="attach-btn" id="attachBtn" onclick="openFilePicker()" title="Attach files" aria-label="Attach files" data-i18n-title="attach_files" data-i18n-aria-label="attach_files">+</button>
                 <div class="input-wrapper">
                     <textarea
                         class="input-field"
                         id="inputField"
-                        placeholder="Ask a question..."
+                        placeholder="Ask a question..." data-i18n-placeholder="ask_question"
                         rows="1"
                         autofocus
                     ></textarea>
                 </div>
-                <button class="send-btn" id="sendBtn" onclick="sendMessage()" title="Send message">➤</button>
+                <button class="send-btn" id="sendBtn" onclick="sendMessage()" title="Send message" data-i18n-title="send_message">➤</button>
                 <!-- Stop: shown in place of Send while a turn is in flight.
                      Cancels the turn server-side rather than just walking away from
                      the stream -- the turn otherwise keeps running to completion. -->
-                <button class="stop-btn" id="stopBtn" onclick="stopTurn()" title="Stop">⏹</button>
+                <button class="stop-btn" id="stopBtn" onclick="stopTurn()" title="Stop" data-i18n-title="stop">⏹</button>
             </div>
             <!-- Voice dock: tap-to-talk + dock toggles; shown in voice mode -->
             <div class="voice-dock" id="voiceDock">
                 <div class="voice-dock-row">
-                    <button class="voice-talk-btn shutter" id="voiceTalkBtn" title="Tap to talk" aria-label="Tap to talk"><span class="shutter-core"></span></button>
-                    <button class="voice-cancel-btn" id="voiceCancelBtn" title="Cancel turn">✕</button>
+                    <button class="voice-talk-btn shutter" id="voiceTalkBtn" title="Tap to talk" aria-label="Tap to talk" data-i18n-title="tap_to_talk" data-i18n-aria-label="tap_to_talk"><span class="shutter-core"></span></button>
+                    <button class="voice-cancel-btn" id="voiceCancelBtn" title="Cancel turn" data-i18n-title="cancel_turn">✕</button>
                 </div>
                 <div class="voice-dock-toggles">
-                    <label class="dock-toggle"><input type="checkbox" id="voiceMute"> Mute</label>
+                    <label class="dock-toggle"><input type="checkbox" id="voiceMute"> <span data-i18n="mute">Mute</span></label>
                     <label class="dock-toggle"><input type="checkbox" id="voiceFast" checked> 2×</label>
-                    <label class="dock-toggle"><input type="checkbox" id="voiceAuto" checked> Auto</label>
+                    <label class="dock-toggle"><input type="checkbox" id="voiceAuto" checked> <span data-i18n="auto">Auto</span></label>
                     <!-- The dot only renders while the wake tap actually holds a
                          live mic — see .listen-dot / updateListenIndicator(). -->
-                    <label class="dock-toggle"><input type="checkbox" id="voiceListen" checked> Listening<span class="listen-dot" id="voiceListenDot" role="status" aria-label="Microphone is live"></span></label>
+                    <label class="dock-toggle"><input type="checkbox" id="voiceListen" checked> <span data-i18n="listening">Listening</span><span class="listen-dot" id="voiceListenDot" role="status" aria-label="Microphone is live" data-i18n-aria-label="microphone_live"></span></label>
                 </div>
             </div>
         </footer>
@@ -3341,6 +3345,7 @@
                     inputArea: document.getElementById('inputArea'),
                     attachmentsPreview: document.getElementById('attachmentsPreview'),
                     fileInput: document.getElementById('fileInput'),
+                    localePicker: document.getElementById('localePicker'),
                     personaPicker: document.getElementById('personaPicker'),
                     orchestratesBadge: document.getElementById('orchestratesBadge'),
                     modelPicker: document.getElementById('modelPicker'),
