@@ -135,8 +135,14 @@ class TestBidirectionalChatContent:
         metrics = page.locator(".sidebar").evaluate("""el => {
             const style = getComputedStyle(el);
             const matrix = new DOMMatrixReadOnly(style.transform);
-            return { left: style.left, right: style.right, translateX: matrix.m41 };
+            const rect = el.getBoundingClientRect();
+            return {
+                right: style.right,
+                translateX: matrix.m41,
+                rectLeft: rect.left,
+                viewportWidth: window.innerWidth,
+            };
         }""")
         assert metrics["right"] == "0px"
-        assert metrics["left"] == "auto"
         assert metrics["translateX"] > 0
+        assert metrics["rectLeft"] >= metrics["viewportWidth"] - 1
