@@ -52,15 +52,19 @@ export function resolveLocale() {
   return storedLocale() || 'en';
 }
 
+export const localeState = { locale: 'en', direction: 'ltr' };
+
 export function applyLocale(locale = resolveLocale(), { persist = false } = {}) {
   const normalized = normalizeLocale(locale) || 'en';
   const direction = directionForLocale(normalized);
 
   document.documentElement.lang = normalized;
   document.documentElement.dir = direction;
+  localeState.locale = normalized;
+  localeState.direction = direction;
 
   if (persist) persistLocale(normalized);
-  return { locale: normalized, direction };
+  return localeState;
 }
 
 export function setLocale(locale) {
@@ -70,4 +74,4 @@ export function setLocale(locale) {
   return true;
 }
 
-export const localeState = applyLocale();
+applyLocale();
