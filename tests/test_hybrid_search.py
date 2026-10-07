@@ -955,6 +955,39 @@ class TestQueryAwareReranking:
         assert 2 not in protected
 
 
+    def test_find_protected_indices_supports_arabic_keywords(self, temp_db):
+        from api.services.hybrid_search import find_protected_indices
+
+        results = [
+            {"id": "doc1", "content": "ملاحظات عامة عن المشروع"},
+            {"id": "doc2", "content": "رقم الحساب هو 482913"},
+            {"id": "doc3", "content": "موعد الاجتماع يوم الخميس"},
+        ]
+
+        protected = find_protected_indices("رقم الحساب", results, max_protected=3)
+
+        assert protected == [1]
+
+    def test_find_protected_indices_ignores_optional_diacritics(self, temp_db):
+        from api.services.hybrid_search import find_protected_indices
+
+        results = [
+            {"id": "doc1", "content": "رقم الحساب هو 482913"},
+            {"id": "doc2", "content": "عنوان السكن محدث"},
+        ]
+
+        protected = find_protected_indices("رَقْمُ الحِساب", results, max_protected=3)
+
+        assert protected == [0]
+
+    def test_search_tokens_keep_non_latin_letters_and_numbers(self, temp_db):
+        from api.services.hybrid_search import _search_tokens
+
+        assert _search_tokens("الحساب ١٢٣ / Account_42") == [
+            "الحساب", "١٢٣", "account", "42"
+        ]
+
+
 class TestSearchAttribution:
     """Each search records the tool query and per-arm attribution of the
     returned results in a ``search_attribution`` span, and tags every result
