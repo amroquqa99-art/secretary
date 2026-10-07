@@ -243,6 +243,18 @@ def test_candidate_workflow_caches_the_test_environment_from_a_trusted_job_only(
     assert 'echo "$VENV/bin" >> "$GITHUB_PATH"' in install
     assert "--no-binary" not in install
     assert install.count("--only-binary=:all:") == 2
+
+    # setup-python's own pip cache is intentionally disabled here. Candidate
+    # jobs restore the complete venv from the trusted environment cache above;
+    # on a hit they may perform no pip install at all, leaving ~/.cache/pip
+    # absent. Enabling setup-python's cache would then fail its post-job save
+    # after every retained test lane has already passed.
+    setup_block = execute_text[
+        execute_text.index("actions/setup-python"):
+        execute_text.index("name: Bound the cached environment's age")
+    ]
+    assert "cache: pip" not in setup_block
+    assert "cache-dependency-path:" not in setup_block
     # The identity proof runs on both paths: it sits after the branch closes.
     assert install.index("          fi\n") < install.index('assert torch.__version__ == os.environ["TORCH_CPU_VERSION"]')
 
