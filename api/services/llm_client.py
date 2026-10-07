@@ -632,7 +632,11 @@ class LocalLLMClient:
                 choices = chunk.get("choices", [])
                 if not choices:
                     continue
-                delta = choices[0].get("delta", {})
+                # Some OpenAI-compatible providers emit a terminal choice
+                # with "delta": null. Treat it as an empty delta; calling
+                # downstream code always receives a mapping even when the
+                # provider represents the terminal delta as null.
+                delta = choices[0].get("delta") or {}
                 finish_reason = choices[0].get("finish_reason")
 
                 # Text content — strip a leading <think>...</think> reasoning
