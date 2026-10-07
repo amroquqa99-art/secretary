@@ -1,0 +1,613 @@
+#!/bin/bash
+
+# LifeOS Launchd Setup Script
+# Generates plist files from templates and installs to ~/Library/LaunchAgents
+#
+# The operational body (prompting, generation, validation, install) is
+# wrapped in main() and guarded at the bottom of this file — the pattern
+# tests/test_deploy_drift.py established for scripts/auto-deploy.sh — so
+# that sourcing this script never prompts, never touches
+# ~/Library/LaunchAgents, and never calls a real `launchctl`. (Top-level
+# variable assignments above and `set -e` still take effect on source, same
+# as auto-deploy.sh; only the operational run itself is gated.)
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIFEOS_PATH="$(cd "$SCRIPT_DIR/.." && pwd)"
+LAUNCHD_DIR="$LIFEOS_PATH/config/launchd"
+LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
+ENV_FILE="$LIFEOS_PATH/.env"
+# Every template hardcodes __HOME__/.venvs/lifeos (no __VENV__ placeholder
+# exists to override it), so validation checks that exact path — not an
+# operator-configurable one — to avoid checking a different directory than
+# what's actually baked into the generated plist. Tests get an isolated venv
+# by pointing $HOME at a sandbox, same as everything else __HOME__-derived.
+VENV_DIR="$HOME/.venvs/lifeos"
+# Same convention as scripts/setup-systemd.sh's LLAMA_DIR: a shell env var
+# override, else ~/llama.cpp default. Feeds __LLAMA_CPP_DIR__ in
+# com.lifeos.llm.plist.template.
+LLAMA_DIR="${LIFEOS_LLAMA_DIR:-$HOME/llama.cpp}"
+
+# Read a KEY=value from .env, same convention as scripts/setup-systemd.sh's
+# and scripts/auto-deploy.sh's own _read_env — stripping quotes, whitespace,
+# and inline comments.
+_read_env() {
+    local key="$1" default="$2" val
+    val=$(grep -E "^${key}=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- \
+        | sed "s/^['\"]//;s/['\"]$//;s/ *#.*//" | tr -d '[:space:]')
+    echo "${val:-$default}"
+}
+
+# Opt-in gates for the three conditionally-installed services (#774, #830)
+# — same env vars, same defaults, as scripts/setup-systemd.sh's Linux
+# install, so a single .env controls all three identically on both
+# platforms.
+AGENT_WORKER_AUTOSTART=$(_read_env "LIFEOS_AGENT_WORKER_AUTOSTART" "false" | tr '[:upper:]' '[:lower:]')
+case "$AGENT_WORKER_AUTOSTART" in
+    true|1|yes) AGENT_WORKER_AUTOSTART="true" ;;
+    *)          AGENT_WORKER_AUTOSTART="false" ;;
+esac
+MCP_BEARER_TOKEN=$(_read_env "LIFEOS_MCP_BEARER_TOKEN" "")
+LLM_AUTOSTART=$(_read_env "LIFEOS_LOCAL_LLM_AUTOSTART" "false" | tr '[:upper:]' '[:lower:]')
+case "$LLM_AUTOSTART" in
+    true|1|yes) LLM_AUTOSTART="true" ;;
+    *)          LLM_AUTOSTART="false" ;;
+esac
+
+# Model source args for com.lifeos.llm.plist — same computation as
+# scripts/setup-systemd.sh's LLM_SOURCE_ARGS: `-hf <repo>` by default, or
+# `-m <gguf> [--mmproj <mmproj>]` when LIFEOS_LLM_MODEL_PATH overrides a
+# stale HuggingFace cache (see docs/guides/agent-worker-setup.md). Kept as
+# an array, not a joined string, because launchd's ProgramArguments is a
+# real argv array — each token needs its own <string> element; see
+# inject_llm_source_args below.
+LLM_MODEL=$(_read_env "LIFEOS_LLM_MODEL" "unsloth/gemma-4-26B-A4B-it-GGUF")
+LLM_MODEL_PATH=$(_read_env "LIFEOS_LLM_MODEL_PATH" "")
+LLM_MMPROJ_PATH=$(_read_env "LIFEOS_LLM_MMPROJ_PATH" "")
+if [ -n "$LLM_MODEL_PATH" ]; then
+    LLM_SOURCE_ARGS_TOKENS=("-m" "$LLM_MODEL_PATH")
+    if [ -n "$LLM_MMPROJ_PATH" ]; then
+        LLM_SOURCE_ARGS_TOKENS+=("--mmproj" "$LLM_MMPROJ_PATH")
+    fi
+    LLM_SOURCE_DISPLAY="$LLM_MODEL_PATH (local file)"
+else
+    LLM_SOURCE_ARGS_TOKENS=("-hf" "$LLM_MODEL")
+    LLM_SOURCE_DISPLAY="$LLM_MODEL (HuggingFace)"
+fi
+
+# --- Generation ------------------------------------------------------------
+
+# Escape a value so it's safe to drop into the replacement side of an
+# `s|X|<value>|` sed expression: a literal `&` (means "whole match" in a sed
+# replacement), `|` (our delimiter), or `\` in a real path would otherwise
+# corrupt the substitution or make sed error out.
+_sed_escape_replacement() {
+    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/&/\\\&/g' -e 's/|/\\|/g'
+}
+
+# XML-escape a value for safe use inside a plist <string> element (found on
+# review, #830): a path containing `&`, `<`, or `>` (e.g. `/Users/x/R&D/model.gguf`
+# — a real-world directory name) produces invalid XML if dropped in raw,
+# which then fails plutil validation and aborts the whole install. `&` must
+# be escaped first, or escaping `<`/`>` afterward would double-escape it.
+_xml_escape() {
+    printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+}
+
+# Substitute the __HOME__/__LIFEOS_PATH__/__VAULT_PATH__/__LLAMA_CPP_DIR__
+# placeholder convention into a template, writing the result to $2.
+# llama_dir ($6) is optional — templates that don't reference
+# __LLAMA_CPP_DIR__ (everything but com.lifeos.llm.plist.template) simply
+# ignore it. __LLAMA_CPP_DIR__ is XML-escaped before the sed-escape (composed,
+# not either alone — sed-escape alone would leave a raw `&` in the plist,
+# and XML-escaping alone would leave literal `&` from `&amp;` unescaped for
+# sed's own replacement syntax). __HOME__/__LIFEOS_PATH__/__VAULT_PATH__
+# intentionally keep their existing sed-only behavior — locked in by
+# test_generate_plist_handles_sed_metacharacters_in_values, unrelated to
+# this new placeholder.
+generate_plist() {
+    local template="$1" output="$2" home="$3" lifeos_path="$4" vault_path="$5" llama_dir="$6"
+    local esc_home esc_lifeos_path esc_vault_path esc_llama_dir
+    esc_home=$(_sed_escape_replacement "$home")
+    esc_lifeos_path=$(_sed_escape_replacement "$lifeos_path")
+    esc_vault_path=$(_sed_escape_replacement "$vault_path")
+    esc_llama_dir=$(_sed_escape_replacement "$(_xml_escape "$llama_dir")")
+    sed -e "s|__HOME__|$esc_home|g" \
+        -e "s|__LIFEOS_PATH__|$esc_lifeos_path|g" \
+        -e "s|__VAULT_PATH__|$esc_vault_path|g" \
+        -e "s|__LLAMA_CPP_DIR__|$esc_llama_dir|g" \
+        "$template" > "$output"
+}
+
+# The launchd analog of scripts/setup-systemd.sh's single LLM_SOURCE_ARGS
+# string: ProgramArguments is a real argv array, so each token
+# (LLM_SOURCE_ARGS_TOKENS, computed above) needs its own <string> element
+# rather than one space-joined string. sed's `r` command inserts a file's
+# raw content immediately after the matched line; the paired `d` then
+# removes the marker line itself. Only ever called for com.lifeos.llm.plist
+# — no other template has this marker, so check_placeholders would (rightly)
+# fail any plist where this was skipped by mistake.
+#
+# Each token is XML-escaped (found on review, #830): these come straight
+# from operator-supplied LIFEOS_LLM_MODEL/_MODEL_PATH/_MMPROJ_PATH, and a
+# path containing `&`, `<`, or `>` would otherwise produce invalid XML that
+# fails plutil validation and aborts the whole install.
+inject_llm_source_args() {
+    local plist="$1"
+    local args_file tok
+    args_file=$(mktemp)
+    for tok in "${LLM_SOURCE_ARGS_TOKENS[@]}"; do
+        printf '        <string>%s</string>\n' "$(_xml_escape "$tok")" >> "$args_file"
+    done
+    sed -e "/__LLM_SOURCE_ARGS_LINES__/r $args_file" -e "/__LLM_SOURCE_ARGS_LINES__/d" "$plist" > "$plist.tmp"
+    mv "$plist.tmp" "$plist"
+    rm -f "$args_file"
+}
+
+# --- Validation (#776) -------------------------------------------------------
+#
+# A previous field deployment copied a plist straight into
+# ~/Library/LaunchAgents with literal, unfilled-in placeholder text still in
+# it — nothing caught it, because the substitution step's failure to fill in
+# a value is not a plist *syntax* error, so plutil -lint (below) passed it.
+# The service then crash-looped against directories that never existed on
+# that machine. These two checks catch that class of mistake before install.
+
+# Print any leftover `__TOKEN__`-shaped placeholder in a generated plist (one
+# per line, sorted+deduped). Empty output means fully substituted.
+check_placeholders() {
+    local plist="$1"
+    grep -oE '__[A-Z_]+__' "$plist" 2>/dev/null | sort -u
+}
+
+# A `<key>NAME</key>` line (real templates indent it) immediately followed
+# by a `<string>value</string>` line — the structure every template in this
+# repo uses. Avoids depending on plutil -extract (macOS-only, and this needs
+# to work when sourced under test on Linux too). Matches the key line by
+# substring rather than exact equality so real (indented) templates match,
+# not just an unindented test fixture.
+_plist_string_value() {
+    local plist="$1" key="<key>${2}</key>"
+    awk -v key="$key" '
+        found { if ($0 ~ /<string>/) { gsub(/.*<string>|<\/string>.*/, ""); print; exit } }
+        index($0, key) > 0 { found=1 }
+    ' "$plist"
+}
+
+# The $2'th <string> inside ProgramArguments's <array> (1-indexed). Every
+# template routes through launchd-env-wrapper.sh (#776), whose own
+# invocation contract is `<wrapper> <project_dir> <real_command>
+# [args...]`, so item 1 is always the wrapper, item 2 the project dir, and
+# item 3 the actual binary launchd-env-wrapper.sh execs — item 4 onward are
+# that binary's own arguments (for a script run via an interpreter, e.g.
+# `/bin/bash <script>`, item 4 is the script). Empty output if there are
+# fewer than $2 items (a plist not shaped this way — nothing to check).
+_plist_program_argument() {
+    awk -v n="$2" '
+        /<key>ProgramArguments<\/key>/ { in_pa=1; next }
+        in_pa && /<\/array>/ { exit }
+        in_pa && /<string>/ {
+            count++
+            if (count == n) {
+                line = $0
+                gsub(/.*<string>|<\/string>.*/, "", line)
+                print line
+                exit
+            }
+        }
+    ' "$1"
+}
+
+# Print any missing path this plist depends on (one per line: "<label>:
+# <path>"). Empty output means every path referenced exists on this machine.
+# Checks WorkingDirectory (parsed from the plist itself), the venv this
+# install resolved (every template uses the same __HOME__/.venvs/lifeos
+# convention, so there's nothing plist-specific to parse for that one), the
+# launchd-env-wrapper.sh every template routes through (item 1), and the
+# actual binary it execs (item 3).
+#
+# Found on review: checking only item 3 misses two real failure modes. A
+# missing/non-executable wrapper (item 1) was never checked at all — the
+# plist would load and immediately fail with no earlier signal. And for a
+# plist that runs a script THROUGH an interpreter (e.g. crm-sync's
+# `/bin/bash <script>`), item 3 is just `/bin/bash`, which trivially exists
+# on every machine — checking only that validates nothing useful, while the
+# actual script (item 4) — the one thing that can realistically be missing
+# — went unchecked. When item 3's basename names a known interpreter, item
+# 4 is checked too.
+#
+# The venv's own python interpreter is checked in addition to (not instead
+# of) the specific binary: an empty or half-created venv (`python3 -m venv`
+# ran but `pip install -r requirements.txt` never did) has neither; a venv
+# with dependencies installed for one service but not another (e.g. crm-sync
+# came up fine, api's uvicorn was never installed) fails only the specific
+# check. Either gap alone must block install.
+check_paths_exist() {
+    local plist="$1" venv_dir="$2"
+    local workdir
+    workdir=$(_plist_string_value "$plist" "WorkingDirectory")
+    if [ -n "$workdir" ] && [ ! -d "$workdir" ]; then
+        echo "WorkingDirectory: $workdir"
+    fi
+    if [ ! -x "$venv_dir/bin/python" ]; then
+        echo "venv: $venv_dir/bin/python"
+    fi
+    local wrapper
+    wrapper=$(_plist_program_argument "$plist" 1)
+    if [ -n "$wrapper" ] && [ ! -x "$wrapper" ]; then
+        echo "launchd env wrapper: $wrapper"
+    fi
+    local binary
+    binary=$(_plist_program_argument "$plist" 3)
+    if [ -n "$binary" ] && [ ! -x "$binary" ]; then
+        echo "program binary: $binary"
+    fi
+    case "$(basename "${binary:-}" 2>/dev/null)" in
+        bash|sh|zsh|python|python3)
+            # Item 4 is only a checkable script path when it isn't itself a
+            # flag — found while writing this: python's `-m module` form
+            # (agent-worker's actual shape) puts a flag, not a path, at
+            # item 4, and misreading it as a missing script would have
+            # broken validation for every python -m invocation. `python
+            # mcp_server.py` (mcp-http's actual shape) and `bash script.sh`
+            # (crm-sync's) both still get checked normally.
+            local script
+            script=$(_plist_program_argument "$plist" 4)
+            case "$script" in
+                -*) ;;  # a flag, e.g. -m — nothing to check
+                "") ;;  # no fourth argument at all
+                *)
+                    if [ ! -x "$script" ]; then
+                        echo "interpreted script: $script"
+                    fi
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+# Refuse to install a plist that is incomplete or broken. Prints the problem
+# and returns 1 rather than installing; returns 0 (silent) when clean.
+validate_plist() {
+    local plist="$1" venv_dir="$2"
+    local filename
+    filename=$(basename "$plist")
+    local ok=true
+
+    local leftover
+    leftover=$(check_placeholders "$plist")
+    if [ -n "$leftover" ]; then
+        echo "  ERROR: $filename still has unsubstituted placeholder(s): $(echo "$leftover" | tr '\n' ' ')"
+        ok=false
+    fi
+
+    if command -v plutil >/dev/null 2>&1; then
+        if ! plutil -lint "$plist" > /dev/null 2>&1; then
+            echo "  ERROR: $filename is invalid!"
+            plutil -lint "$plist" || true
+            ok=false
+        fi
+    fi
+
+    local missing
+    missing=$(check_paths_exist "$plist" "$venv_dir")
+    if [ -n "$missing" ]; then
+        while IFS= read -r line; do
+            [ -n "$line" ] && echo "  ERROR: $filename references a path that does not exist — $line"
+        done <<< "$missing"
+        ok=false
+    fi
+
+    [ "$ok" = true ]
+}
+
+# Copy a generated plist into place only if it differs from what's already
+# there. Re-running setup on a host where a service is already loaded and
+# running must never silently replace it — this script never calls
+# launchctl itself (it only ever writes files), so "don't touch what's
+# unchanged" is the whole idempotency contract.
+#
+# When the destination DOES exist and differs (found on review: this used
+# to overwrite it with no more signal than the one blanket "Continue?"
+# prompt at the top of the run — which `--yes` skips entirely, leaving zero
+# indication a different, possibly hand-edited or differently-versioned
+# plist was just replaced), the previous file is backed up alongside it
+# before being overwritten, and a WARNING names exactly what happened. This
+# doesn't block `--yes`-driven automation — the point is visibility and a
+# recovery path, not an extra confirmation gate — but nothing is now ever
+# silently replaced.
+install_plist() {
+    local src="$1" dst_dir="$2"
+    local filename dst
+    filename=$(basename "$src")
+    dst="$dst_dir/$filename"
+    if [ -f "$dst" ] && cmp -s "$src" "$dst"; then
+        echo "  Unchanged: $filename (already installed, left in place)"
+        return 0
+    fi
+    if [ -f "$dst" ]; then
+        # Backed up OUTSIDE ~/Library/LaunchAgents, not alongside it (found
+        # on review): launchd itself scans that directory, and
+        # `launchctl load ~/Library/LaunchAgents` (the directory form, per
+        # this script's own printed next-steps) would load the .bak file
+        # too — a plist with the same Label loaded twice. A collision-safe
+        # name (checked, not just second-resolution timestamped) avoids a
+        # second backup in the same second silently overwriting the first.
+        local backup_dir="$LIFEOS_PATH/config/launchd/backups"
+        mkdir -p "$backup_dir"
+        local backup="$backup_dir/$filename.$(date +%s)" n=1
+        while [ -e "$backup" ]; do
+            backup="$backup_dir/$filename.$(date +%s).$n"
+            n=$((n + 1))
+        done
+        # `set -e` is active for this whole script — a `cp` failure here
+        # (permission problem, disk full) must not silently abort the
+        # entire run mid-loop with no report; explicitly checked so a
+        # failed backup means "refuse to overwrite this one plist" (this
+        # function returns 1, caller tracks and reports it) rather than an
+        # untraceable hard stop.
+        if ! cp "$dst" "$backup" 2>/dev/null; then
+            echo "  ERROR: could not back up the existing $filename before replacing it — refusing to overwrite"
+            return 1
+        fi
+        echo "  WARNING: $filename differs from what's currently installed — backed up the existing file to config/launchd/backups/$(basename "$backup") before replacing it"
+    fi
+    cp "$src" "$dst"
+    echo "  Installed: $filename"
+}
+
+# Whether $1 (a plist filename, e.g. "com.lifeos.agent-worker.plist") should
+# be validated and installed at all. Echoes a one-line reason and returns 1
+# to skip; prints nothing and returns 0 to proceed. Centralizes every
+# conditional-install rule so validation and install agree on what to skip
+# and why — the exact "silence where there should be a named skip" gap #774
+# was filed to close. (Generation is unaffected — every found template is
+# still rendered into config/launchd/ regardless, same as chromadb's
+# existing precedent; this only gates the copy into ~/Library/LaunchAgents.)
+service_skip_reason() {
+    case "$1" in
+        *chromadb*)
+            echo "use cron watchdog instead — see docs/guides/operations.md"
+            return 1
+            ;;
+        *agent-worker*)
+            if [ "$AGENT_WORKER_AUTOSTART" != "true" ]; then
+                echo "set LIFEOS_AGENT_WORKER_AUTOSTART=true to enable"
+                return 1
+            fi
+            ;;
+        *mcp-http*)
+            if [ -z "$MCP_BEARER_TOKEN" ]; then
+                echo "set LIFEOS_MCP_BEARER_TOKEN to enable"
+                return 1
+            fi
+            ;;
+        *.llm.plist)
+            if [ "$LLM_AUTOSTART" != "true" ]; then
+                echo "set LIFEOS_LOCAL_LLM_AUTOSTART=true to enable"
+                return 1
+            fi
+            ;;
+    esac
+    return 0
+}
+
+# --- Operational run ---------------------------------------------------------
+main() {
+
+echo "LifeOS Launchd Setup"
+echo "===================="
+echo ""
+echo "This script will configure launchd services for:"
+echo "  - com.lifeos.api (API server)"
+echo "  - com.lifeos.crm-sync (nightly sync)"
+echo ""
+echo "Note: ChromaDB should use cron watchdog instead of launchd."
+echo "See docs/guides/launchd-setup.md for ChromaDB cron setup."
+echo ""
+
+# Accept vault path as CLI argument or prompt interactively
+# Usage: ./scripts/setup-launchd.sh [vault_path] [--yes]
+VAULT_PATH=""
+AUTO_YES=false
+
+for arg in "$@"; do
+    if [ "$arg" = "--yes" ] || [ "$arg" = "-y" ]; then
+        AUTO_YES=true
+    elif [ -z "$VAULT_PATH" ]; then
+        VAULT_PATH="$arg"
+    fi
+done
+
+if [ -z "$VAULT_PATH" ]; then
+    # Found on review: --yes is meant for unattended automation, but with
+    # no vault argument this still blocked on an interactive `read` — the
+    # opposite of what --yes asks for. Fall back to .env's own
+    # LIFEOS_VAULT_PATH first; only prompt interactively when NOT --yes,
+    # and fail fast (rather than hang) if --yes has no path from either
+    # source.
+    VAULT_PATH=$(_read_env "LIFEOS_VAULT_PATH" "")
+    if [ -z "$VAULT_PATH" ]; then
+        if [ "$AUTO_YES" = true ]; then
+            echo "Error: no vault path given and LIFEOS_VAULT_PATH is not set in .env — required with --yes."
+            exit 1
+        fi
+        read -p "Enter your Obsidian vault path: " VAULT_PATH
+    fi
+fi
+
+# Expand ~ if present
+VAULT_PATH="${VAULT_PATH/#\~/$HOME}"
+
+# Validate vault path
+if [ ! -d "$VAULT_PATH" ]; then
+    echo "Error: Vault path does not exist: $VAULT_PATH"
+    exit 1
+fi
+
+echo ""
+echo "Configuration:"
+echo "  Home:         $HOME"
+echo "  LifeOS:       $LIFEOS_PATH"
+echo "  Vault:        $VAULT_PATH"
+echo "  Venv:         $VENV_DIR"
+if [ "$AGENT_WORKER_AUTOSTART" = "true" ]; then
+    echo "  Agent Worker: enabled"
+else
+    echo "  Agent Worker: disabled (set LIFEOS_AGENT_WORKER_AUTOSTART=true to enable)"
+fi
+if [ -n "$MCP_BEARER_TOKEN" ]; then
+    echo "  MCP HTTP:     enabled"
+else
+    echo "  MCP HTTP:     disabled (set LIFEOS_MCP_BEARER_TOKEN to enable)"
+fi
+if [ "$LLM_AUTOSTART" = "true" ]; then
+    echo "  Local LLM:    enabled ($LLM_SOURCE_DISPLAY)"
+else
+    echo "  Local LLM:    disabled (set LIFEOS_LOCAL_LLM_AUTOSTART=true to enable)"
+fi
+if [ -n "$LLM_MODEL_PATH" ] && [ ! -f "$LLM_MODEL_PATH" ]; then
+    echo "  WARNING: LIFEOS_LLM_MODEL_PATH=$LLM_MODEL_PATH does not exist"
+fi
+echo ""
+
+if [ "$AUTO_YES" = false ]; then
+    read -p "Continue? (y/n) " -n 1 -r
+    echo ""
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        echo "Aborted."
+        exit 0
+    fi
+fi
+
+# Create logs directory
+mkdir -p "$LIFEOS_PATH/logs"
+
+# Generate plist files from templates
+echo ""
+echo "Generating plist files..."
+
+for template in "$LAUNCHD_DIR"/*.plist.template; do
+    if [ -f "$template" ]; then
+        output="${template%.template}"
+        filename=$(basename "$output")
+        generate_plist "$template" "$output" "$HOME" "$LIFEOS_PATH" "$VAULT_PATH" "$LLAMA_DIR"
+        if [ "$filename" = "com.lifeos.llm.plist" ]; then
+            inject_llm_source_args "$output"
+        fi
+        echo "  Generated: $filename"
+    fi
+done
+
+# Validate plist files — refuse to install anything incomplete or broken
+# (leftover placeholder, invalid XML, or a WorkingDirectory/venv that
+# doesn't exist on this machine).
+echo ""
+echo "Validating plist files..."
+
+VALIDATION_FAILED=false
+for plist in "$LAUNCHD_DIR"/*.plist; do
+    if [ -f "$plist" ] && [[ ! "$plist" == *.template ]]; then
+        filename=$(basename "$plist")
+        # A plist skipped at install (chromadb, or agent-worker/mcp-http
+        # when not opted in — see service_skip_reason()) is also skipped
+        # here: validating one against a convention it either doesn't
+        # follow (chromadb) or that's irrelevant to a service that will
+        # never be installed anyway was always a false positive that could
+        # abort the entire run over a file nothing depends on.
+        skip_reason=$(service_skip_reason "$filename") || {
+            echo "  Skipped: $filename (not installed — see install step below)"
+            continue
+        }
+        if validate_plist "$plist" "$VENV_DIR"; then
+            echo "  Valid: $filename"
+        else
+            VALIDATION_FAILED=true
+        fi
+    fi
+done
+
+if [ "$VALIDATION_FAILED" = true ]; then
+    echo ""
+    echo "Aborting install: one or more plist files failed validation (see ERROR lines above)."
+    exit 1
+fi
+
+# Copy to LaunchAgents (skip chromadb — cron watchdog instead). Only ever
+# writes an unchanged file's content over itself when it actually differs
+# (install_plist); never touches a file that already matches.
+echo ""
+echo "Installing to $LAUNCH_AGENTS..."
+
+mkdir -p "$LAUNCH_AGENTS"
+
+INSTALL_FAILED=false
+for plist in "$LAUNCHD_DIR"/*.plist; do
+    if [ -f "$plist" ] && [[ ! "$plist" == *.template ]]; then
+        filename=$(basename "$plist")
+        skip_reason=$(service_skip_reason "$filename") || {
+            echo "  Skipped: $filename ($skip_reason)"
+            continue
+        }
+        # `set -e` is active for this whole script — calling install_plist
+        # directly (unguarded) would abort the entire loop the instant one
+        # plist's backup step fails, before the rest even get a chance.
+        # Wrapping it in `if` (a normal set -e exemption) lets one failure
+        # be tracked and reported without stopping the others.
+        if ! install_plist "$plist" "$LAUNCH_AGENTS"; then
+            INSTALL_FAILED=true
+        fi
+    fi
+done
+
+if [ "$INSTALL_FAILED" = true ]; then
+    echo ""
+    echo "One or more plists could not be installed (see ERROR lines above)."
+    exit 1
+fi
+
+# Two Linux watchdogs have no macOS equivalent (#774) — GPU health polling
+# reads ROCm/amdgpu-specific sysfs, and the network-recovery watchdog
+# reacts to a Linux-specific WiFi driver deadlock (mt7925). Neither
+# corresponds to any macOS hardware or driver, so there is nothing to
+# install; naming that here instead of leaving it silent is the point —
+# an operator scanning `launchctl list` for a missing service should be
+# able to tell "not applicable on this platform" from "just never built."
+echo ""
+echo "Not applicable on macOS (no equivalent hardware/driver):"
+echo "  lifeos-gpu-watchdog: skipped (GPU health check is ROCm/amdgpu-specific, Linux only)"
+echo "  lifeos-network-watchdog: skipped (recovers from a Linux WiFi driver deadlock, not applicable here)"
+
+echo ""
+echo "Setup complete!"
+echo ""
+echo "Next steps:"
+echo ""
+echo "1. Load the services:"
+echo "   launchctl load ~/Library/LaunchAgents/com.lifeos.api.plist"
+echo "   launchctl load ~/Library/LaunchAgents/com.lifeos.crm-sync.plist"
+if [ "$AGENT_WORKER_AUTOSTART" = "true" ]; then
+    echo "   launchctl load ~/Library/LaunchAgents/com.lifeos.agent-worker.plist"
+fi
+if [ "$LLM_AUTOSTART" = "true" ]; then
+    echo "   launchctl load ~/Library/LaunchAgents/com.lifeos.llm.plist"
+fi
+if [ -n "$MCP_BEARER_TOKEN" ]; then
+    echo "   launchctl load ~/Library/LaunchAgents/com.lifeos.mcp-http.plist"
+fi
+echo ""
+echo "2. Set up ChromaDB cron watchdog:"
+echo "   crontab -e"
+echo "   * * * * * pgrep -f \"chroma run\" || (cd $LIFEOS_PATH && ./scripts/chromadb.sh start >> /tmp/chromadb-watchdog.log 2>&1)"
+echo ""
+echo "3. Verify services are running:"
+echo "   launchctl list | grep lifeos"
+echo ""
+echo "See docs/guides/launchd-setup.md for troubleshooting."
+
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

@@ -1,0 +1,704 @@
+# MCP Tools PRD
+
+> **Status:** Complete
+> **Owner:** API Gateway
+> **Last Updated:** 2026-09-22
+
+MCP (Model Context Protocol) server that exposes LifeOS capabilities to AI assistants like Claude Code.
+
+**Primary Use Cases:**
+- Enable Claude to search your knowledge base
+- Allow AI assistants to query calendar, email, messages
+- Create memories and drafts programmatically
+- Provide personal context during coding sessions
+
+---
+
+## Table of Contents
+
+1. [Overview](#overview)
+2. [Available Tools](#available-tools)
+3. [Setup](#setup)
+4. [Tool Specifications](#tool-specifications)
+
+---
+
+## Overview
+
+The LifeOS MCP server dynamically discovers endpoints from the LifeOS OpenAPI spec and exposes them as Claude Code tools. It runs as a subprocess and communicates via JSON-RPC over stdin/stdout.
+
+**Key Features:**
+- Auto-discovery from OpenAPI spec
+- Curated tool descriptions for optimal AI use
+- Formatted responses for human readability
+- Fallback schemas when API unavailable
+
+The source catalog contains 72 curated LifeOS endpoint tools. It also
+registers 11 worker coordination tools (`lifeos_agent_*`), including
+`lifeos_agent_project_handoff`, `lifeos_agent_project_owner`, and
+`lifeos_agent_execution_override`, for an 83-tool fallback catalog. When the
+OpenAPI document omits an unavailable endpoint, the live list may be smaller;
+the inter-agent tools remain registered as a separate contract.
+
+**Architecture:**
+```
+Claude Code  ←→  MCP Protocol  ←→  mcp_server.py  ←→  LifeOS API
+              (JSON-RPC/stdio)                         (HTTP)
+```
+
+---
+
+## Available Tools
+
+### Core Tools
+| Tool | Description |
+|------|-------------|
+| `lifeos_ask` | Query knowledge base with synthesized answer |
+| `lifeos_search` | Search vault without synthesis (raw results) |
+| `lifeos_vault_list` | List notes in a vault folder or glob match, newest first, with modified date, note type and tags |
+| `lifeos_turn_context` | Per-turn context (date/time, relative-time guidance, existing task tags, task-hierarchy guidance) — read at the start of a turn |
+
+### Calendar & Meeting Tools
+| Tool | Description |
+|------|-------------|
+| `lifeos_calendar_upcoming` | Get upcoming calendar events |
+| `lifeos_calendar_search` | Search calendar events |
+| `lifeos_meeting_prep` | Get meeting prep context with related notes |
+
+### Communication Tools
+| Tool | Description |
+|------|-------------|
+| `lifeos_gmail_search` | Search emails (includes body for top 5) |
+| `lifeos_gmail_draft` | Create Gmail draft |
+| `lifeos_gmail_send` | Send an existing Gmail draft by draft_id; refused for same-turn or cooled-down LifeOS drafts |
+| `lifeos_drive_search` | Search Google Drive files |
+| `lifeos_imessage_search` | Search iMessage/SMS history |
+| `lifeos_slack_search` | Semantic search Slack messages |
+| `lifeos_slack_my_messages` | Every Slack message sent on a date (source-of-truth day pull) |
+
+### People & CRM Tools
+| Tool | Description |
+|------|-------------|
+| `lifeos_people_search` | Search people in network |
+| `lifeos_person_profile` | Get full CRM profile for a person |
+| `lifeos_person_facts` | Get extracted facts about a person |
+| `lifeos_person_timeline` | Get chronological interaction history |
+| `lifeos_person_connections` | Get who someone works with/knows |
+| `lifeos_relationship_insights` | Get relationship patterns and observations |
+| `lifeos_communication_gaps` | Find neglected relationships |
+
+### Task Management Tools
+
+Tasks can also be managed via natural language chat. See [Task Management spec](task-management.md).
+
+| Tool | Description |
+|------|-------------|
+| `lifeos_task_create` | Create a task; set `fields.parent_id` for a project child and `operation_key` for retry-safe creation |
+| `lifeos_task_list` | List/filter enriched tasks, including parent identity and compact derived project progress; filtered output is labeled as scoped |
+| `lifeos_task_update` | Update a task; set/clear `fields.parent_id` to attach, reparent, or detach a child |
+| `lifeos_task_complete` | Mark an ordinary task as done; project parents use the checked project action |
+| `lifeos_task_delete` | Delete a task |
+| `lifeos_task_children` | Retrieve the actual children of a project by stable parent ID, with pagination; partial pages state their displayed count and offset |
+| `lifeos_project_start` | Mark an open project active without launching the parent as an ordinary worker task |
+| `lifeos_project_complete` | Complete a project after every child and coordination guard passes; cancelled children require explicit reduced-scope acknowledgement |
+| `lifeos_project_plan` | Start the project's persistent agent-owner session, or wake the one it already has; idempotent per operation ID |
+| `lifeos_project_cancel` | Preview cancellation scope, then confirm a resumable cascading cancellation with a stable operation ID |
+| `lifeos_project_pause` | Pause a project: blocks child claims, Open, and Plan and delegate until resumed; a mid-turn child still finishes into Review |
+| `lifeos_project_resume` | Resume a paused project; refused with 403 for an agent-attributed caller — only the operator can resume |
+| `lifeos_task_resume_execution` | Resume a paused ordinary task after its final child link is removed |
+| `lifeos_agent_project_handoff` | The current executor turn stages an ordinary top-level task as a one-level durable project and then ends; children remain blocked until that turn has stopped and been verified |
+| `lifeos_agent_project_owner` | The attested project owner accepts or rejects a review-pending child of its own project, or completes its own project — allowed even while its own turn is still live |
+
+Project classification comes only from incoming `fields.parent_id` references;
+it is unrelated to `lifeos_agent_spawn` session ancestry. Before mutating a
+project, retrieve its children rather than treating a compact list summary as
+the full tree. Project planning derives one `operation_key` per intended child
+from the project ID, planning operation ID, and child role, then reuses it on
+retry. `lifeos_project_cancel` is intentionally two-step: the preview
+reports unfinished, running, and awaiting-review work; confirmation abandons
+pending-review output without accepting it, and a partial result remains
+pending until retried with the same `operation_id`.
+
+`lifeos_task_create`/`lifeos_task_update`, and `lifeos_project_resume`,
+carry a caller-asserted worker identity (an `X-LifeOS-Agent-Session`
+header, invisible to the tool schema — the stdio and local-executor MCP
+transports add it automatically, and the agent-only HTTP transport always
+sends the literal `unattested`, since it has no per-call identity of its
+own) whenever this server has one; interactive operator MCP sends none. On a
+project-child create or update, an agent-attributed request can never
+assign `#hermes`, and a paid route (`#cloud`/`#cloud-haiku`/`#cloud-sonnet`)
+is refused unless the project's own owner already carries it. An
+agent-attributed create is stamped internally as agent-created; an
+operator create is not, and neither stamp can be forged or cleared through
+an ordinary update. See [API Reference — Agent-session attribution and
+project-child guards](api-reference.md#agent-session-attribution-and-project-child-guards).
+
+`lifeos_agent_project_handoff` is distinct from ordinary child attachment and
+from `lifeos_agent_spawn`. It accepts an attested current executor turn, a
+stable operation ID, and 1–20 keyed child requests. The server derives the
+source task and session; it rejects a child, an existing project, a stale turn,
+or a caller that tries to broaden provider consent. `#hermes` is not a valid
+child assignee or executor — the schema omits it, and the handler rejects it
+outright. Each durable child retains its own explicit assignment and
+execution request; omitted assignment remains unassigned. A successful
+staging response tells the caller to stop, and work does not become runnable
+until the worker observes and records that terminal
+turn boundary. If termination cannot be verified, the handoff remains visibly
+pending rather than reporting the parent complete. Recovery retains that fence
+across restarts: it does not release staged work until the matching source turn
+is verified stopped. The existing project cancellation operation remains the
+operator escape hatch, and reports pending rather than success until scoped
+teardown is verified. Exact-turn executor return or a positive Managed terminal
+state can satisfy that proof; a terminal row, best-effort CLI stop, or missing
+Managed driver cannot. Hermes additionally requires a positive upstream `done`
+event; a disconnect, deadline, or local cancellation marker is not stop proof.
+A returned turn after cancellation retains only valid route-specific stop
+proof, never activates staged work. This applies even before a staged request
+has created a child, when the source remains an ordinary task.
+
+`lifeos_agent_project_owner` is attested the same way as
+`lifeos_agent_project_handoff` (an exact session, attempt, and turn), and is
+authorized only for the caller that is exactly the target project's current
+owner session, on its exact current turn. Its `action` is one of
+`accept_child`, `reject_child`, or `complete_project`. `accept_child` and
+`reject_child` target a review-pending child whose `parent_id` is the given
+project; `reject_child` requires a `note` and is refused with `paused` while
+the project is paused, because rejecting resumes the child session and so
+starts new child work. `accept_child`/`reject_child` share their underlying
+logic with the operator's own board Accept/Reject actions — an acceptance
+records who accepted (visible on the board), and a rejection's note is
+prefixed to make clear it came from the project owner rather than the
+operator. When the project has a recorded integration branch, `accept_child`
+also merges the child's recorded pull request into that branch first, but
+only when the pull request's base is exactly that branch
+(`merge_pull_request`, default `true`; a PR targeting anything else is never
+touched) — a failed merge fails the whole call with `merge_failed` and the
+card stays in review, unmerged and unaccepted, so the owner can reject it
+with a rebase instruction instead. A pull request already merged, or closed
+without being merged (superseded, abandoned), is nothing to merge and never
+produces `merge_failed`. Operator Accept from the board never merges.
+`complete_project` marks the caller's own project done; it is allowed even
+while the caller's own turn is still live — the one case the ordinary
+live-coordinator completion guard would otherwise refuse — while every other
+completion requirement (no pending cancellation, no unresolved children,
+cancelled-children acknowledgement) still applies exactly as it does for the
+operator's `lifeos_project_complete`, and, when the project has a recorded
+integration branch, that branch must have zero commits the default branch
+doesn't (a generic "commits ahead" check, never a merge of its own) —
+otherwise it's refused with `integration_unmerged`, naming the branch, until
+the owner merges it into the default branch itself through this repository's
+own documented merge process. A branch this repository's merge process has
+already deleted (its normal outcome once the owner merges it, per
+`scripts/candidate_publisher.py`) reads as fully merged rather than a check
+failure. A project with no coding children (nothing was ever merged onto the
+branch) skips that check entirely, and a repository whose `gh` tooling the
+check depends on is unavailable fails it closed rather than treating the
+branch as merged. Operator Complete from the board is never gated by this
+check. Stable error codes: `invalid_arg`, `not_found`, `stale_turn`,
+`not_owner`, `not_review`, `paused`, `forbidden`, `conflict`, `merge_failed`,
+`integration_unmerged`.
+
+### Human Queue Tools
+
+Fire-and-forget cards for something only the operator can do. See the [Human Queue guide](../../guides/human-queue.md).
+
+| Tool | Description |
+|------|-------------|
+| `lifeos_human_queue_add` | File a card for the operator; dedupes on an optional key |
+| `lifeos_human_queue_list` | List open cards waiting on the operator |
+| `lifeos_human_queue_resolve` | Mark a card done by id or key, with a resolution note |
+
+### Scheduler & Telegram Tools
+
+Schedules can also be managed via natural language chat. See [Scheduler Guide](../../guides/scheduler.md).
+
+| Tool | Description |
+|------|-------------|
+| `lifeos_schedule_create` | Create a schedule (cron, one-time, or manual/trigger-only; action notify/prompt/endpoint/agent) |
+| `lifeos_schedule_list` | List all schedules |
+| `lifeos_schedule_delete` | Delete a schedule |
+| `lifeos_schedule_trigger` | Fire a schedule immediately, like the operator's Trigger-now button — a manual schedule's only way to fire |
+| `lifeos_telegram_send` | Send an ad-hoc Telegram message |
+
+The legacy `lifeos_reminder_*` tools remain registered as deprecated aliases.
+
+### Fitness Tools
+
+The fitness persona's central capability — logging a workout — routed through natural language chat on the native backend. See [config/personas/fitness.md](../../../config/personas/fitness.md).
+
+| Tool | Description |
+|------|-------------|
+| `lifeos_workout_manage` | Log/query workouts and fitness metrics (log, update, list, history, summary, log_metric, metrics, get_profile, set_profile, readiness) |
+
+### Photos Tools
+| Tool | Description |
+|------|-------------|
+| `lifeos_photos_person` | Get photos of a specific person |
+| `lifeos_photos_shared` | Get photos where two people appear together |
+| `lifeos_photos_stats` | Get Apple Photos face recognition stats |
+
+### Financial Tools
+| Tool | Description |
+|------|-------------|
+| `lifeos_monarch_accounts` | List financial accounts with balances |
+| `lifeos_monarch_transactions` | Search financial transactions |
+| `lifeos_monarch_cashflow` | Get cashflow summary |
+| `lifeos_monarch_budgets` | Get budget status |
+
+### CRM Write Tools
+| Tool | Description |
+|------|-------------|
+| `lifeos_person_update` | Update person profile (notes, tags, category, birthday) |
+| `lifeos_person_fact_update` | Update an extracted fact |
+| `lifeos_person_fact_confirm` | Confirm a fact as accurate |
+| `lifeos_person_fact_delete` | Delete an incorrect fact |
+
+### Calendar Write Tools
+| Tool | Description |
+|------|-------------|
+| `lifeos_calendar_create` | Create a Google Calendar event |
+| `lifeos_calendar_update` | Update a calendar event |
+| `lifeos_calendar_delete` | Delete a calendar event |
+
+### Home Automation Tools
+
+Pause/resume household internet access via eero. See the [Home — eero guide](../../guides/home-eero.md).
+
+| Tool | Description |
+|------|-------------|
+| `lifeos_home_eero_pause` | Pause a profile/device's internet access; optional `minutes` schedules an auto-resume, else the target's configured default applies |
+| `lifeos_home_eero_resume` | Resume a profile/device's internet access; cancels any pending scheduled auto-resume |
+| `lifeos_home_eero_status` | List every configured target's current paused state and pending scheduled resume |
+
+### Memory & Admin Tools
+| Tool | Description |
+|------|-------------|
+| `lifeos_memories_create` | Save a memory |
+| `lifeos_memories_search` | Search saved memories |
+| `lifeos_conversations_list` | List chat conversations |
+| `lifeos_schedule_update` | Update an existing schedule (`lifeos_reminder_update` kept as a deprecated alias) |
+| `lifeos_sync_trigger` | Trigger data sync for a source |
+| `lifeos_health` | Check service health |
+
+---
+
+## Setup
+
+### Register with Claude Code
+
+```bash
+# Add MCP server
+claude mcp add lifeos -s user -- python /path/to/LifeOS/mcp_server.py
+
+# Verify
+claude mcp list
+```
+
+### Environment Variables
+
+```bash
+LIFEOS_API_URL=http://localhost:8000  # Default
+```
+
+### Requirements
+
+- LifeOS server running (`./scripts/server.sh start`)
+- Python 3.11+ with httpx installed
+
+---
+
+## Tool Specifications
+
+### lifeos_ask
+
+Query your knowledge base and get a synthesized answer with citations.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| question | string | Yes | The question to ask |
+| include_sources | boolean | No | Include source citations (default: true) |
+
+**Example:**
+```json
+{
+  "question": "What did we discuss in the product meeting yesterday?",
+  "include_sources": true
+}
+```
+
+### lifeos_search
+
+Search the vault without synthesis. Returns raw search results.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| query | string | Yes | Search query |
+| top_k | integer | No | Number of results (1-100, default: 10) |
+| date_from, date_to | string | No | Inclusive date window (YYYY-MM-DD) |
+| folder | string | No | Only notes under this vault-relative folder |
+| note_type | string[] | No | Only these note types |
+| people | string[] | No | Only notes mentioning any of these people |
+| tags | string[] | No | Only notes carrying any of these human tags |
+| doc_type, domain, topic, project | string[] | No | Machine-tagged facets; a parent `topic` also matches its children |
+
+The facets are flat arguments with the same names and meaning as the orchestrator's `search_vault` tool and the `/api/search` `filters` object (the call folds them into `filters`). Values within one facet match any; different facets must all match. They apply before ranking, so a selective facet still returns its best matches. See [Search and Indexing — Facets](../technical/search-indexing.md#facets).
+
+### lifeos_calendar_upcoming
+
+Get upcoming calendar events.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| days | integer | No | Days to look ahead (default: 7) |
+
+### lifeos_calendar_search
+
+Search calendar events by keyword.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| q | string | Yes | Search query |
+
+### lifeos_gmail_search
+
+Search emails in Gmail. Automatically fetches full body for top 5 results.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| q | string | Yes | Search query |
+| account | string | No | Account: personal or work |
+
+### lifeos_gmail_draft
+
+Create a draft email in Gmail.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| to | string | Yes | Recipient email |
+| subject | string | Yes | Email subject |
+| body | string | Yes | Email body |
+| cc | string | No | CC recipients |
+| bcc | string | No | BCC recipients |
+| html | boolean | No | Send as HTML |
+| account | string | No | Account: personal or work |
+| turn_id | string | No | Opaque agent-turn identifier forwarded as `X-LifeOS-Turn-ID` |
+
+**Returns:** Draft ID and Gmail URL to open draft. LifeOS records the draft id, creation timestamp, and optional `turn_id` in the send-safety ledger.
+
+### lifeos_gmail_send
+
+Send an existing Gmail draft by its draft ID. Sends the exact draft; there is no compose-and-send shortcut. **Only send after the user has reviewed the draft and explicitly confirmed.** A send whose `turn_id` matches the one that created the draft is refused regardless of elapsed time, as long as that record is still in the ledger (turn-tagged rows are capped by count, oldest-first, rather than expiring by age). If no exact different turn id is available, LifeOS-created drafts are refused during the configured cooling-off window. Drafts not created by LifeOS are not in the ledger and send normally.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| draft_id | string | Yes | The draft ID returned by lifeos_gmail_draft |
+| account | string | No | Account: personal or work (must match where the draft was created) |
+| turn_id | string | No | Opaque agent-turn identifier forwarded as `X-LifeOS-Turn-ID` |
+
+**Returns:** The sent message ID and source account, or a refusal instructing the caller to obtain user confirmation.
+
+### lifeos_drive_search
+
+Search files in Google Drive.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| q | string | Yes | Search query (name or content) |
+| account | string | No | Account: personal or work |
+
+### lifeos_imessage_search
+
+Search iMessage/SMS text message history.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| q | string | No | Search query for message text |
+| phone | string | No | Filter by phone (E.164 format) |
+| entity_id | string | No | Filter by PersonEntity ID |
+| after | string | No | Messages after date (YYYY-MM-DD) |
+| before | string | No | Messages before date (YYYY-MM-DD) |
+| direction | string | No | Filter: sent or received |
+| max_results | integer | No | Max results (1-200, default: 50) |
+
+### lifeos_slack_search
+
+Semantic search across Slack messages.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| query | string | Yes | Search query |
+| top_k | integer | No | Number of results (1-50, default: 20) |
+| channel_id | string | No | Filter by channel ID |
+| user_id | string | No | Filter by user ID |
+
+### lifeos_slack_my_messages
+
+Every message the user sent on a given day (DMs, group DMs, channels, thread replies) via Slack's `search.messages` — exact source-of-truth pull, independent of the sync index.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| date | string | Yes | Day to pull, YYYY-MM-DD (user's Slack timezone) |
+| user | string | No | Slack user ID (defaults to the token owner) |
+
+### lifeos_people_search
+
+Search for people in your network.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| q | string | Yes | Name or email to search |
+| limit | integer | No | Max results (default: 10, max: 50) |
+
+### lifeos_memories_create
+
+Save a memory for future reference.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| content | string | Yes | Memory content |
+| category | string | No | Category (default: facts) |
+
+### lifeos_memories_search
+
+Search saved memories.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| query | string | Yes | Search query |
+
+### lifeos_conversations_list
+
+List recent chat conversations.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| limit | integer | No | Max results (default: 10) |
+
+### lifeos_health
+
+Check if all LifeOS services are healthy.
+
+**Parameters:** None
+
+### lifeos_person_profile
+
+Get comprehensive CRM profile for a person including all contact info, relationship metrics, and user annotations.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| person_id | string | Yes | Entity ID from lifeos_people_search |
+
+**Returns:** Full profile with emails, phones, company, relationship_strength, tags, notes, and interaction counts.
+
+### lifeos_person_facts
+
+Get extracted facts about a person (auto-extracted from interactions).
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| person_id | string | Yes | Entity ID from lifeos_people_search |
+
+**Returns:** Facts organized by category (work, personal, preferences, etc.) with confidence scores.
+
+### lifeos_person_timeline
+
+Get chronological interaction history for a person. Use for "catch me up on [person]" queries.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| person_id | string | Yes | Entity ID from lifeos_people_search |
+| days_back | integer | No | Days of history (default: 365) |
+| source_type | string | No | Filter by source (e.g., "imessage", "gmail,slack") |
+| limit | integer | No | Max results (default: 50) |
+
+**Returns:** Chronological list of interactions with source type, timestamp, and summary.
+
+### lifeos_meeting_prep
+
+Get intelligent meeting preparation context for a date.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| date | string | No | Date in YYYY-MM-DD format (default: today) |
+| include_all_day | boolean | No | Include all-day events (default: false) |
+| max_related_notes | integer | No | Max notes per meeting (1-10, default: 4) |
+
+**Returns:** For each meeting: title, time, attendees, related_notes (people notes, past meetings, topic notes), and attachments.
+
+### lifeos_communication_gaps
+
+Identify people you haven't contacted recently. Requires person_ids from lifeos_people_search.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| person_ids | string | Yes | Comma-separated person IDs |
+| days_back | integer | No | Days of history to analyze (default: 365) |
+| min_gap_days | integer | No | Minimum gap to report (default: 14) |
+
+**Returns:** Communication gaps with duration, plus per-person summaries showing days_since_contact and average_gap_days.
+
+### lifeos_person_connections
+
+Get people connected to a person through shared meetings, emails, messages, and LinkedIn.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| person_id | string | Yes | Entity ID from lifeos_people_search |
+| relationship_type | string | No | Filter by type (e.g., "coworker") |
+| limit | integer | No | Max results (default: 50) |
+
+**Returns:** List of connected people with shared_events_count, shared_threads_count, shared_messages_count, relationship_strength, and last_seen_together.
+
+### lifeos_relationship_insights
+
+Get relationship insights and patterns extracted from therapy notes and conversations.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| person_id | string | No | Focus on specific person (defaults to primary relationship) |
+
+**Returns:** Insights grouped by category (communication_patterns, emotional_needs, conflict_areas, growth_areas) with text, source_title, source_link, and confirmed status.
+
+### lifeos_photos_person
+
+Get photos containing a specific person from Apple Photos face recognition.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| person_id | string | Yes | Entity ID from lifeos_people_search |
+| date | string | No | Filter by date (YYYY-MM-DD) |
+| limit | integer | No | Max photos to return (1-200, default: 50) |
+
+**Returns:** Person ID, list of photos with uuid, timestamp, and source_link, and total count.
+
+### lifeos_photos_shared
+
+Get photos where two people appear together (co-appearances).
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| person_a_id | string | Yes | First person's entity ID |
+| person_b_id | string | Yes | Second person's entity ID |
+| limit | integer | No | Max photos to return (1-100, default: 20) |
+
+**Returns:** Both person IDs, shared_photo_count, and list of photos with uuid, timestamp, and source_link.
+
+### lifeos_photos_stats
+
+Get statistics about Apple Photos library face recognition data.
+
+**Parameters:** None
+
+**Returns:** total_named_people, people_with_contacts, total_face_detections, multi_person_photos, and photos_enabled status.
+
+### lifeos_monarch_accounts
+
+List all financial accounts with current balances from Monarch Money.
+
+**Parameters:** None
+
+**Returns:** List of accounts with name, type (checking, savings, credit card, investment), balance, and institution.
+
+### lifeos_monarch_transactions
+
+Search recent financial transactions from Monarch Money.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| start_date | string | No | Start date (YYYY-MM-DD), defaults to 30 days ago |
+| end_date | string | No | End date (YYYY-MM-DD), defaults to today |
+| category | string | No | Filter by category name |
+| search | string | No | Search by merchant name |
+| limit | integer | No | Max results (default: 100) |
+
+**Returns:** List of transactions with date, merchant, category, amount, and account. Includes date range and count.
+
+### lifeos_monarch_cashflow
+
+Get cashflow summary from Monarch Money for a date range.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| start_date | string | No | Start date (YYYY-MM-DD), defaults to first of current month |
+| end_date | string | No | End date (YYYY-MM-DD), defaults to today |
+
+**Returns:** total_income, total_expenses, savings_rate, and spending breakdown by category.
+
+### lifeos_monarch_budgets
+
+Get current budget status from Monarch Money.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| start_date | string | No | Start date (YYYY-MM-DD), defaults to first of current month |
+| end_date | string | No | End date (YYYY-MM-DD), defaults to today |
+
+**Returns:** List of budgets with category, budgeted amount, actual spending, and remaining balance.
+
+### lifeos_workout_manage
+
+Log and query the fitness bot's workout log and metrics — the same store and dispatcher (`manage_workouts`) the native orchestrator uses, exposed over REST so external MCP clients can log a workout too.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| action | string | Yes | log \| update \| list \| history \| summary \| log_metric \| metrics \| get_profile \| set_profile \| readiness |
+| sets | array | No | Exercises for log/update — one entry per distinct exercise/load: `{exercise, reps, weight, unit, count, rpe, duration_seconds, notes}` |
+| date | string | No | Session date YYYY-MM-DD (log/update). Omit on log to use today |
+| kind | string | No | strength \| cardio \| mobility \| sport \| other |
+| title | string | No | Session title |
+| notes | string | No | Session notes |
+| session_id | string | No | Target session for 'update' (defaults to most recent) |
+| exercise | string | No | Exercise name for 'history' / 'summary' |
+| date_start | string | No | Window start YYYY-MM-DD (list/summary/metrics) |
+| date_end | string | No | Window end YYYY-MM-DD (list/summary/metrics) |
+| metric_type | string | No | Metric name for log_metric/metrics, e.g. 'body_weight' |
+| value | string | No | Numeric for 'log_metric', free text for 'set_profile' |
+| unit | string | No | Metric unit for 'log_metric', e.g. 'lb' |
+| key | string | No | Training-profile key for 'set_profile' |
+| limit | integer | No | Max rows for list/history/metrics |
+
+**Returns:** `{"result": "<plain-text confirmation or error>"}` — the same string the native orchestrator gets from this tool (e.g. `Logged — 2026-08-19: Bench Press 8 @135 lb (session id: ...)`).
+
+---
+
+## Implementation
+
+See `mcp_server.py` for implementation details:
+- Dynamic endpoint discovery from OpenAPI spec
+- Curated tool descriptions in `CURATED_ENDPOINTS`
+- Response formatting for readability
+- Fallback schemas when API unavailable
+
+## Related Documents
+
+- [API Reference](api-reference.md) -- Full API endpoint contracts
+- [Chat UI](chat-ui.md) -- Chat interface that uses the same tools
+- [Agent Worker](agent-worker.md) -- The `lifeos_agent_*` family extends the MCP catalog for durable handoff and inter-agent coordination

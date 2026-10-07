@@ -1,0 +1,35 @@
+[Unit]
+Description=LifeOS Agent Worker
+After=network.target lifeos-api.service
+# Deliberately NO Requires=/BindsTo=/PartOf= on lifeos-api: the cascade made
+# EVERY api restart (post-commit hook, `server.sh restart`, manual systemctl)
+# SIGTERM the worker — killing every in-flight agent session, including the
+# doctor session whose own commit or deploy step triggered the restart
+# (three self-kills on 2026-07-09). The worker only polls the API over HTTP
+# and retries through outages, so it doesn't need to follow api restarts;
+# it restarts only when ITS code changes — auto-deploy restarts each active
+# unit explicitly, and the doctor uses `server.sh restart-worker-detached`.
+# `server.sh stop` stops the worker explicitly (no cascade to rely on).
+# StartLimit* belongs in [Unit] in modern systemd — putting it in
+# [Service] gets silently ignored. Circuit breaker: if the worker
+# crashes more than 5 times in 5 minutes, systemd backs off and the
+# operator has to intervene.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__LIFEOS_DIR__
+EnvironmentFile=__LIFEOS_DIR__/.env
+ExecStart=__VENV__/bin/python -m api.services.agent_worker.worker
+# Restart on any exit (crash OR clean) so the worker stays up through
+# unhandled exceptions, OOM kills, transient API outages, etc. The
+# only thing that keeps it down is an operator-issued `systemctl stop`.
+Restart=always
+RestartSec=10
+StandardOutput=append:__LIFEOS_DIR__/logs/agent-worker.log
+StandardError=append:__LIFEOS_DIR__/logs/agent-worker.log
+
+[Install]
+WantedBy=multi-user.target

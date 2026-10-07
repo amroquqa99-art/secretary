@@ -1,0 +1,18 @@
+# Extra tailnet routes this host publishes besides LifeOS itself.
+# Copy to config/tailscale-routes.local (git-ignored) and edit.
+#
+# One route per line; '#' starts a comment. Fields:
+#   https=<port>    tailnet HTTPS port to listen on
+#   path=<path>     mount path on that port
+#   target=<url>    local URL to proxy to
+#   funnel=on       optional; publishes the route to the public internet.
+#                   Rejected unless LIFEOS_TAILSCALE_ALLOW_FUNNEL=true.
+#
+# Funnel is port-wide: every route on a port must agree on funnel=on, or none
+# of that port's routes are applied.
+#
+# https=8443 path=/webhooks/example target=http://127.0.0.1:9000/webhooks/example
+#
+# Connected apps (docs/guides/mcp-connected-apps.md): the consent page, tailnet
+# only. The public MCP paths live on a separate node, not in this file.
+# https=8443 path=/oauth/authorize target=http://127.0.0.1:8765/oauth/authorize

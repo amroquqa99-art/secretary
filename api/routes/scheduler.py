@@ -1,0 +1,498 @@
+"""
+Scheduler API routes for LifeOS.
+
+CRUD endpoints for schedules (trigger + action) plus ad-hoc Telegram messaging.
+Replaces the legacy ``/api/reminders`` surface (kept as a deprecated alias in
+``api/routes/reminders.py``). A schedule binds a trigger (``once``/``cron``) to
+an ``action`` (notify / prompt / endpoint / agent).
+"""
+import logging
+from datetime import datetime
+from typing import Optional
+from zoneinfo import ZoneInfo
+
+from croniter import croniter
+from fastapi import APIRouter, Header, HTTPException
+from pydantic import BaseModel, Field
+
+from api.services.scheduler_store import (
+    get_scheduler_store,
+    get_scheduler,
+    compute_next_n_triggers,
+    ScheduleEntry,
+    VALID_ACTIONS,
+)
+from api.services.scheduler_validation import (
+    validate_action_inputs,
+    ScheduleActionValidationError,
+)
+from config.settings import settings
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api/scheduler", tags=["scheduler"])
+
+# Legacy message_type ↔ action, for callers still sending message_type.
+_TYPE_TO_ACTION = {"static": "notify", "prompt": "prompt", "endpoint": "endpoint"}
+
+
+# ---------------------------------------------------------------------------
+# Request / Response models
+# ---------------------------------------------------------------------------
+
+class CreateScheduleRequest(BaseModel):
+    name: str = Field(..., min_length=1, description="Human-readable name")
+    schedule_type: str = Field(..., description="'once', 'cron', or 'manual' (no trigger — fired only via POST .../trigger)")
+    schedule_value: str = Field(default="", description="ISO datetime (once) or cron expression (cron); omit for manual")
+    action: Optional[str] = Field(default=None, description="notify | prompt | endpoint | agent")
+    message_type: Optional[str] = Field(default=None, description="Legacy: static | prompt | endpoint")
+    message_content: str = Field(default="", description="Static text or natural-language prompt")
+    endpoint_config: Optional[dict] = Field(default=None, description="For endpoint action: {endpoint, method, params}")
+    executor: str = Field(default="", description="For agent action: local | cloud | cloud-haiku | cloud-sonnet")
+    bot: str = Field(default="", description="Telegram bot to notify from — a name from the "
+                                             "registry (config/telegram_bots.json) or 'primary'; empty = primary")
+    enabled: bool = Field(default=True)
+    timezone: str = Field(default_factory=lambda: settings.timezone, description="IANA timezone for the schedule")
+    persona_id: Optional[str] = None
+    model_id: Optional[str] = None
+    effort: Optional[str] = None
+    host: Optional[str] = None
+    working_dir: Optional[str] = None
+    budget_dollars: Optional[float] = Field(
+        default=None,
+        description="For agent action: dollar budget the created task inherits on every fire "
+                    "(rendered into its title as 'max $X.XX').",
+    )
+    wall_seconds: Optional[int] = Field(
+        default=None,
+        description="For agent action: wall-clock seconds the created task inherits on every "
+                    "fire (rendered into its title in minutes).",
+    )
+
+
+class UpdateScheduleRequest(BaseModel):
+    name: Optional[str] = None
+    schedule_type: Optional[str] = None
+    schedule_value: Optional[str] = None
+    action: Optional[str] = None
+    message_type: Optional[str] = None
+    message_content: Optional[str] = None
+    endpoint_config: Optional[dict] = None
+    executor: Optional[str] = None
+    bot: Optional[str] = None
+    enabled: Optional[bool] = None
+    timezone: Optional[str] = None
+    persona_id: Optional[str] = None
+    model_id: Optional[str] = None
+    effort: Optional[str] = None
+    host: Optional[str] = None
+    working_dir: Optional[str] = None
+    budget_dollars: Optional[float] = None
+    wall_seconds: Optional[int] = None
+
+
+class ScheduleResponse(BaseModel):
+    id: str
+    name: str
+    schedule_type: str
+    schedule_value: str
+    action: str
+    message_type: str
+    message_content: str
+    endpoint_config: Optional[dict]
+    executor: str
+    bot: str
+    enabled: bool
+    created_at: str
+    last_triggered_at: Optional[str]
+    next_trigger_at: Optional[str]
+    last_status: str
+    timezone: str
+    persona_id: str = ""
+    model_id: str = ""
+    effort: str = ""
+    host: str = ""
+    working_dir: str = ""
+    budget_dollars: Optional[float] = None
+    wall_seconds: Optional[int] = None
+
+    @classmethod
+    def from_entry(cls, e: ScheduleEntry) -> "ScheduleResponse":
+        return cls(
+            id=e.id,
+            name=e.name,
+            schedule_type=e.schedule_type,
+            schedule_value=e.schedule_value,
+            action=e.action,
+            message_type=e.message_type,
+            message_content=e.message_content,
+            endpoint_config=e.endpoint_config,
+            executor=e.executor,
+            bot=e.bot,
+            enabled=e.enabled,
+            created_at=e.created_at or "",
+            last_triggered_at=e.last_triggered_at,
+            next_trigger_at=e.next_trigger_at,
+            last_status=e.last_status,
+            timezone=e.timezone or settings.timezone,
+            persona_id=e.persona_id,
+            model_id=e.model_id,
+            effort=e.effort,
+            host=e.host,
+            working_dir=e.working_dir,
+            budget_dollars=e.budget_dollars,
+            wall_seconds=e.wall_seconds,
+        )
+
+
+class ScheduleListResponse(BaseModel):
+    schedules: list[ScheduleResponse]
+    total: int
+
+
+class SendMessageRequest(BaseModel):
+    text: str = Field(..., min_length=1, description="Message text to send via Telegram")
+    bot: Optional[str] = Field(
+        default=None,
+        description="Optional bot name to send from — a name from the registry "
+                    "(config/telegram_bots.json). Falls back to the primary bot "
+                    "if unset or unrecognised.",
+    )
+
+
+class PreviewScheduleRequest(BaseModel):
+    schedule_type: str = Field(..., description="'once' or 'cron'")
+    schedule_value: str = Field(..., description="ISO datetime (once) or cron expression (cron)")
+    timezone: str = Field(default_factory=lambda: settings.timezone, description="IANA timezone")
+
+
+class PreviewScheduleResponse(BaseModel):
+    next: list[str]
+    timezone: str
+
+
+PREVIEW_TRIGGER_COUNT = 3
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _resolve_action(action: Optional[str], message_type: Optional[str]) -> str:
+    """Resolve the action from an explicit value or the legacy message_type."""
+    if action:
+        return action
+    return _TYPE_TO_ACTION.get(message_type or "", "notify")
+
+
+def _require_known_bot(bot: Optional[str]) -> Optional[str]:
+    """Reject a bot name the registry doesn't know, else return it.
+
+    An orphaned name — usually the residue of a bot rename — otherwise stores
+    fine and then silently delivers to the primary chat at every fire. The
+    registry is read here, at request time, because it reflects the current
+    environment; empty or unset stays valid and means the primary bot. Returns
+    the trimmed name so that is what gets stored.
+    """
+    from api.services.telegram import validate_bot_name
+
+    try:
+        return validate_bot_name(bot)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+
+def _validate_schedule_value(schedule_type: str, schedule_value: str) -> None:
+    """Validate a schedule value's shape against a schedule type, 422 on
+    failure. Shared by the two call sites below: a request that supplies
+    ``schedule_value`` validates it against the effective type, and one
+    that changes ``schedule_type`` alone validates the entry's still-stored
+    value against the new type."""
+    if schedule_type == "cron":
+        try:
+            croniter(schedule_value)
+        except Exception as e:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Invalid cron expression '{schedule_value}': {e}",
+            )
+    elif schedule_type == "once":
+        try:
+            datetime.fromisoformat(schedule_value)
+        except Exception as e:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Invalid ISO datetime '{schedule_value}': {e}",
+            )
+
+
+def _validate_action_inputs(
+    action: str, message_content: str, endpoint_config: Optional[dict],
+    budget_dollars: Optional[float] = None, wall_seconds: Optional[int] = None,
+) -> Optional[dict]:
+    """Validate that a schedule's resulting action has the inputs it needs
+    to fire, 422 on failure. Shared by ``create_schedule`` and
+    ``update_schedule`` below so the drawer and every other client (chat
+    tools, MCP) get the same rules and the same detail text — the actual
+    rule lives in ``api/services/scheduler_validation.py``'s
+    ``validate_action_inputs``, which ``manage_schedules``
+    (``api/services/agent_tools.py``) also calls directly.
+
+    Returns the ``endpoint_config`` to store: for ``endpoint``, the same
+    dict with ``method`` normalized to upper case; for every other action,
+    ``endpoint_config`` unchanged.
+    """
+    try:
+        return validate_action_inputs(
+            action, message_content, endpoint_config, budget_dollars, wall_seconds,
+        )
+    except ScheduleActionValidationError as e:
+        raise HTTPException(status_code=422, detail=e.detail)
+
+
+def _validate_update_fields(schedule_id: str, request: "UpdateScheduleRequest", store) -> None:
+    """Validate the fields present in a PUT before anything is written.
+
+    Mirrors the status codes ``POST ""`` already uses for ``schedule_type``
+    and ``action`` (400) so the two endpoints agree; ``timezone`` and
+    ``schedule_value`` use 422 like the bot check above, since those are
+    per-field shape errors rather than a missing/misnamed top-level choice.
+    Every detail string names what's wrong well enough to show an operator
+    verbatim.
+
+    A request naming ``schedule_type`` without ``schedule_value`` is
+    validated against the entry's CURRENTLY STORED value under the new
+    type, not skipped — a bare type change from `cron` to `once` (or back)
+    otherwise writes a schedule whose stored value doesn't parse under its
+    own type, and the store's next-trigger computation then silently drops
+    it out of rotation instead of ever firing again. A request that
+    supplies both fields together converts a schedule in one write: the
+    submitted value is validated against the submitted type, regardless of
+    what's currently stored. ``manual`` has no trigger value to validate —
+    a schedule_value shape check never applies to it.
+    """
+    if request.schedule_type is not None and request.schedule_type not in ("once", "cron", "manual"):
+        raise HTTPException(status_code=400, detail="schedule_type must be 'once', 'cron', or 'manual'")
+    if request.action is not None and request.action not in VALID_ACTIONS:
+        raise HTTPException(status_code=400, detail=f"action must be one of {VALID_ACTIONS}")
+    if request.timezone is not None:
+        try:
+            ZoneInfo(request.timezone)
+        except Exception:
+            raise HTTPException(status_code=422, detail=f"Unknown timezone '{request.timezone}'")
+
+    if request.schedule_type == "manual":
+        return
+
+    if request.schedule_value is not None:
+        effective_type = request.schedule_type
+        if effective_type is None:
+            entry = store.get(schedule_id)
+            if entry is None:
+                raise HTTPException(status_code=404, detail="Schedule not found")
+            effective_type = entry.schedule_type
+        if effective_type != "manual":
+            _validate_schedule_value(effective_type, request.schedule_value)
+        return
+
+    if request.schedule_type is not None:
+        entry = store.get(schedule_id)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="Schedule not found")
+        _validate_schedule_value(request.schedule_type, entry.schedule_value)
+
+
+# ---------------------------------------------------------------------------
+# Routes (static paths MUST come before {schedule_id} to avoid capture)
+# ---------------------------------------------------------------------------
+
+@router.post("", response_model=ScheduleResponse)
+async def create_schedule(request: CreateScheduleRequest):
+    """Create a new schedule. A 'manual' schedule has no trigger of its own —
+    it fires only via ``POST /{schedule_id}/trigger`` — so its schedule_value
+    is ignored and stored blank regardless of what's supplied."""
+    if request.schedule_type not in ("once", "cron", "manual"):
+        raise HTTPException(status_code=400, detail="schedule_type must be 'once', 'cron', or 'manual'")
+    try:
+        ZoneInfo(request.timezone)
+    except Exception:
+        raise HTTPException(status_code=422, detail=f"Unknown timezone '{request.timezone}'")
+    if request.schedule_type == "manual":
+        request.schedule_value = ""
+    else:
+        _validate_schedule_value(request.schedule_type, request.schedule_value)
+    action = _resolve_action(request.action, request.message_type)
+    if action not in VALID_ACTIONS:
+        raise HTTPException(status_code=400, detail=f"action must be one of {VALID_ACTIONS}")
+    request.bot = _require_known_bot(request.bot)
+    request.endpoint_config = _validate_action_inputs(
+        action, request.message_content, request.endpoint_config,
+        request.budget_dollars, request.wall_seconds,
+    )
+
+    store = get_scheduler_store()
+    entry = store.create(
+        name=request.name,
+        schedule_type=request.schedule_type,
+        schedule_value=request.schedule_value,
+        action=action,
+        message_type=request.message_type or ("static" if action == "notify" else action),
+        message_content=request.message_content,
+        endpoint_config=request.endpoint_config,
+        executor=request.executor,
+        bot=request.bot,
+        enabled=request.enabled,
+        timezone=request.timezone,
+        persona_id=request.persona_id or "",
+        model_id=request.model_id or "",
+        effort=request.effort or "",
+        host=request.host or "",
+        working_dir=request.working_dir or "",
+        budget_dollars=request.budget_dollars,
+        wall_seconds=request.wall_seconds,
+    )
+    return ScheduleResponse.from_entry(entry)
+
+
+@router.get("", response_model=ScheduleListResponse)
+async def list_schedules():
+    """List all schedules."""
+    store = get_scheduler_store()
+    entries = store.list_all()
+    return ScheduleListResponse(
+        schedules=[ScheduleResponse.from_entry(e) for e in entries],
+        total=len(entries),
+    )
+
+
+@router.post("/send")
+async def send_adhoc_message(request: SendMessageRequest):
+    """Send an ad-hoc message via Telegram."""
+    from api.services.telegram import send_message_async
+
+    if not settings.telegram_enabled:
+        raise HTTPException(status_code=400, detail="Telegram not configured")
+
+    success = await send_message_async(request.text, bot=request.bot)
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to send Telegram message")
+    return {"status": "sent"}
+
+
+@router.get("/bots")
+async def list_bots():
+    """Telegram bot names a schedule's `bot` field may name — `primary` plus
+    the registry (`config/telegram_bots.json`), read at call time so a
+    rename is reflected immediately. Backs the board drawer's bot select,
+    which must offer only names the API actually accepts."""
+    from api.services.telegram import valid_bot_names
+
+    return {"bots": valid_bot_names()}
+
+
+@router.post("/preview", response_model=PreviewScheduleResponse)
+async def preview_schedule(request: PreviewScheduleRequest):
+    """Preview the next fire times for a trigger without creating a schedule.
+
+    Uses the same trigger semantics the scheduler itself fires on — a cron
+    expression evaluated in ``timezone`` — so a create-schedule composer can
+    show what a trigger will actually do before saving it. Declared ahead of
+    ``GET /{schedule_id}`` so ``preview`` is never captured as an id."""
+    if request.schedule_type not in ("once", "cron"):
+        raise HTTPException(status_code=400, detail="schedule_type must be 'once' or 'cron'")
+    try:
+        ZoneInfo(request.timezone)
+    except Exception:
+        raise HTTPException(status_code=422, detail=f"Unknown timezone '{request.timezone}'")
+    _validate_schedule_value(request.schedule_type, request.schedule_value)
+
+    triggers = compute_next_n_triggers(
+        request.schedule_type, request.schedule_value, request.timezone,
+        count=PREVIEW_TRIGGER_COUNT, label="preview",
+    )
+    return PreviewScheduleResponse(next=triggers, timezone=request.timezone)
+
+
+@router.get("/{schedule_id}", response_model=ScheduleResponse)
+async def get_schedule(schedule_id: str):
+    """Get a specific schedule by ID."""
+    store = get_scheduler_store()
+    entry = store.get(schedule_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Schedule not found")
+    return ScheduleResponse.from_entry(entry)
+
+
+@router.put("/{schedule_id}", response_model=ScheduleResponse)
+async def update_schedule(schedule_id: str, request: UpdateScheduleRequest):
+    """Update an existing schedule. Converting to schedule_type='manual'
+    clears schedule_value — a manual schedule has no trigger of its own."""
+    request.bot = _require_known_bot(request.bot)
+    store = get_scheduler_store()
+    _validate_update_fields(schedule_id, request, store)
+    if request.schedule_type == "manual":
+        request.schedule_value = ""
+    # Only when the patch actually touches one of the action-input fields —
+    # an unrelated patch (e.g. `enabled`) to a pre-existing invalid entry
+    # must still succeed, matching `_validate_update_fields`'s own "only
+    # what's present is checked" rule above.
+    if (
+        request.action is not None or request.message_content is not None
+        or request.endpoint_config is not None or request.budget_dollars is not None
+        or request.wall_seconds is not None
+    ):
+        entry = store.get(schedule_id)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="Schedule not found")
+        resulting_action = request.action if request.action is not None else entry.action
+        resulting_message = request.message_content if request.message_content is not None else entry.message_content
+        resulting_endpoint_config = (
+            request.endpoint_config if request.endpoint_config is not None else entry.endpoint_config
+        )
+        resulting_budget_dollars = (
+            request.budget_dollars if request.budget_dollars is not None else entry.budget_dollars
+        )
+        resulting_wall_seconds = (
+            request.wall_seconds if request.wall_seconds is not None else entry.wall_seconds
+        )
+        normalized = _validate_action_inputs(
+            resulting_action, resulting_message, resulting_endpoint_config,
+            resulting_budget_dollars, resulting_wall_seconds,
+        )
+        if request.endpoint_config is not None:
+            request.endpoint_config = normalized
+    updates = {k: v for k, v in request.model_dump().items() if v is not None}
+    entry = store.update(schedule_id, **updates)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Schedule not found")
+    return ScheduleResponse.from_entry(entry)
+
+
+@router.delete("/{schedule_id}")
+async def delete_schedule(schedule_id: str):
+    """Delete a schedule."""
+    store = get_scheduler_store()
+    if not store.delete(schedule_id):
+        raise HTTPException(status_code=404, detail="Schedule not found")
+    return {"status": "deleted", "id": schedule_id}
+
+
+@router.post("/{schedule_id}/trigger")
+async def trigger_schedule(
+    schedule_id: str,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+    request_key: Optional[str] = Header(default=None, alias="X-Request-Key"),
+):
+    """Manually fire a schedule immediately. For a ``once`` schedule this
+    consumes it exactly like an unattended fire would: ``mark_triggered``
+    disables it and clears its next fire, so it stops firing on its own
+    trigger too."""
+    store = get_scheduler_store()
+    entry = store.get(schedule_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Schedule not found")
+
+    await get_scheduler()._fire_entry(
+        entry, manual=True, request_key=request_key or idempotency_key,
+    )
+    return {"status": "triggered", "id": schedule_id}

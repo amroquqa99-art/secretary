@@ -1,0 +1,370 @@
+"""
+Tests for the indexer service.
+P1.1 Acceptance Criteria:
+- Indexer starts and watches vault folder without errors
+- New file creation triggers indexing within 5 seconds
+- File modification triggers re-indexing within 5 seconds
+- File deletion removes chunks from ChromaDB
+- Indexer recovers gracefully from restart (no duplicate chunks)
+
+NOTE: Imports are deferred to avoid loading heavy dependencies (ChromaDB,
+sentence-transformers) during pytest collection, which would slow down unit tests.
+"""
+import tempfile
+import time
+from pathlib import Path
+
+import pytest
+
+# These tests require ChromaDB and file watching (slow)
+pytestmark = pytest.mark.slow
+
+
+class TestIndexerService:
+    """Test the main indexer service."""
+
+    @pytest.fixture
+    def temp_vault(self):
+        """Create temporary vault directory with test files."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            vault_path = Path(tmpdir) / "vault"
+            vault_path.mkdir()
+
+            # Create some test files
+            (vault_path / "test1.md").write_text("""---
+tags: [test]
+type: note
+---
+
+# Test Note 1
+
+This is a test note about budget planning.
+""")
+            (vault_path / "test2.md").write_text("""---
+tags: [meeting]
+type: meeting
+people: [Alex]
+---
+
+# Meeting Notes
+
+## Discussion
+We talked about Q1 targets.
+
+## Action Items
+- [ ] Review budget
+""")
+            yield vault_path
+
+    @pytest.fixture
+    def temp_db(self):
+        """Create temporary database directory."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    @pytest.fixture
+    def indexer(self, temp_vault, temp_db):
+        """Create indexer instance with mock stores to avoid production DB writes."""
+        from api.services.indexer import IndexerService
+        from unittest.mock import MagicMock
+
+        # Create mock stores to prevent writes to production database
+        mock_interaction_store = MagicMock()
+        mock_interaction_store.add_if_not_exists.return_value = (None, False)
+
+        mock_source_entity_store = MagicMock()
+        mock_entity_resolver = MagicMock()
+        mock_entity_resolver.resolve.return_value = None  # Don't create entities
+
+        indexer = IndexerService(
+            vault_path=str(temp_vault),
+            db_path=str(temp_db),
+            interaction_store=mock_interaction_store,
+            source_entity_store=mock_source_entity_store,
+            entity_resolver=mock_entity_resolver,
+        )
+        yield indexer
+        indexer.stop()
+
+    def test_indexes_markdown_files(self, indexer, temp_vault):
+        """Should index all markdown files in vault."""
+        # Run initial index
+        indexed = indexer.index_all()
+
+        assert indexed >= 2  # We created 2 test files
+
+    def test_extracts_metadata_from_frontmatter(self, indexer, temp_vault):
+        """Should extract metadata from YAML frontmatter."""
+        indexer.index_all()
+
+        # Search for content
+        results = indexer.vector_store.search("budget", top_k=5)
+        assert len(results) >= 1
+
+        # Check metadata
+        result = results[0]
+        assert "file_path" in result
+        assert result["file_name"].endswith(".md")
+
+    def test_scalar_frontmatter_tags_are_indexed_as_a_list(self, indexer, temp_vault):
+        """A comma-separated tags scalar reaches the vector store as a clean list."""
+        from unittest.mock import MagicMock
+
+        note = temp_vault / "scalar_tags.md"
+        note.write_text("---\ntags: alpha, beta\n---\n\n# Scalar Tags\n\nSynthetic body text.\n")
+        indexer.vector_store = MagicMock()
+
+        indexer.index_file(str(note))
+
+        _chunks, metadata = indexer.vector_store.update_document.call_args.args
+        assert metadata["tags"] == ["alpha", "beta"]
+
+    def test_chunks_granola_notes_by_headers(self, indexer, temp_vault):
+        """Granola/meeting notes should be chunked by headers."""
+        # Create a Granola-style note
+        granola_note = temp_vault / "Granola" / "meeting.md"
+        granola_note.parent.mkdir(exist_ok=True)
+        granola_note.write_text("""---
+granola_id: abc123
+type: meeting
+---
+
+# Team Standup
+
+## Attendees
+- John
+- Alex
+
+## Updates
+Everyone shared their progress.
+
+## Action Items
+- [ ] John: Send report
+""")
+
+        indexer.index_all()
+
+        # Search for action items specifically
+        results = indexer.vector_store.search("send report", top_k=5)
+        assert len(results) >= 1
+
+    def test_infers_note_type_from_folder(self, indexer, temp_vault):
+        """Should infer note_type from folder path."""
+        # Create files in different folders
+        (temp_vault / "Personal").mkdir()
+        (temp_vault / "Work" / "ML").mkdir(parents=True)
+
+        (temp_vault / "Personal" / "journal.md").write_text("""# My Journal
+
+Today was a good day.
+""")
+        (temp_vault / "Work" / "ML" / "meeting.md").write_text("""# Work Meeting
+
+Discussed strategy.
+""")
+
+        indexer.index_all()
+
+        # Search and check note_type
+        personal_results = indexer.vector_store.search(
+            "journal good day",
+            filters={"note_type": "Personal"}
+        )
+        assert len(personal_results) >= 1
+
+    def test_note_type_ignores_vault_location_named_work(self, tmp_path):
+        """A vault living under a directory named `work` labels notes by their own folder."""
+        from api.services.indexer import IndexerService as Indexer
+        vault = tmp_path / "work" / "vault"
+        (vault / "Personal").mkdir(parents=True)
+        (vault / "Work" / "ML").mkdir(parents=True)
+        idx = Indexer.__new__(Indexer)
+        idx.vault_path = vault
+        assert idx._infer_note_type(vault / "Personal" / "a.md") == "Personal"
+        assert idx._infer_note_type(vault / "Work" / "ML" / "b.md") == "ML"
+        assert idx._infer_note_type(vault / "Work" / "c.md") == "Work"
+        assert idx._infer_note_type(vault / "Inbox.md") == "Other"
+
+    def test_handles_file_without_frontmatter(self, indexer, temp_vault):
+        """Should handle files without YAML frontmatter."""
+        (temp_vault / "plain.md").write_text("""# Simple Note
+
+No frontmatter here, just content.
+""")
+
+        indexed = indexer.index_all()
+        assert indexed >= 1
+
+        results = indexer.vector_store.search("simple note content")
+        assert len(results) >= 1
+
+    def test_skips_non_markdown_files(self, indexer, temp_vault):
+        """Should skip non-markdown files."""
+        (temp_vault / "image.png").write_bytes(b"fake image data")
+        (temp_vault / "data.json").write_text('{"key": "value"}')
+
+        indexed = indexer.index_all()
+        # Should only index .md files
+        assert indexed == 2  # Original test files only
+
+    def test_recovers_from_restart_no_duplicates(self, indexer, temp_vault, temp_db):
+        """Re-indexing should not create duplicates."""
+        from api.services.indexer import IndexerService
+        from unittest.mock import MagicMock
+
+        # First index
+        indexer.index_all()
+        count1 = indexer.vector_store.get_document_count()
+
+        # Create mock stores to prevent production DB writes
+        mock_interaction_store = MagicMock()
+        mock_interaction_store.add_if_not_exists.return_value = (None, False)
+        mock_source_entity_store = MagicMock()
+        mock_entity_resolver = MagicMock()
+        mock_entity_resolver.resolve.return_value = None
+
+        # Create new indexer (simulating restart)
+        indexer2 = IndexerService(
+            vault_path=str(temp_vault),
+            db_path=str(temp_db),
+            interaction_store=mock_interaction_store,
+            source_entity_store=mock_source_entity_store,
+            entity_resolver=mock_entity_resolver,
+        )
+
+        # Re-index
+        indexer2.index_all()
+        count2 = indexer2.vector_store.get_document_count()
+
+        # Should have same count (no duplicates)
+        assert count1 == count2
+        indexer2.stop()
+
+
+class TestFileWatcher:
+    """Test file watching functionality."""
+
+    @pytest.fixture
+    def temp_vault(self):
+        """Create temporary vault directory."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            vault_path = Path(tmpdir) / "vault"
+            vault_path.mkdir()
+            yield vault_path
+
+    @pytest.fixture
+    def temp_db(self):
+        """Create temporary database directory."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    @pytest.fixture
+    def indexer(self, temp_vault, temp_db):
+        """Create indexer with file watching and mock stores."""
+        from api.services.indexer import IndexerService
+        from unittest.mock import MagicMock
+
+        # Create mock stores to prevent production DB writes
+        mock_interaction_store = MagicMock()
+        mock_interaction_store.add_if_not_exists.return_value = (None, False)
+        mock_source_entity_store = MagicMock()
+        mock_entity_resolver = MagicMock()
+        mock_entity_resolver.resolve.return_value = None
+
+        indexer = IndexerService(
+            vault_path=str(temp_vault),
+            db_path=str(temp_db),
+            interaction_store=mock_interaction_store,
+            source_entity_store=mock_source_entity_store,
+            entity_resolver=mock_entity_resolver,
+        )
+        yield indexer
+        indexer.stop()
+
+    def test_detects_new_file_creation(self, indexer, temp_vault):
+        """New file should be indexed automatically."""
+        from tests.conftest import wait_for_condition
+        from api.services.indexer import VaultEventHandler
+
+        # Start watching
+        indexer.start_watching()
+        time.sleep(0.5)  # Let watcher initialize
+
+        # Create new file
+        new_file = temp_vault / "new_note.md"
+        new_file.write_text("""# Brand New Note
+
+This is freshly created content about testing.
+""")
+
+        # Wait for the watcher's batch debounce to flush and index the file,
+        # rather than sleeping a fixed duration that can undershoot it.
+        def _indexed():
+            return any(fp.endswith("new_note.md") for fp in indexer.vector_store.get_all_file_paths())
+
+        assert wait_for_condition(_indexed, timeout=VaultEventHandler._BATCH_DELAY + 30), (
+            "watcher did not index the new file within the timeout"
+        )
+
+        # Search for the new content
+        results = indexer.vector_store.search("freshly created testing")
+        assert len(results) >= 1
+        assert "new_note.md" in results[0]["file_name"]
+
+    def test_detects_file_modification(self, indexer, temp_vault):
+        """Modified file should be re-indexed."""
+        from tests.conftest import wait_for_condition
+        from api.services.indexer import VaultEventHandler
+        # Create initial file
+        test_file = temp_vault / "modify_test.md"
+        test_file.write_text("# Original\n\nOriginal content.")
+
+        # Index it
+        indexer.index_file(str(test_file))
+
+        # Start watching
+        indexer.start_watching()
+        time.sleep(0.5)
+
+        # Modify the file
+        test_file.write_text("# Modified\n\nCompletely different updated content.")
+
+        def _reindexed():
+            return bool(indexer.vector_store.search("different updated content"))
+
+        assert wait_for_condition(_reindexed, timeout=VaultEventHandler._BATCH_DELAY + 30)
+
+    def test_detects_file_deletion(self, indexer, temp_vault):
+        """Deleted file should be removed from index."""
+        from tests.conftest import wait_for_condition
+        from api.services.indexer import VaultEventHandler
+
+        # Create and index file
+        test_file = temp_vault / "to_delete.md"
+        test_file.write_text("# To Delete\n\nThis will be deleted.")
+        indexer.index_file(str(test_file))
+
+        # Verify it's indexed
+        initial_results = indexer.vector_store.search("will be deleted")
+        assert len(initial_results) >= 1
+
+        # Start watching
+        indexer.start_watching()
+        time.sleep(1)  # Give watcher more time to start
+
+        # Delete the file
+        test_file.unlink()
+
+        # Wait for the watcher's batch debounce to flush and remove the file,
+        # rather than sleeping a fixed duration that can undershoot it.
+        def _removed():
+            return not any(fp.endswith("to_delete.md") for fp in indexer.vector_store.get_all_file_paths())
+
+        assert wait_for_condition(_removed, timeout=VaultEventHandler._BATCH_DELAY + 30), (
+            "watcher did not remove the deleted file from the index within the timeout"
+        )
+
+        # Search should not find the content
+        results = indexer.vector_store.search("will be deleted")
+        deleted_results = [r for r in results if "to_delete.md" in r["file_name"]]
+        assert len(deleted_results) == 0

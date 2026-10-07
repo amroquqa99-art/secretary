@@ -1,0 +1,525 @@
+"""Journal is a filing surface, not an orchestrator: on a journal-persona
+turn, the native agentic loop advertises a narrowed tool catalog
+(`tools_for_persona`) and enforces the same boundary again at execution time
+(`execute_tool_parallel`'s journal gate), so a model that names an excluded
+tool anyway is refused rather than served.
+
+Also covers the tag/field-attestation filter on `manage_tasks` create (only
+what the operator actually typed in their own message survives) and the
+`bot`/`timezone` fields `manage_schedules` create accepts and persists.
+"""
+from __future__ import annotations
+
+import pytest
+
+from api.services.agent_tools import (
+    JOURNAL_EXCLUDED_TOOLS,
+    TOOL_DEFINITIONS,
+    _journal_created_task_id,
+    execute_tool_parallel,
+    tools_for_persona,
+)
+from api.services.memory_store import MemoryStore
+from api.services.scheduler_store import SchedulerStore
+from api.services.task_manager import TaskManager
+
+pytestmark = pytest.mark.unit
+
+
+class TestToolsForPersona:
+    def test_non_journal_persona_gets_the_full_catalog(self):
+        assert tools_for_persona("primary") is TOOL_DEFINITIONS
+        assert tools_for_persona("") is TOOL_DEFINITIONS
+        assert tools_for_persona("fitness") is TOOL_DEFINITIONS
+
+    def test_journal_persona_excludes_the_orchestration_tools(self):
+        names = {t["name"] for t in tools_for_persona("journal")}
+        assert names & JOURNAL_EXCLUDED_TOOLS == set()
+        # Read/search and filing tools remain.
+        assert "search_vault" in names
+        assert "manage_tasks" in names
+        assert "manage_schedules" in names
+
+    def test_journal_persona_excludes_manage_reminders(self):
+        # manage_reminders is a deprecated alias of manage_schedules that
+        # writes into the same scheduler store without ever setting `bot` —
+        # journal only gets manage_schedules for this job.
+        names = {t["name"] for t in tools_for_persona("journal")}
+        assert "manage_reminders" not in names
+        assert "manage_reminders" in {t["name"] for t in tools_for_persona("primary")}
+
+    def test_journal_list_keeps_exactly_one_cache_breakpoint(self):
+        journal_tools = tools_for_persona("journal")
+        with_marker = [t for t in journal_tools if "cache_control" in t]
+        assert len(with_marker) == 1
+        assert with_marker[0] is journal_tools[-1]
+
+    def test_building_the_journal_list_does_not_mutate_the_shared_catalog(self):
+        before = [dict(t) for t in TOOL_DEFINITIONS]
+        tools_for_persona("journal")
+        assert TOOL_DEFINITIONS == before
+
+
+@pytest.fixture
+def tm(tmp_path, monkeypatch):
+    vault = tmp_path / "vault"
+    index = tmp_path / "task_index.json"
+    manager = TaskManager(vault_path=vault, index_path=index)
+    monkeypatch.setattr("api.services.agent_tools.get_task_manager", lambda: manager, raising=False)
+    import api.services.task_manager as tm_mod
+    monkeypatch.setattr(tm_mod, "get_task_manager", lambda: manager)
+    return manager
+
+
+@pytest.fixture
+def sched(tmp_path, monkeypatch):
+    store = SchedulerStore(vault_path=tmp_path / "vault", index_path=tmp_path / "sched_index.json")
+    monkeypatch.setattr("api.services.agent_tools.get_scheduler_store", lambda: store, raising=False)
+    import api.services.scheduler_store as sched_mod
+    monkeypatch.setattr(sched_mod, "get_scheduler_store", lambda: store)
+    return store
+
+
+@pytest.fixture
+def mem(tmp_path, monkeypatch):
+    store = MemoryStore(file_path=str(tmp_path / "memories.json"))
+    monkeypatch.setattr("api.services.memory_store.get_memory_store", lambda: store)
+    return store
+
+
+class TestExecuteToolParallelJournalGate:
+    async def test_non_journal_turn_is_never_gated(self, tm):
+        out = await execute_tool_parallel(
+            "manage_tasks", {"action": "create", "description": "x", "tags": ["invented"]},
+        )
+        assert out.startswith("Task created")
+        assert tm.list_tasks()[0].tags == ["invented"]
+
+    async def test_excluded_tool_is_refused_on_a_journal_turn(self, mem):
+        # `mem` isolates the store so a gate regression can never reach the
+        # operator's real ~/.lifeos/memories.json or fire a live LLM call —
+        # the gate itself is what this test asserts, not a safe fallback.
+        out = await execute_tool_parallel(
+            "save_memory", {"content": "x"}, persona_id="journal", user_message="x",
+        )
+        assert out.startswith("Error:")
+        assert "journal persona" in out
+        assert mem.list_memories() == []
+
+    async def test_manage_reminders_is_refused_on_a_journal_turn(self, sched, monkeypatch):
+        # _reminder_create imports get_reminder_store from the shim at call
+        # time, not from scheduler_store's patched attribute — patch the
+        # shim directly so a gate regression can't be masked by writing to
+        # an already-isolated-but-different store.
+        monkeypatch.setattr(
+            "api.services.reminder_store.get_reminder_store", lambda: sched,
+        )
+        out = await execute_tool_parallel(
+            "manage_reminders",
+            {
+                "action": "create", "name": "call mom", "schedule_type": "once",
+                "schedule_value": "2030-01-02T15:00:00", "message_content": "call mom",
+            },
+            persona_id="journal", user_message="remind me to call mom tomorrow at 3",
+        )
+        assert out.startswith("Error:")
+        assert "journal persona" in out
+        assert sched.list_all() == []
+
+    async def test_excluded_tool_is_not_refused_off_a_journal_turn(self, monkeypatch):
+        # save_memory's own handler is irrelevant here -- just confirm the
+        # journal gate doesn't fire without persona_id="journal".
+        called = {}
+        async def fake_save_memory(inp):
+            called["ran"] = True
+            return "Memory saved."
+        monkeypatch.setitem(
+            __import__("api.services.agent_tools", fromlist=["_TOOL_HANDLERS"])._TOOL_HANDLERS,
+            "save_memory", fake_save_memory,
+        )
+        out = await execute_tool_parallel("save_memory", {"content": "x"})
+        assert out == "Memory saved."
+        assert called.get("ran")
+
+    async def test_manage_tasks_complete_is_refused_on_a_journal_turn(self, tm):
+        task = tm.create("Existing task")
+        out = await execute_tool_parallel(
+            "manage_tasks", {"action": "complete", "task_id": task.id},
+            persona_id="journal", user_message="mark it done",
+        )
+        assert out.startswith("Error:")
+        assert tm.get(task.id).status != "done"
+
+    async def test_manage_tasks_update_is_refused_on_a_journal_turn(self, tm):
+        task = tm.create("Existing task")
+        out = await execute_tool_parallel(
+            "manage_tasks", {"action": "update", "task_id": task.id, "description": "changed"},
+            persona_id="journal", user_message="change it",
+        )
+        assert out.startswith("Error:")
+        assert tm.get(task.id).description == "Existing task"
+
+    async def test_manage_tasks_create_keeps_only_attested_tags(self, tm):
+        out = await execute_tool_parallel(
+            "manage_tasks",
+            {"action": "create", "description": "call mom", "tags": ["claude", "invented"]},
+            persona_id="journal",
+            user_message="create a calendar event to call mom tomorrow at 3 #claude",
+        )
+        assert out.startswith("Task created")
+        assert tm.list_tasks()[0].tags == ["claude"]
+
+    async def test_manage_tasks_create_strips_all_tags_when_none_attested(self, tm):
+        out = await execute_tool_parallel(
+            "manage_tasks",
+            {"action": "create", "description": "call mom", "tags": ["agent"]},
+            persona_id="journal",
+            user_message="create a calendar event to call mom tomorrow at 3",
+        )
+        assert out.startswith("Task created")
+        assert tm.list_tasks()[0].tags == []
+
+    async def test_manage_tasks_create_strips_unattested_fields(self, tm):
+        out = await execute_tool_parallel(
+            "manage_tasks",
+            {"action": "create", "description": "call mom", "fields": {"model": "opus"}},
+            persona_id="journal",
+            user_message="create a calendar event to call mom tomorrow at 3",
+        )
+        assert out.startswith("Task created")
+        created = tm.get(tm.list_tasks()[0].id)
+        assert created.fields == {}
+
+    async def test_manage_tasks_create_strips_a_tag_that_is_only_a_substring_of_a_message_tag(self, tm):
+        out = await execute_tool_parallel(
+            "manage_tasks",
+            {"action": "create", "description": "notes", "tags": ["agent", "claude"]},
+            persona_id="journal",
+            user_message="thinking about the #agentic loop and #claude-code docs",
+        )
+        assert out.startswith("Task created")
+        assert tm.list_tasks()[0].tags == []
+
+    async def test_manage_tasks_create_strips_fields_that_are_bare_words_in_the_message(self, tm):
+        out = await execute_tool_parallel(
+            "manage_tasks",
+            {
+                "action": "create", "description": "call the vendor",
+                "fields": {"executor": "local", "model": "opus"},
+            },
+            persona_id="journal",
+            user_message="call the local vendor about the opus recording",
+        )
+        assert out.startswith("Task created")
+        created = tm.get(tm.list_tasks()[0].id)
+        assert created.fields == {}
+
+    async def test_manage_tasks_create_keeps_a_genuinely_written_tag(self, tm):
+        out = await execute_tool_parallel(
+            "manage_tasks",
+            {"action": "create", "description": "notes", "tags": ["claude"]},
+            persona_id="journal",
+            user_message="thinking about the #claude docs",
+        )
+        assert out.startswith("Task created")
+        assert tm.list_tasks()[0].tags == ["claude"]
+
+    async def test_manage_tasks_create_keeps_a_field_value_attested_in_the_message(self, tm):
+        out = await execute_tool_parallel(
+            "manage_tasks",
+            {"action": "create", "description": "call mom", "fields": {"key": "callmom"}},
+            persona_id="journal",
+            user_message="create a calendar event to call mom tomorrow at 3 key:callmom",
+        )
+        assert out.startswith("Task created")
+        created = tm.get(tm.list_tasks()[0].id)
+        assert created.fields == {"key": "callmom"}
+
+    async def test_manage_tasks_create_keeps_a_field_value_attested_by_a_quoted_span(self, tm):
+        out = await execute_tool_parallel(
+            "manage_tasks",
+            {"action": "create", "description": "call the vendor", "fields": {"executor": "local"}},
+            persona_id="journal",
+            user_message='use the "local" executor for this',
+        )
+        assert out.startswith("Task created")
+        created = tm.get(tm.list_tasks()[0].id)
+        assert created.fields == {"executor": "local"}
+
+    async def test_manage_schedules_notify_create_is_allowed_on_a_journal_turn(self, sched):
+        out = await execute_tool_parallel(
+            "manage_schedules",
+            {
+                "action": "create", "name": "call mom", "schedule_type": "once",
+                "schedule_value": "2030-01-02T15:00:00", "schedule_action": "notify",
+                "message_content": "call mom",
+            },
+            persona_id="journal", user_message="remind me to call mom tomorrow at 3",
+        )
+        assert out.startswith("Schedule created")
+        assert sched.list_all()[0].action == "notify"
+
+    @pytest.mark.parametrize("bad_action", ["prompt", "endpoint", "agent"])
+    async def test_manage_schedules_non_notify_create_is_refused_on_a_journal_turn(self, sched, bad_action):
+        out = await execute_tool_parallel(
+            "manage_schedules",
+            {
+                "action": "create", "name": "x", "schedule_type": "once",
+                "schedule_value": "2030-01-02T15:00:00", "schedule_action": bad_action,
+                "message_content": "x",
+            },
+            persona_id="journal", user_message="x",
+        )
+        assert out.startswith("Error:")
+        assert sched.list_all() == []
+
+    async def test_manage_schedules_create_persists_bot_and_timezone(self, sched):
+        out = await execute_tool_parallel(
+            "manage_schedules",
+            {
+                "action": "create", "name": "call mom", "schedule_type": "once",
+                "schedule_value": "2030-01-02T15:00:00", "schedule_action": "notify",
+                "message_content": "call mom", "bot": "journal", "timezone": "America/New_York",
+            },
+            persona_id="journal", user_message="remind me to call mom tomorrow at 3",
+        )
+        assert out.startswith("Schedule created")
+        entry = sched.list_all()[0]
+        assert entry.bot == "journal"
+        assert entry.timezone == "America/New_York"
+
+    async def test_manage_schedules_create_defaults_bot_to_journal_when_configured(self, sched, monkeypatch):
+        # Simulate an install with TELEGRAM_JOURNAL_BOT_TOKEN configured, the
+        # way test_vault_write_route.py's _enable_journal_persona does: the
+        # registry loader merges dotenv values with os.environ, and
+        # monkeypatch.setenv always wins that merge.
+        monkeypatch.setenv("TELEGRAM_JOURNAL_BOT_TOKEN", "test-token")
+        out = await execute_tool_parallel(
+            "manage_schedules",
+            {
+                "action": "create", "name": "call mom", "schedule_type": "once",
+                "schedule_value": "2030-01-02T15:00:00", "schedule_action": "notify",
+                "message_content": "call mom",
+            },
+            persona_id="journal", user_message="remind me to call mom tomorrow at 3",
+        )
+        assert out.startswith("Schedule created")
+        assert sched.list_all()[0].bot == "journal"
+
+    async def test_manage_schedules_create_leaves_bot_empty_when_journal_not_configured(self, sched, tmp_path, monkeypatch):
+        # Force the registry to resolve no bots at all, regardless of what
+        # this machine's real config/telegram_bots.json or .env carries.
+        monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", tmp_path / "no-registry.json")
+        out = await execute_tool_parallel(
+            "manage_schedules",
+            {
+                "action": "create", "name": "call mom", "schedule_type": "once",
+                "schedule_value": "2030-01-02T15:00:00", "schedule_action": "notify",
+                "message_content": "call mom",
+            },
+            persona_id="journal", user_message="remind me to call mom tomorrow at 3",
+        )
+        assert out.startswith("Schedule created")
+        assert sched.list_all()[0].bot == ""
+
+    async def test_manage_schedules_delete_is_refused_on_a_journal_turn(self, sched):
+        entry = sched.create(
+            action="notify", name="existing", schedule_type="once",
+            schedule_value="2030-01-02T15:00:00", message_content="x",
+        )
+        out = await execute_tool_parallel(
+            "manage_schedules", {"action": "delete", "schedule_id": entry.id},
+            persona_id="journal", user_message="actually, cancel that 3pm reminder",
+        )
+        assert out.startswith("Error:")
+        assert sched.get(entry.id) is not None
+
+    async def test_manage_schedules_update_is_refused_on_a_journal_turn(self, sched):
+        entry = sched.create(
+            action="agent", name="existing", schedule_type="once",
+            schedule_value="2030-01-02T15:00:00", message_content="do work",
+            executor="claude_code",
+        )
+        out = await execute_tool_parallel(
+            "manage_schedules",
+            {"action": "update", "schedule_id": entry.id, "message_content": "changed", "executor": "codex"},
+            persona_id="journal", user_message="change that schedule",
+        )
+        assert out.startswith("Error:")
+        unchanged = sched.get(entry.id)
+        assert unchanged.message_content == "do work"
+        assert unchanged.executor == "claude_code"
+
+
+class TestJournalCreatedTaskIdExtraction:
+    """`_journal_created_task_id` pulls the newly created task's own id out
+    of a `manage_tasks` create result, for `execute_tool_parallel` to add to
+    the per-turn set a same-turn child create can then name as its parent."""
+
+    def test_extracts_the_id_of_a_plain_created_task(self):
+        result = "Task created:\n[ ] Renovate the synthetic garage [id:abcd1234]"
+        assert _journal_created_task_id(result) == "abcd1234"
+
+    def test_picks_the_own_id_not_a_later_parent_line(self):
+        result = (
+            "Task created:\n[ ] Clear the synthetic shelves [id:efgh5678]\n"
+            "  Parent: Renovate the synthetic garage [id:abcd1234]"
+        )
+        assert _journal_created_task_id(result) == "efgh5678"
+
+    def test_a_recovered_task_yields_no_id(self):
+        result = "Task recovered:\n[ ] Renovate the synthetic garage [id:abcd1234]"
+        assert _journal_created_task_id(result) is None
+
+    def test_an_error_result_yields_no_id(self):
+        result = "Error: description is required"
+        assert _journal_created_task_id(result) is None
+
+    def test_an_id_pattern_in_the_due_date_does_not_poison_extraction(self):
+        # This extractor has no knowledge of the journal gate's own_task_id
+        # filter — it only reasons about the rendered line — so it must
+        # still pick the anchored, trailing [id:...] over one that a
+        # due_date rendered earlier on the same line happens to contain
+        # ("... (due <due_date>) [id:<own id>]").
+        result = "Task created:\n[ ] Renovate the synthetic garage (due [id:other]) [id:abcd1234]"
+        assert _journal_created_task_id(result) == "abcd1234"
+
+
+class TestExecuteToolParallelSameTurnParentAttestation:
+    """`execute_tool_parallel`'s `created_task_ids` param, mirroring the
+    per-turn set `run_agent_loop` binds for the journal persona."""
+
+    async def test_a_successful_create_adds_its_own_id_to_the_set(self, tm):
+        created: set = set()
+        out = await execute_tool_parallel(
+            "manage_tasks",
+            {"action": "create", "description": "Renovate the synthetic garage"},
+            persona_id="journal",
+            user_message="Make a project to renovate the synthetic garage",
+            created_task_ids=created,
+        )
+        assert out.startswith("Task created")
+        parent = tm.list_tasks()[0]
+        assert created == {parent.id}
+
+    async def test_a_same_turn_child_create_keeps_the_parents_id(self, tm):
+        created: set = set()
+        await execute_tool_parallel(
+            "manage_tasks",
+            {"action": "create", "description": "Renovate the synthetic garage"},
+            persona_id="journal",
+            user_message="Make a project to renovate the synthetic garage with subtasks clear the shelves",
+            created_task_ids=created,
+        )
+        parent = tm.list_tasks()[0]
+
+        out = await execute_tool_parallel(
+            "manage_tasks",
+            {"action": "create", "description": "Clear the shelves", "parent_id": parent.id},
+            persona_id="journal",
+            user_message="Make a project to renovate the synthetic garage with subtasks clear the shelves",
+            created_task_ids=created,
+        )
+
+        assert out.startswith("Task created")
+        child = next(t for t in tm.list_tasks() if t.description == "Clear the shelves")
+        assert child.fields.get("parent_id") == parent.id
+        assert created == {parent.id, child.id}
+
+    async def test_a_recovered_task_does_not_add_a_duplicate_or_new_id(self, tm):
+        created: set = set()
+        first = await execute_tool_parallel(
+            "manage_tasks",
+            {"action": "create", "description": "x", "operation_key": "op-1"},
+            persona_id="journal", user_message="x", created_task_ids=created,
+        )
+        assert first.startswith("Task created")
+        after_first = set(created)
+
+        second = await execute_tool_parallel(
+            "manage_tasks",
+            {"action": "create", "description": "x", "operation_key": "op-1"},
+            persona_id="journal", user_message="x", created_task_ids=created,
+        )
+
+        assert second.startswith("Task recovered")
+        assert created == after_first
+
+    async def test_no_set_keeps_todays_stripping_behavior(self, tm):
+        # With no created_task_ids (the default), an unattested parent_id is
+        # always stripped.
+        out = await execute_tool_parallel(
+            "manage_tasks",
+            {"action": "create", "description": "Clear the shelves", "parent_id": "some-parent"},
+            persona_id="journal",
+            user_message="Make a project to renovate the synthetic garage with subtasks clear the shelves",
+        )
+        assert out.startswith("Task created")
+        assert tm.list_tasks()[0].fields.get("parent_id") is None
+
+
+class TestExecuteToolParallelDueDatePoisoning:
+    """A `due_date` is only kept when it is a strict `YYYY-MM-DD` date
+    (`_journal_filter_task_create_input`), so a `due_date` that itself
+    contains `[id:...]` text — or, worse, a newline that could relocate a
+    forged `[id:...]` onto the own-task line — is stripped before it ever
+    reaches `_task_create`. A stripped/poisoned `due_date` must not be
+    recorded as a same-turn created id, and a later create naming the
+    poisoned id as `parent_id` must not attach to it."""
+
+    @pytest.mark.parametrize("poisoned_due_date", [
+        "[id:{existing_id}]",
+        "[id:{existing_id}]\nX",
+        "X) [id:{existing_id}]\n",
+    ])
+    async def test_a_poisoned_due_date_does_not_survive_or_poison_extraction(self, tm, poisoned_due_date):
+        existing_out = await execute_tool_parallel(
+            "manage_tasks",
+            {"action": "create", "description": "Existing task"},
+            persona_id="journal", user_message="x",
+        )
+        assert existing_out.startswith("Task created")
+        existing_id = tm.list_tasks()[0].id
+
+        created: set = set()
+        out = await execute_tool_parallel(
+            "manage_tasks",
+            {
+                "action": "create",
+                "description": "Poisoned due date task",
+                "due_date": poisoned_due_date.format(existing_id=existing_id),
+            },
+            persona_id="journal", user_message="x",
+            created_task_ids=created,
+        )
+        assert out.startswith("Task created")
+        new_task = next(t for t in tm.list_tasks() if t.description == "Poisoned due date task")
+
+        assert created == {new_task.id}
+        assert existing_id not in created
+        assert new_task.due_date is None
+
+        # A same-turn create naming the pre-existing task as parent is not
+        # attested and not in created_task_ids, so parent_id is stripped and
+        # the existing task's own fields are left untouched.
+        child_out = await execute_tool_parallel(
+            "manage_tasks",
+            {"action": "create", "description": "Should not attach", "parent_id": existing_id},
+            persona_id="journal", user_message="x",
+            created_task_ids=created,
+        )
+        assert child_out.startswith("Task created")
+        child = next(t for t in tm.list_tasks() if t.description == "Should not attach")
+        assert child.fields.get("parent_id") is None
+
+        existing_task_after = next(t for t in tm.list_tasks() if t.id == existing_id)
+        assert existing_task_after.fields.get("parent_id") is None
+
+    async def test_a_valid_iso_due_date_is_kept(self, tm):
+        out = await execute_tool_parallel(
+            "manage_tasks",
+            {"action": "create", "description": "call mom", "due_date": "2030-01-02"},
+            persona_id="journal", user_message="x",
+        )
+        assert out.startswith("Task created")
+        assert tm.list_tasks()[0].due_date == "2030-01-02"

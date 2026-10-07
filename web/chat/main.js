@@ -1,0 +1,135 @@
+// Chat module entry point. Wires the extracted modules together and
+// bridges them to the classic index.html shell script:
+//
+//   - `window.lifeChat` exposes the shared state and `initChat` so the shell can
+//     boot the chat surface (passing the DOM elements, endpoints, and the
+//     agent-thread hook it still owns) and read/write shared chat state.
+//   - `window.*` function shims keep the inline `on*=` handlers in index.html
+//     working unchanged (delegated-listener migration is a tracked follow-up).
+//
+// Both are installed at module load — before the shell's DOMContentLoaded
+// handler runs — so the bridge exists by the time any shell code touches it.
+
+import { state, config, elements, endpoints, hooks } from './session.js';
+import { addMessage, toggleSources, setStatus } from './thread.js';
+import { setupAttachmentHandlers, openFilePicker, removeAttachment } from './attachments.js';
+import {
+  setupSwipeGestures, toggleSidebar, closeSidebar, newChat,
+  filterConversations, loadConversation, deleteConversation,
+} from './conversations.js';
+import { sendMessage, askQuestion, stopTurn } from './ask-stream.js';
+import { loadPersonas, onPersonaChange, personaOrchestrates, personaSupportsHandoff } from './persona.js';
+import {
+  initVoice, submitTurn, checkForWakeWord,
+  checkEndpointCandidate, isTranscriptComplete, finalizeEndpointing,
+  isCancelUtterance, isListenTapRunning, isListenTrackEnabled, isEndpointTapActive,
+  finalizeIdleTimeout, cancelActiveTurn, hasHeldRecording,
+} from './voice.js';
+import { initBackend } from './backend.js';
+import { initModel, onModelChange } from './model.js';
+
+// Boot the chat surface. The shell passes in the explicit DOM element map (so
+// the modules never getElementById), the API endpoints, and integration hooks
+// (onAgentThreadReply — the agent-thread reply path still lives in the shell).
+export function initChat({ elements: els, endpoints: eps, hooks: hks } = {}) {
+  Object.assign(elements, els || {});
+  Object.assign(endpoints, eps || {});
+  Object.assign(hooks, hks || {});
+
+  const { inputField } = elements;
+
+  // Auto-resize textarea
+  inputField.addEventListener('input', function () {
+    this.style.height = 'auto';
+    this.style.height = Math.min(this.scrollHeight, 200) + 'px';
+  });
+
+  // Enter to send (Shift+Enter for newline)
+  inputField.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendMessage();
+    }
+  });
+
+  setupAttachmentHandlers();
+  setupSwipeGestures();
+  // loadPersonas() resolves config.personaId synchronously (from sessionStorage)
+  // before its own first await, so it runs BEFORE initBackend() to guarantee the
+  // per-backend conversation key (which is persona-scoped for lifeos) reads a
+  // persona id on a refresh. That synchronous id is provisional, though — it's
+  // only validated against /api/personas (falling back to primary if the fetch
+  // says it's gone) once loadPersonas()'s own promise settles. It deliberately
+  // does NOT list the conversation sidebar itself — config.backend isn't
+  // resolved yet at this point either, and initBackend() below issues the
+  // sidebar's single initial load once BOTH are resolved — awaiting this promise
+  // (personasReady) is what makes it wait on persona validation too, not just
+  // the synchronous id restore.
+  const personasReady = loadPersonas();
+  // LifeOS|Agent|Hermes selector + restore per-backend conversation.
+  // The promise is stashed on the bridge (below) so tests can await
+  // "default resolution actually happened" instead of polling UI state that
+  // can look identical before and after (e.g. the lifeos default matches
+  // index.html's initial markup).
+  window.lifeChat.backendReady = initBackend(personasReady);
+  // A deep link naming a conversation — e.g. the board's "open" on
+  // a Hermes card, `/chat?conversation=<id>` — opens that thread once the
+  // backend restore above has settled, so it wins over whatever
+  // per-backend conversation initBackend() itself restored from
+  // sessionStorage. loadConversation() only needs `endpoints.conversations`
+  // (already set by the Object.assign calls above), not the resolved
+  // backend, but waiting on backendReady keeps this deterministic instead
+  // of racing initBackend()'s own restore. Purely additive: no `conversation`
+  // param leaves every existing boot path (including the plain `?mode=`/
+  // `?record=` deep links voice.js reads) byte-identical, and this never
+  // touches the SSE contract those params gate.
+  window.lifeChat.backendReady.then(() => { maybeOpenDeepLinkedConversation(); });
+  initModel();  // restore the per-turn model picker (Auto/Sonnet/Opus/Gemma)
+  initVoice();  // restore Voice|Text mode + wire the hold-to-talk dock
+  setStatus('', 'Ready');
+  inputField.focus();
+}
+
+// `?conversation=<id>` deep link — see initChat()'s call site above
+// for why this runs after backendReady rather than synchronously.
+function maybeOpenDeepLinkedConversation() {
+  let id = null;
+  try {
+    id = new URLSearchParams(window.location.search).get('conversation');
+  } catch (e) {
+    return;  // no URLSearchParams / blocked — same guard voice.js uses
+  }
+  if (!id) return;
+  loadConversation(id);
+}
+
+// --- Bridge for the classic shell script + inline handlers ---
+// personaOrchestrates/personaSupportsHandoff are exposed read-only for tests
+// (a browser-test truth table across backends) — nothing in the app
+// itself needs them off this bridge; ask-stream.js/voice.js import them
+// directly as module functions.
+window.lifeChat = { state, config, initChat, personaOrchestrates, personaSupportsHandoff };
+
+Object.assign(window, {
+  // thread.js
+  addMessage, toggleSources,
+  // conversations.js
+  toggleSidebar, closeSidebar, newChat, filterConversations,
+  loadConversation, deleteConversation,
+  // attachments.js
+  openFilePicker, removeAttachment,
+  // ask-stream.js
+  sendMessage, askQuestion, stopTurn,
+  // persona.js
+  onPersonaChange,
+  // model.js
+  onModelChange,
+});
+
+// Voice helpers for the headless test harness (mic/audio can't run headless).
+window.lifeChatVoice = {
+  submitTurn, checkForWakeWord,
+  checkEndpointCandidate, isTranscriptComplete, finalizeEndpointing,
+  isCancelUtterance, isListenTapRunning, isListenTrackEnabled, isEndpointTapActive,
+  finalizeIdleTimeout, cancelActiveTurn, hasHeldRecording,
+};

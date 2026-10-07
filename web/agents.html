@@ -1,0 +1,2269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Agents" />
+<title>Agents · LifeOS</title>
+<link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
+<!-- iOS reads this, not the SVG favicon, when the page is added to the Home
+     Screen; without it the icon is a generated letter tile. -->
+<link rel="apple-touch-icon" href="/static/icons/apple-touch-icon.png" />
+<link rel="manifest" href="/manifests/agents.webmanifest" />
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  :root {
+    --bg-primary: #0a0a0f;
+    --bg-secondary: #12121a;
+    --bg-card: #1a1a24;
+    --bg-elev: #20202c;
+    --text-primary: #e8e8ed;
+    --text-secondary: #8888a0;
+    --text-dim: #5a5a6e;
+    --accent: #6366f1;
+    --border: #2a2a3a;
+    --running: #34d399;
+    --running-glow: rgba(52, 211, 153, 0.45);
+    --claimed: #60a5fa;
+    --yielded: #fbbf24;
+    --blocked: #fb923c;
+    --completed: #6b7280;
+    --failed: #f87171;
+  }
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+  }
+  *::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  *::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  *::-webkit-scrollbar-thumb {
+    background-color: var(--border);
+    border-radius: 6px;
+    border: 2px solid transparent;
+    background-clip: padding-box;
+  }
+  *::-webkit-scrollbar-thumb:hover {
+    background-color: var(--text-dim);
+  }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    min-height: 100vh;
+    overflow: hidden;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    padding: 0.75rem 1.25rem;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-secondary);
+    height: 56px;
+  }
+  header h1 {
+    font-size: 1rem;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+  }
+  header h1 a {
+    color: var(--text-primary);
+    text-decoration: none;
+  }
+  header h1 .crumb {
+    color: var(--text-dim);
+    font-weight: 400;
+    margin: 0 0.5rem;
+  }
+  .header-nav {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    margin-left: 1rem;
+  }
+  .nav-link {
+    display: flex;
+    align-items: center;
+    gap: 0.375rem;
+    padding: 0.375rem 0.75rem;
+    border-radius: 6px;
+    text-decoration: none;
+    font-size: 0.85rem;
+    font-weight: 500;
+    color: var(--text-secondary);
+    transition: all 0.2s;
+  }
+  .nav-link:hover {
+    background: var(--bg-card);
+    color: var(--text-primary);
+  }
+  .nav-link.active {
+    background: var(--accent);
+    color: var(--bg-primary);
+  }
+  .chips {
+    display: flex;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    margin-left: auto;
+  }
+  .chips[hidden] { display: none; }
+  .chip {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 0.25rem 0.75rem;
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    white-space: nowrap;
+  }
+  .chip strong { color: var(--text-primary); font-weight: 600; margin-right: 0.25rem; }
+  .chip.running strong { color: var(--running); }
+  .chip.blocked strong { color: var(--blocked); }
+  .chip.spend strong { color: var(--accent); }
+  .filters {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem 0.75rem;
+    align-items: center;
+    padding: 0.5rem 1.25rem;
+    border-bottom: 1px solid var(--border);
+    font-size: 0.8rem;
+    background: var(--bg-primary);
+    color: var(--text-secondary);
+  }
+  .filters label { display: flex; align-items: center; gap: 0.35rem; cursor: pointer; }
+  .filters select, .filters input[type="text"] {
+    background: var(--bg-card);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.25rem 0.5rem;
+    font-size: 0.8rem;
+  }
+  /* Search box + live results dropdown. The wrapper is the
+     positioning context for the absolutely-placed results list. */
+  .search-wrap { position: relative; }
+  .search-wrap input {
+    background: var(--bg-card);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.25rem 0.5rem;
+    font-size: 0.8rem;
+    width: 200px;
+  }
+  .search-wrap input:focus { outline: none; border-color: var(--accent); }
+  .search-results {
+    position: absolute;
+    top: calc(100% + 4px);
+    left: 0;
+    width: 360px;
+    max-height: 50vh;
+    overflow-y: auto;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+    padding: 0.25rem 0;
+    z-index: 50;
+  }
+  .search-results[hidden] { display: none; }
+  .search-group-label {
+    font-size: 0.66rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-dim);
+    padding: 0.4rem 0.6rem 0.2rem;
+  }
+  .search-result {
+    display: block;
+    width: 100%;
+    text-align: left;
+    border: none;
+    background: transparent;
+    color: var(--text-primary);
+    padding: 0.3rem 0.6rem;
+    cursor: pointer;
+  }
+  .search-result:hover,
+  .search-result.active { background: var(--bg-primary); }
+  .search-result .sr-title {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.8rem;
+  }
+  .search-result .sr-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .search-result .sr-badge {
+    flex: none;
+    margin-left: auto;
+    font-size: 0.6rem;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: var(--text-dim);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 0 0.35rem;
+  }
+  .search-result .sr-snippet {
+    font-size: 0.72rem;
+    color: var(--text-secondary);
+    margin-top: 0.1rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .search-result mark {
+    background: var(--accent);
+    color: #fff;
+    border-radius: 2px;
+    padding: 0 1px;
+  }
+  .search-group.hidden-group .search-result { opacity: 0.5; }
+  .search-empty {
+    padding: 0.5rem 0.6rem;
+    font-size: 0.75rem;
+    color: var(--text-dim);
+  }
+  main {
+    display: grid;
+    grid-template-columns: 1fr var(--panel-width, 360px);
+    height: calc(100vh - 56px - 41px - 34px);
+  }
+  /* Lane + engine legend — sits between the filters bar and the
+     graph, visible only while the Graph tab is active. */
+  .legend-bar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 1.25rem;
+    padding: 0.4rem 1.25rem;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-primary);
+    font-size: 0.72rem;
+    color: var(--text-secondary);
+  }
+  .legend-group {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.6rem;
+    align-items: center;
+  }
+  .legend-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    white-space: nowrap;
+  }
+  .legend-swatch {
+    width: 10px;
+    height: 10px;
+    border-radius: 3px;
+    display: inline-block;
+  }
+  .legend-glyph {
+    width: 11px;
+    height: 11px;
+    display: inline-block;
+    background: var(--text-secondary);
+  }
+  .legend-glyph-circle { border-radius: 50%; }
+  .legend-glyph-square { border-radius: 2px; }
+  .legend-glyph-diamond { transform: rotate(45deg); width: 9px; height: 9px; }
+  .legend-glyph-hexagon { clip-path: polygon(25% 0%, 75% 0%, 100% 50%, 75% 100%, 25% 100%, 0% 50%); }
+  .legend-glyph-star { clip-path: polygon(50% 0%, 61% 35%, 98% 35%, 68% 57%, 79% 91%, 50% 70%, 21% 91%, 32% 57%, 2% 35%, 39% 35%); }
+  #graph-zoom-fit, #graph-zoom-reset {
+    background: var(--bg-card);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.25rem 0.6rem;
+    font-size: 0.75rem;
+    cursor: pointer;
+  }
+  #graph-zoom-fit:hover, #graph-zoom-reset:hover { border-color: var(--accent); }
+  /* HTML hover card. Never intercepts pointer events so it can't itself
+     trigger mouseleave on the node underneath it. */
+  .hover-card {
+    position: fixed;
+    z-index: 50;
+    pointer-events: none;
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.5rem 0.65rem;
+    font-size: 0.72rem;
+    color: var(--text-secondary);
+    box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+    max-width: 260px;
+  }
+  .hover-card[hidden] { display: none; }
+  .hover-card .hc-title {
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin-bottom: 0.3rem;
+    word-break: break-word;
+  }
+  .hover-card .hc-row { display: flex; gap: 0.4rem; justify-content: space-between; }
+  .hover-card .hc-label { color: var(--text-dim); }
+  .hover-card .hc-value { color: var(--text-secondary); text-align: right; word-break: break-word; }
+  .timeline-guides text {
+    font: 12px system-ui, -apple-system, sans-serif;
+    fill: var(--text-dim);
+    pointer-events: none;
+    user-select: none;
+  }
+  .timeline-guides .depth-label { text-anchor: end; font-size: 10px; }
+  .timeline-guides .time-label { font-size: 10px; }
+  .timeline-guides .timeline-row {
+    stroke: rgba(255, 255, 255, 0.07);
+    stroke-width: 1;
+    stroke-dasharray: 3 7;
+    pointer-events: none;
+  }
+  /* Node badges — question ring/glyph, error count, and the
+     collapsed-subagent-count badge. Offset from the node so they never
+     collide with its label. */
+  .node-badge-question { pointer-events: none; }
+  .node-badge-errors { pointer-events: none; }
+  .node-badge-children { font-weight: 600; }
+  /* Card actions above the transcript panel — Show on board / Answer
+     for whatever node or card cluster is currently selected. Empty (and
+     therefore invisible — no min-height) when nothing is selected. */
+  #graph-panel-actions {
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+    padding: 0 0 0.5rem 5px;
+  }
+  #graph-panel-actions:empty { display: none; }
+  .graph-panel-action {
+    align-self: flex-start;
+    background: var(--bg-card);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.3rem 0.7rem;
+    font-size: 0.78rem;
+    cursor: pointer;
+  }
+  .graph-panel-action:hover { border-color: var(--accent); }
+  .graph-panel-answer-form {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+  }
+  .graph-panel-answer-form textarea {
+    background: var(--bg-card);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.4rem;
+    font: inherit;
+    min-height: 4.5em;
+    resize: vertical;
+  }
+  /* Drag handle on the left edge of the side panel — col-resize cursor,
+     pure CSS visual feedback on hover/active. Drag logic in JS persists
+     the width to localStorage so it survives reload. */
+  .panel-resizer {
+    position: absolute;
+    left: 0; top: 0; bottom: 0;
+    width: 5px;
+    cursor: col-resize;
+    background: transparent;
+    transition: background 0.15s ease;
+    z-index: 10;
+  }
+  .panel-resizer:hover,
+  .panel-resizer.dragging {
+    background: var(--accent);
+  }
+  aside.panel { position: relative; }
+  .panel-content {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    height: 100%;
+    padding-left: 5px;  /* leave room for the resizer strip */
+  }
+  #graph {
+    background: var(--bg-primary);
+    position: relative;
+    overflow: hidden;
+  }
+  #graph-svg {
+    width: 100%;
+    height: 100%;
+    display: block;
+  }
+  /* Delegation timeline styles */
+  #graph-svg .link {
+    stroke: #3a3a4a;
+    stroke-width: 1.2;
+    fill: none;
+    opacity: 0.7;
+    pointer-events: none;
+  }
+  #graph-svg .node-shape {
+    cursor: pointer;
+    transition: stroke-width 0.2s ease, filter 0.2s ease;
+  }
+  #graph-svg .node-shape:hover {
+    stroke: #e8e8ed;
+    filter: brightness(1.15);
+  }
+  #graph-svg .node-label {
+    font: 12px system-ui, -apple-system, sans-serif;
+    fill: #e8e8ed;
+    text-anchor: middle;
+    pointer-events: none;
+    user-select: none;
+  }
+  /* `updateLabelLegibility` (web/agents/graph.js) counter-scales each
+     label's own font-size to hold it at a legible on-screen size across
+     most zoom levels; past a point no reasonable font-size compensates
+     without the labels themselves overlapping and cluttering a dense,
+     zoomed-far-out graph, so it hides them entirely instead — the hover
+     card still names a node in this state. */
+  #graph-svg .nodes.labels-below-legible .node-label {
+    display: none;
+  }
+  /* Pulse animation for actively-writing nodes (last 60s of activity).
+     White border that alternates thick / thin via CSS keyframe — no JS
+     polling required. */
+  @keyframes node-pulse {
+    0%, 100% { stroke: var(--running); stroke-width: 2; }
+    50%      { stroke: #ffffff;        stroke-width: 5; }
+  }
+  #graph-svg .node-shape.pulsing {
+    animation: node-pulse 1.4s ease-in-out infinite;
+  }
+  /* Selection emphasis — `!important` on stroke beats the pulsing keyframe
+     when both apply (selected actively-writing node prefers selection cue). */
+  #graph-svg .node-shape.selected {
+    stroke: #ffffff !important;
+    stroke-width: 5 !important;
+    animation: none !important;
+  }
+  #graph-svg .node-shape.related {
+    stroke: rgba(255, 255, 255, 0.78) !important;
+    stroke-width: 3 !important;
+    animation: none !important;
+  }
+  #graph-svg .node-shape.dimmed {
+    opacity: 0.28;
+  }
+  #graph-svg .node-label.dimmed {
+    opacity: 0.35;
+  }
+  #graph-svg .link.highlighted {
+    stroke: #ffffff;
+    stroke-width: 2.4;
+    opacity: 1;
+  }
+  #graph-svg .link.dimmed {
+    opacity: 0.18;
+  }
+  #graph .empty-state {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-secondary);
+    gap: 0.5rem;
+    pointer-events: none;
+  }
+  #graph .empty-state .icon { font-size: 2.5rem; opacity: 0.5; }
+  #graph .empty-state .label { font-size: 0.95rem; }
+  #graph .empty-state .hint { font-size: 0.8rem; color: var(--text-dim); }
+  aside.panel {
+    background: var(--bg-secondary);
+    border-left: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .panel-header {
+    padding: 1rem;
+    border-bottom: 1px solid var(--border);
+  }
+  .panel-header .label {
+    font-size: 0.95rem;
+    font-weight: 600;
+    word-break: break-word;
+    cursor: pointer;
+    border-radius: 4px;
+    padding: 1px 4px;
+    margin: -1px -4px;
+    transition: background 0.12s;
+  }
+  .panel-header .label:hover { background: var(--bg-elev); }
+  .panel-header .meta {
+    color: var(--text-secondary);
+    font-size: 0.75rem;
+    margin-top: 0.25rem;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem 0.75rem;
+  }
+  .panel-header .meta .badge {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    padding: 0.1rem 0.5rem;
+    border-radius: 4px;
+    font-size: 0.7rem;
+  }
+  .badge.status-running { color: var(--running); border-color: var(--running); }
+  .badge.status-claimed { color: var(--claimed); border-color: var(--claimed); }
+  .badge.status-yielded { color: var(--yielded); border-color: var(--yielded); }
+  .badge.status-inactive { color: var(--yielded); border-color: var(--yielded); }
+  .badge.status-idle { color: var(--yielded); border-color: var(--yielded); }
+  .badge.status-blocked { color: var(--blocked); border-color: var(--blocked); }
+  .badge.status-completed { color: var(--completed); border-color: var(--completed); }
+  .badge.status-ended { color: var(--completed); border-color: var(--completed); }
+  .badge.status-failed,
+  .badge.status-budget_exceeded { color: var(--failed); border-color: var(--failed); }
+  /* Model / engine / host / effort chips — display-only metadata,
+     never the node/panel name (that's the `.label` above). */
+  .panel-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.3rem;
+    margin-top: 0.35rem;
+  }
+  .panel-chips .panel-chip {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    padding: 0.1rem 0.45rem;
+    border-radius: 999px;
+    font-size: 0.68rem;
+    color: var(--text-secondary);
+  }
+  .panel-empty {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-dim);
+    padding: 2rem;
+    text-align: center;
+    font-size: 0.85rem;
+  }
+  .session-summary {
+    padding: 0.55rem 0.7rem 0.65rem;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-elev);
+    font-size: 0.78rem;
+    line-height: 1.45;
+  }
+  .session-summary .ss-label {
+    font-size: 0.65rem;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-bottom: 0.25rem;
+  }
+  .session-summary .ss-short {
+    font-weight: 600;
+    color: var(--text-primary);
+    font-size: 0.92rem;
+    margin-bottom: 0.35rem;
+  }
+  .session-summary .ss-body {
+    color: var(--text-secondary);
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .session-summary .ss-body ul {
+    margin: 0.1rem 0 0;
+    padding-left: 1.1rem;
+  }
+  .session-summary .ss-body li { margin: 0.1rem 0; }
+  .session-summary.loading .ss-body {
+    color: var(--text-dim);
+    font-style: italic;
+  }
+  .events {
+    flex: 1;
+    overflow-y: auto;
+    padding: 0.5rem;
+  }
+  .event {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.45rem 0.6rem;
+    margin-bottom: 0.4rem;
+    font-size: 0.78rem;
+    line-height: 1.35;
+    animation: fadeIn 0.3s ease;
+  }
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translateY(-4px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  .event.kind-tool_call { border-left: 2px solid var(--accent); }
+  .event.kind-failed,
+  .event.kind-managed_failed,
+  .event.kind-child_failed_internal,
+  .event.kind-killed,
+  .event.kind-cascade_killed { border-left: 2px solid var(--failed); }
+  .event.kind-spawn,
+  .event.kind-spawned_child { border-left: 2px solid var(--claimed); }
+  .event.kind-final { border-left: 2px solid var(--running); }
+  .event .kind {
+    color: var(--text-primary);
+    font-weight: 600;
+    font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+    font-size: 0.72rem;
+    cursor: pointer;
+    padding: 0.05rem 0.3rem;
+    border-radius: 3px;
+    transition: background 0.12s ease;
+  }
+  .event .kind:hover {
+    background: var(--bg-elev);
+    color: var(--accent);
+  }
+  .event .kind.kind-active-filter {
+    background: var(--accent);
+    color: var(--bg-primary);
+  }
+  .event .ts {
+    color: var(--text-dim);
+    font-size: 0.68rem;
+    margin-left: 0.5rem;
+  }
+  .event .payload {
+    color: var(--text-secondary);
+    margin-top: 0.2rem;
+    word-break: break-word;
+    white-space: pre-wrap;
+    font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+    font-size: 0.7rem;
+    max-height: 8rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  /* Click anywhere on a feed item (except the kind label, which filters)
+     to expand it — full untruncated payload + white text. Click again to
+     collapse. The cursor signals affordance only on the content area. */
+  .event .payload { cursor: pointer; }
+  .event.expanded {
+    background: var(--bg-elev);
+  }
+  .event.expanded .payload {
+    color: var(--text-primary);
+    max-height: none;
+    overflow: visible;
+    text-overflow: clip;
+  }
+  /* Pretty payload — replaces raw JSON in the collapsed view. The raw JSON
+     is still emitted in a sibling .payload-raw <pre> revealed on expand,
+     so power users can still inspect the full shape. */
+  .event .payload {
+    font-family: system-ui, -apple-system, sans-serif;
+    font-size: 0.78rem;
+    line-height: 1.5;
+    max-height: 14rem;
+  }
+  .event .payload-raw {
+    display: none;
+    margin-top: 0.35rem;
+    padding-top: 0.35rem;
+    border-top: 1px dashed var(--border);
+    color: var(--text-secondary);
+    font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+    font-size: 0.7rem;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 20rem;
+    overflow-y: auto;
+  }
+  .event.expanded .payload-raw { display: block; }
+  .pp-text {
+    color: var(--text-primary);
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .pp-text.muted { color: var(--text-dim); font-style: italic; }
+  .pp-routing {
+    color: var(--text-primary);
+    margin-top: 0.15rem;
+  }
+  .pp-routing .pp-target {
+    color: var(--accent);
+    font-weight: 600;
+  }
+  .pp-routing .pp-reason { color: var(--text-secondary); }
+  .pp-field {
+    margin-top: 0.25rem;
+    color: var(--text-secondary);
+  }
+  .pp-field .pp-label,
+  .pp-budget .pp-label,
+  .pp-usage  .pp-label,
+  .pp-kv     .pp-label,
+  .pp-badge  .pp-label {
+    text-transform: uppercase;
+    font-size: 0.62rem;
+    letter-spacing: 0.04em;
+    color: var(--text-dim);
+    margin-right: 0.3rem;
+  }
+  .pp-field .pp-value {
+    color: var(--text-primary);
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .pp-tools {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.3rem;
+    margin-top: 0.3rem;
+  }
+  .pp-tool {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 0.3rem;
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.1rem 0.4rem;
+    font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+    font-size: 0.72rem;
+  }
+  .pp-tool .pp-tool-name { color: var(--accent); font-weight: 600; }
+  .pp-tool .pp-tool-args { color: var(--text-dim); }
+  .pp-budget, .pp-usage {
+    margin-top: 0.25rem;
+    color: var(--text-secondary);
+  }
+  .pp-badges {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.3rem;
+    margin-top: 0.3rem;
+  }
+  .pp-badge {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.05rem 0.4rem;
+    font-size: 0.7rem;
+    color: var(--text-primary);
+  }
+  .pp-badge.pp-warn { color: var(--blocked); border-color: var(--blocked); }
+  .pp-extra {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem 0.9rem;
+    margin-top: 0.3rem;
+    color: var(--text-secondary);
+  }
+  .pp-empty { color: var(--text-dim); font-style: italic; }
+  /* `.panel-header-top` is its own row, in normal flow, above the label
+     and the `.meta`/`.panel-chips` badge rows below it — normal flow
+     (never floated) guarantees the badges/chips always render below it,
+     never underneath. `flex-wrap: nowrap` on THIS row, combined with
+     `.panel-close`'s `flex: none` below, keeps the close button pinned to
+     the top-right corner regardless of how tall the action row gets —
+     `.panel-header-actions` is the only item allowed to wrap (onto
+     multiple lines within its own box, via `flex: 1 1 auto; min-width: 0`
+     shrinking it to make room), so a wide action row grows DOWN within
+     its own column instead of pushing the close button onto a second
+     line of this row. */
+  .panel-header-top {
+    display: flex;
+    flex-wrap: nowrap;
+    align-items: flex-start;
+    justify-content: flex-end;
+    gap: 0.4rem;
+  }
+  /* The shared action row (web/agents/session_actions.js's
+     `renderActionRow`) mounts here. `flex-wrap` is what actually lays the
+     row out: the Board drawer's own action-row container
+     (`.drawer-actions`) is flex too, so the two surfaces wrap and place a
+     disabled action's reason text (`.drawer-field-reason`) the same way —
+     the row can hold every card-only action a card-linked panel offers,
+     not just the three CLI-only buttons
+     (`.panel-kill`/`.panel-resume`/`.panel-focus`). `flex: 1 1 auto;
+     min-width: 0` lets this shrink and wrap onto multiple lines within
+     `.panel-header-top` (see above) instead of forcing that nowrap row to
+     overflow. */
+  .panel-header-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.4rem;
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  .panel-header-top > .panel-close {
+    flex: none;
+  }
+  .panel-close {
+    background: none;
+    border: none;
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-size: 1.25rem;
+    line-height: 1;
+    padding: 0.15rem 0.4rem;
+    border-radius: 4px;
+    float: right;
+  }
+  .panel-close:hover { background: var(--bg-card); color: var(--text-primary); }
+  .panel-kill {
+    background: var(--bg-card);
+    border: 1px solid var(--failed);
+    color: var(--failed);
+    cursor: pointer;
+    font-size: 0.75rem;
+    line-height: 1;
+    padding: 0.3rem 0.55rem;
+    border-radius: 4px;
+    float: right;
+    margin-right: 0.5rem;
+    font-weight: 500;
+    letter-spacing: 0.02em;
+  }
+  .panel-kill:hover { background: var(--failed); color: var(--bg-primary); }
+  .panel-kill:disabled {
+    opacity: 0.6;
+    cursor: progress;
+  }
+  .panel-resume {
+    background: var(--bg-card);
+    border: 1px solid var(--accent);
+    color: var(--accent);
+    cursor: pointer;
+    font-size: 0.75rem;
+    line-height: 1;
+    padding: 0.3rem 0.55rem;
+    border-radius: 4px;
+    float: right;
+    margin-right: 0.5rem;
+    font-weight: 500;
+    letter-spacing: 0.02em;
+  }
+  .panel-resume:hover { background: var(--accent); color: var(--bg-primary); }
+  .panel-resume:disabled { opacity: 0.6; cursor: progress; }
+  .panel-resume-host {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+    font-size: 0.7rem;
+    line-height: 1;
+    padding: 0.3rem 0.35rem;
+    border-radius: 4px;
+    float: right;
+    margin-right: 0.5rem;
+    max-width: 9rem;
+  }
+  .resume-command {
+    margin-top: 0.4rem;
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    /* This is a flex item of the action row it's a sibling of
+       (`.panel-header-actions` / `.drawer-actions`, both flex-wrap) —
+       `flex-basis: 100%` forces it onto its own line below the buttons
+       regardless of exactly where in the row Resume's button lands. */
+    flex-basis: 100%;
+  }
+  .resume-command[hidden] { display: none; }
+  .resume-command code {
+    flex: 1;
+    font-size: 0.7rem;
+    color: var(--text-secondary);
+    background: var(--bg-elev);
+    border-radius: 4px;
+    padding: 0.25rem 0.4rem;
+    word-break: break-all;
+  }
+  .resume-command button {
+    font-size: 0.7rem;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+    border-radius: 4px;
+    padding: 0.2rem 0.45rem;
+    cursor: pointer;
+  }
+  .resume-command button:hover { background: var(--accent); color: var(--bg-primary); }
+  .panel-focus {
+    background: var(--bg-card);
+    border: 1px solid var(--text-dim);
+    color: var(--text-dim);
+    cursor: pointer;
+    font-size: 0.75rem;
+    line-height: 1;
+    padding: 0.3rem 0.55rem;
+    border-radius: 4px;
+    float: right;
+    margin-right: 0.5rem;
+    font-weight: 500;
+    letter-spacing: 0.02em;
+  }
+  .panel-focus:hover { background: var(--text-dim); color: var(--bg-primary); }
+  .panel-focus:disabled { opacity: 0.6; cursor: progress; }
+  .modal-backdrop {
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,0.55);
+    z-index: 100;
+    display: flex; align-items: center; justify-content: center;
+    animation: fadeIn 0.15s ease;
+  }
+  .modal {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.25rem;
+    width: min(420px, 90vw);
+    max-height: 85vh;
+    overflow-y: auto;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+  }
+  .modal h2 {
+    font-size: 1rem;
+    font-weight: 600;
+    margin-bottom: 0.6rem;
+  }
+  .modal .target {
+    color: var(--text-secondary);
+    font-size: 0.8rem;
+    margin-bottom: 0.5rem;
+    word-break: break-word;
+  }
+  .modal .descendants {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.5rem 0.75rem;
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    margin: 0.5rem 0;
+    max-height: 6rem;
+    overflow-y: auto;
+  }
+  .modal textarea {
+    width: 100%;
+    background: var(--bg-elev);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.4rem 0.6rem;
+    font-family: inherit;
+    font-size: 0.8rem;
+    resize: vertical;
+    min-height: 3rem;
+    margin: 0.5rem 0;
+  }
+  .modal .actions {
+    display: flex;
+    gap: 0.5rem;
+    justify-content: flex-end;
+    margin-top: 0.75rem;
+  }
+  .modal button {
+    background: var(--bg-elev);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.4rem 0.85rem;
+    font-size: 0.8rem;
+    cursor: pointer;
+  }
+  .modal button.danger {
+    background: var(--failed);
+    color: var(--bg-primary);
+    border-color: var(--failed);
+    font-weight: 600;
+  }
+  .modal button:hover { filter: brightness(1.15); }
+  .toast {
+    position: fixed;
+    bottom: 1.5rem;
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.6rem 1rem;
+    font-size: 0.85rem;
+    box-shadow: 0 6px 24px rgba(0,0,0,0.4);
+    z-index: 110;
+    animation: fadeIn 0.2s ease;
+  }
+  .toast.error { border-color: var(--failed); color: var(--failed); }
+  .toast-action {
+    margin-left: 0.65rem;
+    padding: 0;
+    border: none;
+    background: transparent;
+    color: inherit;
+    text-decoration: underline;
+    font: inherit;
+    cursor: pointer;
+  }
+  .toast-action:disabled { opacity: 0.6; cursor: wait; }
+  .live-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--running);
+    box-shadow: 0 0 6px var(--running-glow);
+    margin-right: 0.4rem;
+    animation: pulse 1.4s ease-in-out infinite;
+    vertical-align: middle;
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.5; transform: scale(0.85); }
+  }
+  @media (max-width: 800px) {
+    main {
+      grid-template-columns: 1fr;
+      grid-template-rows: 1fr auto;
+    }
+    aside.panel {
+      max-height: 50vh;
+      border-left: none;
+      border-top: 1px solid var(--border);
+    }
+    .chips { display: none; }
+  }
+  /* -------------------------------------------------------------------
+     Board tab — Kanban board that reuses the styles above for
+     chips, panel-*, modal-*, and toast markup (the drawer's session
+     panel section renders the same `.panel-header` / `.events` / etc.
+     structure SessionPanel builds for the Graph tab).
+     ------------------------------------------------------------------- */
+  .tabs {
+    display: flex;
+    gap: 0.25rem;
+    margin-left: 0.5rem;
+  }
+  .tab-btn {
+    background: none;
+    border: none;
+    color: var(--text-secondary);
+    font-size: 0.85rem;
+    font-weight: 500;
+    padding: 0.375rem 0.75rem;
+    border-radius: 6px;
+    cursor: pointer;
+  }
+  .tab-btn:hover { background: var(--bg-card); color: var(--text-primary); }
+  .tab-btn.active { background: var(--accent); color: var(--bg-primary); }
+  .tab-short { display: none; }
+  .tab-view[hidden] { display: none; }
+  #board-view {
+    height: calc(100vh - 56px - 45px);
+    display: flex;
+    flex-direction: column;
+  }
+  #board-view[hidden] { display: none; }
+  .board-filters {
+    display: flex;
+    gap: 0.6rem;
+    align-items: center;
+    padding: 0.5rem 1.25rem;
+    border-bottom: 1px solid var(--border);
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    flex-wrap: wrap;
+  }
+  .board-filters select,
+  .board-filters input[type="text"],
+  .board-filters input[type="search"] {
+    background: var(--bg-card);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.25rem 0.5rem;
+    font-size: 0.8rem;
+  }
+  .board-filters label { display: flex; align-items: center; gap: 0.3rem; cursor: pointer; }
+  #board-filter-clear {
+    background: var(--bg-card);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.3rem 0.7rem;
+    font-size: 0.8rem;
+    cursor: pointer;
+  }
+  #board-filter-clear:hover { border-color: var(--accent); }
+  .board-filters select, .board-drawer select, .board-drawer button { touch-action: manipulation; }
+  .board-filter-toggle {
+    display: none;
+    align-items: center;
+    gap: 0.4rem;
+    background: var(--bg-card);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.4rem 0.6rem;
+    font-size: 0.8rem;
+    cursor: pointer;
+  }
+  .board-filter-summary { color: var(--text-secondary); font-size: 0.74rem; }
+  .board-filter-controls { display: contents; }
+  #board-new-card {
+    margin-left: auto;
+    background: var(--accent);
+    color: var(--bg-primary);
+    border: none;
+    border-radius: 6px;
+    padding: 0.35rem 0.8rem;
+    font-size: 0.8rem;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  #board-lanes {
+    flex: 1;
+    display: flex;
+    gap: 0.75rem;
+    padding: 0.75rem 1.25rem;
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+  .board-lane {
+    flex: 1 1 260px;
+    /* Low enough that the six default lanes actually fit an 1280px board
+       without horizontal scroll, so hiding one genuinely widens the rest
+       instead of sitting pinned at this floor. 200px
+       would leave a 20px overflow (the container's 1.25rem padding-right)
+       that still forces a scrollbar at exactly 1280px — 196px is the
+       largest floor that actually fits: (1280 - 40px padding - 60px of
+       five 12px gaps) / 6 lanes = 196.67px. */
+    min-width: 196px;
+    display: flex;
+    flex-direction: column;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  .board-lane.drag-over { border-color: var(--accent); }
+  .board-lane-add {
+    display: block;
+    width: 100%;
+    background: var(--accent);
+    color: var(--bg-primary);
+    border: none;
+    padding: 0.3rem 0;
+    font-size: 0.95rem;
+    font-weight: 700;
+    cursor: pointer;
+  }
+  .board-lane-add:hover { filter: brightness(1.1); }
+  .board-lanes-empty-hint {
+    padding: 1.5rem;
+    color: var(--text-dim);
+    font-size: 0.85rem;
+  }
+  /* Lane multi-select filter — mirrors the CRM's people-filter-*
+     checkbox dropdown (web/crm.html:640, :7410-7460), scoped to the board
+     so it can't leak into the Graph tab's own filter styles. */
+  .board-lane-filter-dropdown { position: relative; }
+  .board-lane-filter-btn {
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
+    padding: 0.25rem 0.6rem;
+    background: var(--bg-card);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 0.8rem;
+    cursor: pointer;
+  }
+  .board-lane-filter-btn:hover { border-color: var(--accent); }
+  .board-lane-filter-arrow { font-size: 0.65rem; color: var(--text-dim); }
+  .board-lane-filter-options {
+    display: none;
+    position: absolute;
+    top: 100%;
+    left: 0;
+    margin-top: 4px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.5rem;
+    min-width: 180px;
+    max-height: 320px;
+    overflow-y: auto;
+    z-index: 100;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+  }
+  .board-lane-filter-options.show { display: block; }
+  .board-lane-filter-toggles {
+    display: flex;
+    gap: 0.4rem;
+    padding: 0 0 0.4rem;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 0.3rem;
+  }
+  .board-filter-toggle-btn {
+    flex: 1;
+    padding: 0.2rem 0.4rem;
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text-primary);
+    font-size: 0.7rem;
+    cursor: pointer;
+  }
+  .board-filter-toggle-btn:hover { border-color: var(--accent); }
+  .board-lane-filter-option {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.3rem 0.4rem;
+    cursor: pointer;
+    border-radius: 4px;
+    font-size: 0.78rem;
+    white-space: nowrap;
+  }
+  .board-lane-filter-option:hover { background: var(--bg-elev); }
+  .board-lane-filter-option input { margin: 0; }
+  /* board.js's renderBulkBar() sets this element's `hidden` attribute
+     whenever the bulk bar takes its place — without this override the
+     tray's own unconditional `display: flex` below wins over the
+     browser's default `[hidden] { display: none }`, the same reason
+     .board-bulk-bar needs its own such rule. */
+  .board-drop-tray[hidden] { display: none; }
+  .board-drop-tray {
+    position: relative;
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    min-height: 58px;
+    padding: 0.45rem 1.25rem;
+    border-top: 1px solid var(--border);
+    background: var(--bg-secondary);
+    color: var(--text-secondary);
+  }
+  /* Pulled out of flex flow and pinned to the tray's own edges so
+     `justify-content: center` above centers just the assignee/Done
+     buttons — the only remaining in-flow children — on the tray itself,
+     rather than centering the whole label+buttons+status row as one block
+     (which would leave the label off-centre instead of pinned left). */
+  .board-drop-tray-label {
+    position: absolute;
+    left: 1.25rem;
+    top: 50%;
+    transform: translateY(-50%);
+    font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em;
+  }
+  /* The assignee row is also the drop target for both drag directions, so
+     it takes two thirds of the tray and splits that evenly between its
+     buttons rather than hugging its labels — a label-width target is hard
+     to hit with a dragged card, most of all on a phone. The remaining
+     third leaves room for the tray label, the Done target (first in the
+     row, ahead of the assignees), and the drop status line. */
+  #board-assignee-drops {
+    display: flex;
+    flex: 1 1 auto;
+    max-width: 66%;
+    gap: 0.5rem;
+  }
+  .board-assignee-drop,
+  .board-done-drop {
+    min-height: 42px;
+    min-width: 58px;
+    padding: 0.35rem 0.65rem;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    background: var(--bg-card);
+    color: var(--text-primary);
+    font-size: 0.78rem;
+    cursor: pointer;
+    flex: 0 0 auto;
+  }
+  /* After the shared sizing rule above, which would otherwise reset this
+     back to content width. */
+  #board-assignee-drops .board-assignee-drop { flex: 1 1 0; }
+  .board-assignee-drop:hover,
+  .board-assignee-drop.selected,
+  .board-done-drop:hover { border-color: var(--accent); }
+  .board-assignee-drop.dragging-source { opacity: 0.45; }
+  .board-done-drop { border-color: var(--completed); color: var(--text-primary); }
+  /* Reflects that clicking Done has toggled the Done lane visible — the
+     same state the lane multi-select's Done checkbox shows. */
+  .board-done-drop.active { border-color: var(--accent); background: var(--bg-elev); }
+  .board-drop-target.drop-allowed { border-color: var(--running); box-shadow: 0 0 0 2px rgba(52, 211, 153, 0.25); }
+  .board-drop-target.drop-refused { border-color: var(--failed); box-shadow: 0 0 0 2px rgba(248, 113, 113, 0.2); }
+  /* Pinned to the tray's right edge — see .board-drop-tray-label above for
+     why this is out of flex flow. `max-width` keeps a longer status
+     message from growing into the centred buttons. */
+  .board-drop-status {
+    position: absolute;
+    right: 1.25rem;
+    top: 50%;
+    transform: translateY(-50%);
+    max-width: 28%;
+    min-width: 0;
+    font-size: 0.74rem;
+    color: var(--text-secondary);
+    text-align: right;
+  }
+  .board-drop-status:empty { display: none; }
+  .board-drop-status.error { color: var(--failed); }
+  /* Multi-select bulk bar — same slot/sizing as .board-drop-tray
+     (a sibling, toggled by board.js so exactly one of the two shows at a
+     time), never both stacked. */
+  .board-bulk-bar[hidden] { display: none; }
+  .board-bulk-bar {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    min-height: 58px;
+    padding: 0.45rem 1.25rem;
+    border-top: 1px solid var(--accent);
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+  }
+  .board-bulk-count { font-size: 0.8rem; font-weight: 600; flex: 0 0 auto; }
+  .board-bulk-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; flex: 1 1 auto; }
+  .board-bulk-actions > div { position: relative; }
+  .board-bulk-actions button {
+    min-height: 42px;
+    padding: 0.35rem 0.75rem;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    background: var(--bg-card);
+    color: var(--text-primary);
+    font-size: 0.78rem;
+    cursor: pointer;
+  }
+  .board-bulk-actions button:hover { border-color: var(--accent); }
+  .board-bulk-actions button.danger {
+    background: var(--failed);
+    color: var(--bg-primary);
+    border-color: var(--failed);
+    font-weight: 600;
+  }
+  .board-bulk-actions button.danger:hover { filter: brightness(1.15); }
+  .board-bulk-clear {
+    flex: 0 0 auto;
+    min-height: 32px;
+    min-width: 32px;
+    border: 1px solid var(--border);
+    border-radius: 50%;
+    background: var(--bg-card);
+    color: var(--text-primary);
+    font-size: 0.9rem;
+    line-height: 1;
+    cursor: pointer;
+  }
+  .board-bulk-clear:hover { border-color: var(--accent); }
+  .board-bulk-popover {
+    position: absolute;
+    bottom: 100%;
+    left: 0;
+    margin-bottom: 6px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.5rem;
+    min-width: 180px;
+    max-height: 260px;
+    overflow-y: auto;
+    z-index: 100;
+    box-shadow: 0 -4px 12px rgba(0,0,0,0.3);
+  }
+  .board-bulk-popover input[type="search"] {
+    width: 100%;
+    box-sizing: border-box;
+    margin-bottom: 0.4rem;
+    padding: 0.3rem 0.5rem;
+    background: var(--bg-elev);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 0.78rem;
+  }
+  .board-bulk-popover-option {
+    display: block;
+    width: 100%;
+    text-align: left;
+    padding: 0.3rem 0.5rem;
+    background: transparent;
+    color: var(--text-primary);
+    border: none;
+    border-radius: 4px;
+    font-size: 0.78rem;
+    cursor: pointer;
+  }
+  .board-bulk-popover-option:hover { background: var(--bg-elev); }
+  .board-bulk-popover-create { color: var(--accent); font-weight: 600; }
+  /* Purple selection outline — .board-card already gets a border/hover
+     treatment from --accent elsewhere on this page, so a selected card
+     reuses the same token rather than introducing a second "purple". */
+  .board-card.board-card-selected {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px var(--accent);
+  }
+  .board-lane-header {
+    padding: 0.5rem 0.75rem;
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: var(--text-secondary);
+    border-bottom: 1px solid var(--border);
+    /* Lane accent — the same colour the graph tab uses for this
+       lane's node fill (web/agents/lanes.js), so the board and graph read
+       as one system. Colour set inline per-lane by board.js. */
+    border-top: 3px solid var(--border);
+    display: flex;
+    justify-content: space-between;
+  }
+  .board-lane-count { color: var(--text-dim); font-weight: 400; }
+  .board-lane-cards {
+    flex: 1;
+    overflow-y: auto;
+    padding: 0.5rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+  .board-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.5rem 0.6rem;
+    font-size: 0.8rem;
+    cursor: pointer;
+    /* No `touch-action` reservation: dragging is mouse/pen only, so a touch
+       gesture starting on a card must keep both axes — horizontal scrolling
+       across the lane strip is how a phone reaches another lane. */
+    touch-action: auto;
+  }
+  .board-card:hover { border-color: var(--accent); }
+  .board-card.dragging-source { opacity: 0.4; }
+  body.board-dragging, body.board-dragging * { user-select: none !important; }
+  .board-card-ghost { opacity: 0.9; box-shadow: 0 8px 24px rgba(0,0,0,0.5); }
+  .board-card-accept {
+    margin-top: 0.4rem;
+    width: 100%;
+    font-size: 0.72rem;
+    padding: 0.25rem 0.5rem;
+    cursor: pointer;
+  }
+  .board-card-title { font-weight: 600; word-break: break-word; }
+  .board-card-question {
+    margin-top: 0.3rem;
+    font-size: 0.72rem;
+    color: var(--blocked);
+  }
+  .board-card-lastrun {
+    margin-top: 0.3rem;
+    font-size: 0.7rem;
+    color: var(--text-dim);
+  }
+  .board-card-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.3rem;
+    margin-top: 0.35rem;
+  }
+  .board-chip {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 0.05rem 0.5rem;
+    font-size: 0.68rem;
+    color: var(--text-secondary);
+  }
+  /* Assignee and tag pills get their own color, spread evenly around the
+     hue wheel (web/agents/chip_colors.js) via an inline `--chip-hue`
+     custom property set per element; the fallback below only applies if
+     that property is ever missing. */
+  .board-chip-assignee {
+    color: hsl(var(--chip-hue, 231) 70% 68%);
+    border-color: hsl(var(--chip-hue, 231) 70% 68%);
+  }
+  .board-chip-project { color: var(--running); border-color: var(--running); font-weight: 600; }
+  .board-chip-parent { color: var(--yielded); border-color: var(--yielded); cursor: pointer; }
+  .board-project-progress { margin-top: 0.35rem; color: var(--text-secondary); font-size: 0.72rem; }
+  .board-project-ready { color: var(--running); font-weight: 600; }
+  .board-chip-host { color: var(--claimed); border-color: var(--claimed); }
+  .board-chip-assigned-host { color: var(--yielded); border-color: var(--yielded); border-style: dashed; }
+  .board-chip-snoozed { color: var(--yielded); border-color: var(--yielded); }
+  /* Tag chip — clicking it toggles the shared tag filter to exactly this
+     tag (board.js's `applyTagFilterFrom`); `active` marks the chip(s)
+     matching the currently-applied filter with a filled style, so a
+     second click reads as "un-apply". */
+  .board-chip-tag {
+    cursor: pointer;
+    color: hsl(var(--chip-hue, 231) 70% 68%);
+    border-color: hsl(var(--chip-hue, 231) 70% 68%);
+    background: hsl(var(--chip-hue, 231) 70% 68% / 0.12);
+  }
+  .board-chip-tag:hover { filter: brightness(1.15); }
+  .board-chip-tag.active {
+    background: hsl(var(--chip-hue, 231) 70% 68%);
+    color: var(--bg-primary);
+  }
+  /* Session chip → graph tab — a clickable chip on a card whose
+     session is live, distinct from the plain (non-interactive) chips
+     above it. */
+  .board-chip-session {
+    cursor: pointer;
+    background: var(--accent);
+    color: var(--bg-primary);
+    border-color: var(--accent);
+  }
+  .board-chip-session:hover { filter: brightness(1.1); }
+  /* Review-lane card-face PR badge and the matching drawer chip — number
+     plus a color naming the merge state so it reads at a glance. */
+  .board-card-pr { margin-top: 0.3rem; }
+  .board-pr-badge {
+    display: inline-block;
+    border-radius: 999px;
+    padding: 0.05rem 0.5rem;
+    font-size: 0.68rem;
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+  }
+  .board-pr-badge-merged { color: var(--running); border-color: var(--running); }
+  .board-pr-badge-open { color: var(--yielded); border-color: var(--yielded); }
+  .board-pr-badge-closed { color: var(--failed); border-color: var(--failed); }
+  .board-pr-badge-unknown { color: var(--text-dim); border-color: var(--border); }
+  /* Drawer's read-only "Agent outcome" section — visually distinct from
+     the editable Notes box just below it. */
+  .drawer-outcome {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.6rem 0.75rem;
+  }
+  .drawer-outcome-meta {
+    display: flex;
+    justify-content: space-between;
+    gap: 0.5rem;
+    font-size: 0.72rem;
+    color: var(--text-dim);
+    margin-bottom: 0.35rem;
+  }
+  .drawer-outcome-summary {
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-size: 0.82rem;
+    color: var(--text-primary);
+  }
+  .drawer-outcome-branch {
+    margin-top: 0.4rem;
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+  }
+  .drawer-outcome-prs { margin-top: 0.4rem; display: flex; flex-direction: column; gap: 0.3rem; }
+  .drawer-outcome-pr { display: flex; align-items: center; gap: 0.4rem; font-size: 0.8rem; }
+  .drawer-outcome-pr a { color: var(--accent); }
+  /* Node selected → board tab reveal — a temporary highlight on the
+     card `revealCard` scrolled to, so it's findable at a glance even in a
+     lane with many cards. */
+  @keyframes board-card-reveal-pulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(99, 102, 241, 0); }
+    50%      { box-shadow: 0 0 0 4px rgba(99, 102, 241, 0.55); }
+  }
+  .board-card.reveal-highlight {
+    border-color: var(--accent);
+    animation: board-card-reveal-pulse 0.6s ease-in-out 2;
+  }
+  #board-connection-state { margin-left: 0.5rem; color: var(--text-dim); font-size: 0.75rem; }
+
+  .board-drawer-backdrop {
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,0.5);
+    z-index: 90;
+    display: flex;
+    justify-content: flex-end;
+  }
+  .board-drawer-backdrop[hidden] { display: none; }
+  .board-drawer {
+    width: min(440px, 92vw);
+    height: 100vh;
+    background: var(--bg-secondary);
+    border-left: 1px solid var(--border);
+    overflow-y: auto;
+    padding: 1rem;
+  }
+  .board-drawer.project-drawer { width: min(720px, 96vw); }
+  .project-summary { background: var(--bg-elev); border: 1px solid var(--border); border-radius: 8px; padding: 0.7rem; }
+  .project-status-row { display: flex; flex-wrap: wrap; gap: 0.35rem; margin-top: 0.35rem; }
+  .project-child-list { display: flex; flex-direction: column; gap: 0.4rem; margin-top: 0.6rem; }
+  .project-child-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto; gap: 0.45rem; align-items: center; border: 1px solid var(--border); border-radius: 6px; padding: 0.45rem; }
+  .project-child-open { min-width: 0; background: transparent; color: var(--text-primary); border: 0; text-align: left; cursor: pointer; font: inherit; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .project-child-meta { color: var(--text-secondary); font-size: 0.72rem; white-space: nowrap; }
+  .project-child-actions { display: flex; gap: 0.25rem; }
+  .project-child-actions button, .project-inline-action { font-size: 0.72rem; padding: 0.25rem 0.45rem; }
+  .project-coordination { margin-top: 0.6rem; color: var(--text-secondary); font-size: 0.8rem; }
+  .project-integration { margin-top: 0.6rem; color: var(--text-secondary); font-size: 0.8rem; }
+  .project-integration-prs { margin-top: 0.4rem; display: flex; flex-direction: column; gap: 0.3rem; }
+  .drawer-integration-pr { display: flex; align-items: center; gap: 0.4rem; font-size: 0.8rem; }
+  .drawer-integration-pr-title { color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .project-error { color: var(--failed); font-size: 0.75rem; margin-top: 0.35rem; }
+  .drawer-header { position: relative; margin-bottom: 0.75rem; }
+  .drawer-title {
+    display: block;
+    width: 100%;
+    background: transparent;
+    border: none;
+    color: var(--text-primary);
+    font-family: inherit;
+    font-size: 1rem;
+    font-weight: 600;
+    line-height: 1.3;
+    padding: 0.2rem 1.75rem 0.2rem 0;
+    resize: none;
+    overflow: hidden;
+  }
+  .drawer-title:focus { outline: 1px solid var(--accent); border-radius: 4px; }
+  .drawer-label {
+    display: block;
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-dim);
+    margin: 0.6rem 0 0.25rem;
+  }
+  .drawer-notes, .drawer-tags, .drawer-assignee,
+  .drawer-schedule-value, .drawer-timezone, .drawer-select, .drawer-input {
+    width: 100%;
+    background: var(--bg-elev);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.4rem 0.55rem;
+    font-family: inherit;
+    font-size: 0.8rem;
+  }
+  .drawer-notes { min-height: 5rem; resize: vertical; }
+  /* The agent action's collapsed persona/model/effort/host/working-dir
+     group — collapsed by default so the common notify/prompt/endpoint
+     drawer stays short; the summary reuses .drawer-label's type
+     treatment rather than the browser's own disclosure-triangle default. */
+  .drawer-exec-context { margin-top: 0.6rem; }
+  .drawer-exec-context-summary { cursor: pointer; margin: 0.6rem 0 0.25rem; }
+  .drawer-tags-picker {
+    position: relative;
+    width: 100%;
+  }
+  .drawer-tag-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.3rem;
+    min-height: 1.8rem;
+    margin-bottom: 0.35rem;
+  }
+  .drawer-tag-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    /* Colored per tag, same `--chip-hue` custom property and formula as
+       the card face's `.board-chip-tag` (web/agents/chip_colors.js). */
+    background: hsl(var(--chip-hue, 231) 70% 68% / 0.12);
+    border: 1px solid hsl(var(--chip-hue, 231) 70% 68%);
+    border-radius: 999px;
+    padding: 0.1rem 0.25rem 0.1rem 0.5rem;
+    color: hsl(var(--chip-hue, 231) 70% 68%);
+    font-size: 0.75rem;
+  }
+  .drawer-tag-chip-remove {
+    width: 1.1rem;
+    height: 1.1rem;
+    padding: 0;
+    border: none;
+    border-radius: 50%;
+    background: transparent;
+    color: var(--text-secondary);
+    cursor: pointer;
+    line-height: 1;
+  }
+  .drawer-tag-chip-remove:hover,
+  .drawer-tag-chip-remove:focus { color: var(--text-primary); background: var(--border); }
+  .drawer-tag-options {
+    position: absolute;
+    z-index: 4;
+    top: 100%;
+    left: 0;
+    right: 0;
+    max-height: 12rem;
+    overflow-y: auto;
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    box-shadow: 0 6px 18px rgba(0,0,0,0.35);
+  }
+  .drawer-tag-options[hidden] { display: none; }
+  .drawer-tag-option {
+    display: block;
+    width: 100%;
+    padding: 0.45rem 0.55rem;
+    border: none;
+    background: transparent;
+    color: var(--text-primary);
+    text-align: left;
+    font: inherit;
+    cursor: pointer;
+  }
+  .drawer-tag-option:hover,
+  .drawer-tag-option:focus { background: var(--bg-card); outline: none; }
+  .drawer-tag-option-create { color: var(--accent); font-weight: 600; }
+  .drawer-tags-search:disabled { opacity: 0.55; cursor: default; }
+  /* Task-card notes only — height tracks content via JS, capped at
+     2/3 of the viewport height; the schedule drawer's message-content
+     textarea keeps the plain manual-resize behavior above, untouched. The
+     cap is ALSO expressed here in CSS (not just computed from
+     window.innerHeight in JS on input/render) so it re-applies automatically
+     when the viewport shrinks, without a resize listener. */
+  /* Two thirds of the viewport height, matching autosizeNotesTextarea's own
+     `innerHeight * 2/3` cap (web/agents/board.js) — CSS wins when the two
+     disagree, so a mismatch here silently makes the JS branch dead. */
+  .drawer-notes-autosize { overflow-y: auto; resize: none; max-height: 66.667vh; }
+  .drawer-row { display: grid; grid-template-columns: 1fr 1fr; gap: 0.6rem; }
+  /* The drawer reads as bands — what the card reports, what the operator
+     edits, what they can do to it, and its session — rather than one flat
+     run of controls. */
+  .drawer-section { padding: 0.75rem 0; border-bottom: 1px solid var(--border); }
+  .drawer-section:last-child { border-bottom: none; }
+  .drawer-section-actions { padding-bottom: 0.5rem; }
+  .drawer-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem 1.1rem;
+    padding-top: 0.5rem;
+  }
+  .drawer-meta-item { display: flex; align-items: baseline; gap: 0.35rem; min-width: 0; }
+  .drawer-meta-label {
+    font-size: 0.65rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-secondary);
+  }
+  .drawer-meta-value { font-size: 0.78rem; color: var(--text-primary); }
+  .drawer-meta-id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.72rem; }
+  /* Visible reason text next to a picker or displayed action the board's
+     own policy has disabled. A distinct
+     element/style from .assignment-error below: this is a normal
+     explanation, not a failed-save error, and must not paint an ordinary
+     "can't change this right now" reason the same alarming red as a real
+     save failure. --text-secondary (5.39:1 on this drawer's background)
+     rather than --text-dim (2.77:1) — this text is the only explanation
+     the operator gets for a refused action, so it needs to clear WCAG AA. */
+  /* This is a flex item of the action row it's a sibling of
+     (`.panel-header-actions` / `.drawer-actions`, both flex-wrap — see
+     .panel-header-actions below) — `flex-basis: 100%` forces it onto its
+     own line below the buttons rather than sharing a line with them,
+     where a disabled button's reason text would otherwise collide with
+     whatever follows the row. */
+  .drawer-field-reason { color: var(--text-secondary); font-size: 0.75rem; margin-top: 0.3rem; flex-basis: 100%; }
+  .drawer-actions { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.75rem; }
+  .drawer-action {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    color: var(--text-primary);
+    border-radius: 6px;
+    padding: 0.3rem 0.65rem;
+    font-size: 0.75rem;
+    cursor: pointer;
+  }
+  .drawer-action:hover { border-color: var(--accent); }
+  .drawer-action:disabled { opacity: 0.5; cursor: default; }
+  .drawer-action:disabled:hover { border-color: var(--border); }
+  .drawer-action.danger {
+    background: var(--failed);
+    color: var(--bg-primary);
+    border-color: var(--failed);
+    font-weight: 600;
+  }
+  .drawer-action.danger:hover { filter: brightness(1.15); border-color: var(--failed); }
+  /* Snooze's picker — a flex item of the action row it's a sibling of
+     (same reasoning as .resume-command above): `flex-basis: 100%` puts it
+     on its own line below the Snooze button, `min-width: 0` on every input
+     lets it shrink inside a narrow drawer instead of forcing horizontal
+     overflow. */
+  .snooze-picker {
+    flex-basis: 100%;
+    margin-top: 0.4rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.5rem;
+    max-width: 100%;
+    box-sizing: border-box;
+  }
+  .snooze-picker[hidden] { display: none; }
+  .snooze-presets { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+  .snooze-custom-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.35rem;
+    max-width: 100%;
+  }
+  .snooze-custom-row .drawer-label { flex-basis: 100%; margin: 0; }
+  .snooze-duration-value,
+  .snooze-duration-unit,
+  .snooze-datetime-value {
+    background: var(--bg-card);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.3rem 0.4rem;
+    font-size: 0.75rem;
+    min-width: 0;
+    max-width: 100%;
+    box-sizing: border-box;
+  }
+  .snooze-duration-value { width: 4.5rem; flex: 0 1 auto; }
+  .snooze-datetime-value { flex: 1 1 auto; }
+  .drawer-session { margin-top: 0.75rem; border-top: 1px solid var(--border); padding-top: 0.5rem; }
+  .drawer-session .panel-header { padding: 0; border: none; }
+  .drawer-session .events { max-height: 40vh; padding: 0.5rem 0; }
+  /* An inline save-rejection detail next to the offending schedule field
+     (cron/datetime, timezone) — the same alarming color as
+     .assignment-error since, unlike .drawer-field-reason above, this is a
+     failed save, not an ordinary disabled-control explanation. */
+  .drawer-field-error { color: var(--failed); font-size: 0.75rem; margin-top: 0.3rem; }
+  .drawer-schedule-info { color: var(--text-dim); font-size: 0.75rem; margin-top: 0.4rem; }
+  /* The schedule composer's custom-days trigger mode (Sun-Sat checkboxes). */
+  .drawer-daypicker { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 0.4rem 0; }
+  .drawer-daycheck { display: inline-flex; align-items: center; gap: 0.25rem; font-size: 0.75rem; color: var(--text-secondary); }
+  .drawer-assignment { margin-top: 0.6rem; }
+  .assignment-row { margin: 0.6rem 0; }
+  .assignment-label {
+    display: block;
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-dim);
+    margin: 0 0 0.25rem;
+  }
+  .assignment-engine, .assignment-model, .assignment-effort, .assignment-host {
+    width: 100%;
+    background: var(--bg-elev);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.4rem 0.55rem;
+    font-family: inherit;
+    font-size: 0.8rem;
+  }
+  .assignment-ran { color: var(--text-dim); font-size: 0.75rem; margin-top: 0.3rem; }
+  .assignment-error { color: var(--failed); font-size: 0.75rem; margin-top: 0.3rem; }
+  @media (max-width: 600px) {
+    .header-nav { margin-left: 0; }
+    .header-nav .nav-link { padding-left: 0.4rem; padding-right: 0.4rem; font-size: 0.75rem; }
+    .tabs { margin-left: auto; }
+    .tab-btn { min-width: 42px; padding: 0.5rem 0.65rem; }
+    .tab-label { display: none; }
+    .tab-short { display: inline; }
+    .board-filter-toggle { display: inline-flex; }
+    .board-filter-controls { display: none; width: 100%; flex-wrap: wrap; gap: 0.4rem; }
+    .board-filters.filters-open .board-filter-controls { display: flex; }
+    .board-filter-controls > * { max-width: 100%; }
+    .board-filter-controls #board-new-card { margin-left: 0; }
+    #board-connection-state { margin-left: 0; }
+    .board-filters { padding: 0.45rem 0.65rem; gap: 0.4rem; }
+    #board-lanes { padding: 0.5rem 0.65rem; gap: 0.5rem; }
+    .board-lane { min-width: min(84vw, 280px); }
+    .board-drawer {
+      width: 100vw;
+      max-width: 100vw;
+      overflow-x: hidden;
+    }
+    .drawer-header .panel-close {
+      position: absolute;
+      top: 0;
+      right: 0;
+      float: none;
+      z-index: 1;
+    }
+    .drawer-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+    .project-child-row { grid-template-columns: minmax(0, 1fr) auto; }
+    .project-child-row .project-child-actions { grid-column: 1 / -1; }
+    .drawer-row > *,
+    .board-drawer select {
+      min-width: 0;
+      max-width: 100%;
+    }
+    .drawer-meta-id { overflow-wrap: anywhere; }
+    .drawer-actions > * { max-width: 100%; }
+    .drawer-actions .panel-kill,
+    .drawer-actions .panel-resume,
+    .drawer-actions .panel-focus {
+      float: none;
+      margin-right: 0;
+    }
+    /* Every quick target occupies one grid track. `display: contents` makes
+       assignee buttons and Done participate in the same row even though the
+       assignees retain their semantic group wrapper. */
+    .board-drop-tray {
+      display: grid;
+      grid-template-columns: repeat(var(--board-tray-button-count, 7), minmax(0, 1fr));
+      gap: 0.3rem;
+      justify-content: stretch;
+      padding: 0.45rem 0.65rem;
+      min-height: 66px;
+    }
+    /* The label and status share row 1 at a fixed line-height so neither
+       the drop-status text appearing/clearing during a drag, nor the
+       post-drop confirmation message, ever changes the tray's height —
+       a height change would shove every button out from under a finger
+       mid-drag (see board_gesture.js POINTER_SLOP usage in board.js's
+       onDragMove). */
+    .board-drop-tray-label {
+      position: static;
+      transform: none;
+      grid-column: 1 / 3;
+      grid-row: 1;
+      font-size: 0.65rem;
+      line-height: 1.2;
+    }
+    #board-assignee-drops { display: contents; }
+    #board-assignee-drops .board-assignee-drop,
+    .board-done-drop {
+      grid-row: 2;
+      min-width: 0;
+      width: 100%;
+      padding-inline: 0.2rem;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 0.65rem;
+    }
+    .board-drop-status,
+    .board-drop-status:empty {
+      display: block;
+      position: static;
+      transform: none;
+      grid-column: 3 / -1;
+      grid-row: 1;
+      justify-self: end;
+      min-width: 0;
+      max-width: 100%;
+      text-align: right;
+      font-size: 0.65rem;
+      line-height: 1.2;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1><a href="/">LifeOS</a></h1>
+  <nav class="header-nav">
+    <a href="/chat" class="nav-link">💬 Chat</a>
+    <a href="/crm" class="nav-link">👥 CRM</a>
+    <a href="/agents" class="nav-link active">🛠️ Agents</a>
+  </nav>
+  <div class="tabs" id="tabs">
+    <button class="tab-btn active" id="tab-btn-board" data-tab="board" aria-label="Board"><span class="tab-label">Board</span><span class="tab-short" aria-hidden="true">B</span></button>
+    <button class="tab-btn" id="tab-btn-graph" data-tab="graph" aria-label="Graph"><span class="tab-label">Graph</span><span class="tab-short" aria-hidden="true">G</span></button>
+  </div>
+  <div class="chips" id="graph-chips" hidden>
+    <span class="chip running">running <strong id="chip-running">0</strong></span>
+    <span class="chip blocked">blocked <strong id="chip-blocked">0</strong></span>
+    <span class="chip">recent <strong id="chip-recent">0</strong></span>
+    <span class="chip" title="Claude Code CLI sessions (shown as boxes)">cc <strong id="chip-cc">0</strong></span>
+    <span class="chip spend" title="API-billed spend: only LifeOS agent worker sessions (Claude Code CLI uses your subscription, not the API).">API spend <strong id="chip-spend">$0.00</strong></span>
+  </div>
+</header>
+
+<!-- Board tab — the primary /agents view. -->
+<div class="tab-view" id="board-view">
+  <div class="board-filters" id="board-filters">
+    <button type="button" class="board-filter-toggle" id="board-filter-toggle" aria-expanded="false" aria-controls="board-filter-controls">
+      <span>Filters</span><span class="board-filter-summary" id="board-filter-summary">default</span>
+    </button>
+    <div class="board-filter-controls" id="board-filter-controls">
+    <input type="search" id="board-search" placeholder="Search cards…" autocomplete="off" spellcheck="false" />
+    <div class="board-lane-filter-dropdown" id="board-lane-filter-dropdown">
+      <button type="button" class="board-lane-filter-btn" id="board-lane-filter-btn" title="Lanes">
+        <span id="board-lane-filter-label">Lanes</span>
+        <span class="board-lane-filter-arrow">&#9662;</span>
+      </button>
+      <div class="board-lane-filter-options" id="board-lane-filter-options">
+        <div class="board-lane-filter-toggles">
+          <button type="button" class="board-filter-toggle-btn" id="board-lane-filter-all">All</button>
+          <button type="button" class="board-filter-toggle-btn" id="board-lane-filter-clear" title="Reset to the default lanes (all except Done and Snoozed)">Clear</button>
+        </div>
+        <!-- one .board-lane-filter-option checkbox per LANES entry, injected by board.js -->
+      </div>
+    </div>
+    <select id="board-filter-assignee" title="Assignee">
+      <option value="all">any assignee</option>
+      <option value="unassigned">unassigned</option>
+      <option value="me">me</option>
+      <option value="claude">claude</option>
+      <option value="codex">codex</option>
+      <option value="hermes">hermes</option>
+      <option value="local">local</option>
+      <option value="cloud">cloud</option>
+    </select>
+    <select id="board-filter-project" title="Project membership">
+      <option value="all">all work</option>
+      <option value="projects">projects</option>
+      <option value="children">project children</option>
+      <option value="ordinary">ordinary tasks</option>
+    </select>
+    <select id="board-filter-host" title="Host"><option value="all">all hosts</option></select>
+    <select id="board-filter-engine" title="Engine">
+      <option value="all">all engines</option>
+      <option value="local">local</option>
+      <option value="remote">remote</option>
+      <option value="claude">claude</option>
+      <option value="claude_code">claude code</option>
+      <option value="codex">codex</option>
+      <option value="hermes">hermes</option>
+      <option value="ask">ask</option>
+    </select>
+    <input type="text" id="board-filter-tag" placeholder="tag" />
+    <select id="board-filter-sort" title="Sort cards within each lane">
+      <option value="file">file order</option>
+      <option value="created_asc">created oldest</option>
+      <option value="created_desc">created newest</option>
+      <option value="modified_asc">modified oldest</option>
+      <option value="modified_desc" selected>modified newest</option>
+      <option value="assignee_asc">assignee A-Z</option>
+    </select>
+    <select id="board-filter-recency" title="Recency">
+      <option value="60">1 min</option>
+      <option value="1800">30 min</option>
+      <option value="3600">1 h</option>
+      <option value="86400">24 h</option>
+      <option value="604800">1 wk</option>
+      <option value="all" selected>all time</option>
+    </select>
+    <label><input type="checkbox" id="board-filter-done" /> include cancelled</label>
+    <button type="button" id="board-filter-clear" title="Reset all board filters to defaults">Clear filters</button>
+    <button id="board-new-card" type="button">+ New card</button>
+    <span id="board-connection-state">connecting…</span>
+    </div>
+  </div>
+  <div id="board-lanes"></div>
+  <div class="board-drop-tray" id="board-drop-tray" aria-label="Board quick actions">
+    <span class="board-drop-tray-label">Assign</span>
+    <button type="button" class="board-drop-target board-done-drop" id="board-done-drop" title="Done">Done</button>
+    <div id="board-assignee-drops" role="group" aria-label="Filter board by assignee, or drop a card here to assign it"></div>
+    <span class="board-drop-status" id="board-drop-status" role="status" aria-live="polite"></span>
+  </div>
+  <!-- Multi-select bulk action bar — hidden until a card is
+       selected; board.js hides board-drop-tray above while this shows. -->
+  <div class="board-bulk-bar" id="board-bulk-bar" aria-label="Bulk actions" hidden>
+    <span class="board-bulk-count" id="board-bulk-count"></span>
+    <div class="board-bulk-actions">
+      <div>
+        <button type="button" id="board-bulk-tag">Tag</button>
+        <div class="board-bulk-popover" id="board-bulk-tag-popover" role="group" aria-label="Add a tag to every selected card" hidden>
+          <input type="search" data-field="tag-search" placeholder="Search or add tag…" autocomplete="off" />
+          <div data-field="options"></div>
+        </div>
+      </div>
+      <div>
+        <button type="button" id="board-bulk-assign">Assign</button>
+        <div class="board-bulk-popover" id="board-bulk-assign-popover" role="group" aria-label="Assign every selected card" hidden></div>
+      </div>
+      <button type="button" id="board-bulk-done">Mark Done</button>
+      <button type="button" class="danger" id="board-bulk-delete">Delete</button>
+    </div>
+    <button type="button" class="board-bulk-clear" id="board-bulk-clear" aria-label="Clear selection">×</button>
+  </div>
+</div>
+<div class="board-drawer-backdrop" id="board-drawer-backdrop" hidden>
+  <aside class="board-drawer" id="board-drawer"></aside>
+</div>
+
+<!-- Graph tab — the original /agents page, kept as a secondary tab. -->
+<div class="tab-view" id="graph-view" hidden>
+  <div class="filters">
+    <div class="search-wrap" id="search-wrap">
+      <input type="search" id="search-input" placeholder="Search sessions…" autocomplete="off" spellcheck="false"
+             title="Search session names and summaries. Matches in visible nodes rank above filtered-out ones; click a result to highlight it." />
+      <div class="search-results" id="search-results" hidden></div>
+    </div>
+    <label title="Include sessions that already finished — completed, failed, or budget-exceeded. Hidden by default so the graph focuses on what's live right now."><input type="checkbox" id="filter-terminal" /> include finished</label>
+    <label title="Hide sessions whose last activity is older than this. Default flips to 1 week when 'include finished' is on; 30min otherwise.">recency
+      <select id="filter-recency">
+        <option value="60">1 min</option>
+        <option value="1800" selected>30 min</option>
+        <option value="3600">1 h</option>
+        <option value="86400">24 h</option>
+        <option value="604800">1 wk</option>
+        <option value="all">all time</option>
+      </select>
+    </label>
+    <label title="Limit to sessions whose project working directory matches.">cwd
+      <select id="filter-cwd">
+        <option value="all">all</option>
+      </select>
+    </label>
+    <label title="Limit to sessions running on a specific machine.">host
+      <select id="filter-host">
+        <option value="all">all</option>
+      </select>
+    </label>
+    <label>route
+      <select id="filter-route">
+        <option value="all">all</option>
+        <option value="local">local</option>
+        <option value="remote">remote</option>
+        <option value="claude">claude</option>
+        <option value="claude_code">claude code</option>
+        <option value="codex">codex</option>
+        <option value="hermes">hermes</option>
+        <option value="ask">ask</option>
+      </select>
+    </label>
+    <label title="Limit to sessions whose board lane matches — shared with the board's own lane filter.">lane
+      <select id="filter-lane">
+        <option value="all">all</option>
+        <option value="unassigned">Unassigned</option>
+        <option value="assigned">Assigned</option>
+        <option value="in_progress">In progress</option>
+        <option value="human_queue">Human queue</option>
+        <option value="scheduled">Scheduled</option>
+        <option value="review">Review</option>
+        <option value="done">Done</option>
+      </select>
+    </label>
+    <label title="Limit to sessions whose linked card is assigned to this — shared with the board's own assignee filter.">assignee
+      <select id="filter-assignee">
+        <option value="all">any assignee</option>
+        <option value="unassigned">unassigned</option>
+        <option value="me">me</option>
+        <option value="claude">claude</option>
+        <option value="codex">codex</option>
+        <option value="hermes">hermes</option>
+        <option value="local">local</option>
+      </select>
+    </label>
+    <label title="Limit to sessions whose linked card carries this tag — shared with the board's own tag filter.">tag
+      <input type="text" id="filter-tag" placeholder="tag" />
+    </label>
+    <button type="button" id="graph-filter-clear" title="Reset every shared filter to its default">Clear</button>
+    <label>status
+      <select id="filter-status">
+        <option value="all">all</option>
+        <option value="running">running</option>
+        <option value="claimed">claimed</option>
+        <option value="yielded">yielded</option>
+        <option value="inactive">inactive</option>
+        <option value="idle">idle</option>
+        <option value="blocked">blocked</option>
+        <option value="completed">completed</option>
+        <option value="ended">ended</option>
+        <option value="failed">failed</option>
+      </select>
+    </label>
+    <button type="button" id="graph-zoom-fit" title="Fit all visible nodes into the viewport">Fit</button>
+    <button type="button" id="graph-zoom-reset" title="Reset zoom and pan">Reset</button>
+    <span style="margin-left:auto;color:var(--text-dim);font-size:0.75rem" id="connection-state">connecting…</span>
+  </div>
+  <div class="legend-bar" id="graph-legend">
+    <span class="legend-group" id="graph-lane-legend" title="Node fill colour = board lane"></span>
+    <span class="legend-group" id="graph-engine-legend" title="Node shape = engine"></span>
+  </div>
+  <main>
+    <section id="graph">
+      <svg id="graph-svg" preserveAspectRatio="xMidYMid meet"></svg>
+      <div class="empty-state" id="empty-state">
+        <div class="icon">🛠️</div>
+        <div class="label">No agent sessions yet</div>
+        <div class="hint">Sessions will appear here when an <code>#agent</code> task is claimed.</div>
+      </div>
+      <div class="hover-card" id="graph-hover-card" hidden></div>
+    </section>
+    <aside class="panel" id="panel-outer">
+      <div class="panel-resizer" id="panel-resizer" title="Drag to resize"></div>
+      <div id="graph-panel-actions"></div>
+      <div class="panel-content" id="panel">
+        <div class="panel-empty" id="panel-empty">Click a node to inspect its transcript.</div>
+      </div>
+    </aside>
+  </main>
+</div>
+
+<script type="module">
+  import { initBoard } from '/static/agents/board.js';
+  import { initGraph } from '/static/agents/graph.js';
+  import {
+    activateTab, onTabActivate, requestGraphFocus, requestBoardFocus,
+  } from '/static/agents/linking.js';
+
+  const boardView = document.getElementById('board-view');
+  const graphView = document.getElementById('graph-view');
+  const graphChips = document.getElementById('graph-chips');
+  const tabButtons = document.querySelectorAll('.tab-btn');
+  let graphInitialized = false;
+
+  // The DOM-visibility half of tab activation — registered as a
+  // subscriber (see linking.js's `onTabActivate`) rather than called
+  // directly, so `activateTab` stays the one thing both this page's own
+  // tab buttons and a URL deep link (below) go through.
+  onTabActivate((name) => {
+    tabButtons.forEach(btn => btn.classList.toggle('active', btn.dataset.tab === name));
+    boardView.hidden = name !== 'board';
+    graphView.hidden = name !== 'graph';
+    graphChips.hidden = name !== 'graph';
+    if (name === 'graph' && !graphInitialized) {
+      graphInitialized = true;
+      initGraph(boardApi);
+    }
+  });
+
+  tabButtons.forEach(btn => btn.addEventListener('click', () => activateTab(btn.dataset.tab)));
+
+  // Board is the primary view — boots immediately. The Graph tab's snapshot
+  // fetch + SSE stream only start once the operator opens it; `boardApi`
+  // lets its side panel find a session's linked card without a second
+  // `/api/agents/board` fetch.
+  const boardApi = initBoard();
+
+  // URL deep links — `?session=<id>` opens the graph tab with that node
+  // selected; `?card=<id>` opens the board with that card's drawer open.
+  // The intent is stored via `requestGraphFocus`/`requestBoardFocus` BEFORE
+  // `activateTab` runs, so it's already there for board.js/graph.js's own
+  // `onTabActivate` drain (see their `initBoard`/`initGraph`) whether or not
+  // their data has loaded yet — an unknown id is reported by whichever
+  // module actually resolves the intent once its data lands, not here.
+  const deepLinkParams = new URLSearchParams(location.search);
+  const sessionParam = deepLinkParams.get('session');
+  const cardParam = deepLinkParams.get('card');
+  if (sessionParam) {
+    requestGraphFocus(sessionParam);
+    activateTab('graph');
+  } else if (cardParam) {
+    requestBoardFocus(cardParam, { openDrawer: true });
+    activateTab('board');
+  }
+</script>
+</body>
+</html>

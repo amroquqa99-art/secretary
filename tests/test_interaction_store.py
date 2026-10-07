@@ -1,0 +1,1712 @@
+"""
+Tests for InteractionStore.
+"""
+import pytest
+import tempfile
+import uuid
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from api.services.interaction_store import (
+    Interaction,
+    InteractionStore,
+    build_obsidian_link,
+    build_gmail_link,
+    build_calendar_link,
+    create_gmail_interaction,
+    create_calendar_interaction,
+    create_vault_interaction,
+)
+from config.people_config import InteractionConfig
+
+pytestmark = pytest.mark.unit
+
+
+class TestInteraction:
+    """Tests for Interaction dataclass."""
+
+    def test_create_interaction(self):
+        """Test creating a basic interaction."""
+        interaction = Interaction(
+            id="test-id",
+            person_id="person-123",
+            timestamp=datetime(2024, 6, 15, 10, 30),
+            source_type="gmail",
+            title="Re: Project Update",
+            snippet="Thanks for the update...",
+            source_link="https://mail.google.com/...",
+            source_id="msg-abc123",
+        )
+
+        assert interaction.id == "test-id"
+        assert interaction.person_id == "person-123"
+        assert interaction.source_type == "gmail"
+        assert interaction.title == "Re: Project Update"
+        assert interaction.source_badge == "📧"
+
+    def test_source_badges(self):
+        """Test source badge property for different types."""
+        badges = {
+            "gmail": "📧",
+            "calendar": "📅",
+            "vault": "📝",
+            "granola": "📝",
+        }
+
+        for source_type, expected_badge in badges.items():
+            interaction = Interaction(
+                id="test",
+                person_id="p1",
+                timestamp=datetime.now(),
+                source_type=source_type,
+                title="Test",
+            )
+            assert interaction.source_badge == expected_badge
+
+    def test_to_dict_and_from_dict(self):
+        """Test JSON serialization roundtrip."""
+        original = Interaction(
+            id="test-id",
+            person_id="person-123",
+            timestamp=datetime(2024, 6, 15, 10, 30, 0),
+            source_type="calendar",
+            title="1:1 Meeting",
+            snippet="Discuss project roadmap",
+            source_link="https://calendar.google.com/...",
+            source_id="event-xyz",
+            created_at=datetime(2024, 6, 15, 11, 0, 0),
+        )
+
+        data = original.to_dict()
+        assert isinstance(data["timestamp"], str)
+        assert isinstance(data["created_at"], str)
+
+        restored = Interaction.from_dict(data)
+        assert restored.id == original.id
+        assert restored.person_id == original.person_id
+        # Datetimes are normalized to UTC-aware after serialization roundtrip
+        # So we compare the timestamp values (year, month, day, hour, minute, second)
+        assert restored.timestamp.replace(tzinfo=None) == original.timestamp.replace(tzinfo=None)
+        assert restored.created_at.replace(tzinfo=None) == original.created_at.replace(tzinfo=None)
+        # Restored datetimes should be timezone-aware
+        assert restored.timestamp.tzinfo is not None
+        assert restored.created_at.tzinfo is not None
+        assert restored.source_type == original.source_type
+        assert restored.title == original.title
+        assert restored.snippet == original.snippet
+        assert restored.source_link == original.source_link
+        assert restored.source_id == original.source_id
+
+
+class TestLinkBuilders:
+    """Tests for link building functions."""
+
+    def test_build_gmail_link(self):
+        """Test Gmail link generation."""
+        link = build_gmail_link("abc123")
+        assert "mail.google.com" in link
+        assert "abc123" in link
+
+    def test_build_calendar_link(self):
+        """Test Calendar link generation."""
+        link = build_calendar_link("event123")
+        assert "calendar.google.com" in link
+        assert "event123" in link
+
+    def test_build_obsidian_link(self):
+        """Test Obsidian URI generation."""
+        link = build_obsidian_link(
+            "/Users/test/Notes 2025/Work/meeting.md",
+            vault_path="/Users/test/Notes 2025",
+        )
+        assert link.startswith("obsidian://")
+        assert "vault=" in link
+        assert "file=" in link
+
+
+class TestInteractionStore:
+    """Tests for InteractionStore."""
+
+    @pytest.fixture
+    def temp_store(self):
+        """Create a temporary store for testing."""
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            store = InteractionStore(f.name, strict=False)
+            yield store
+            Path(f.name).unlink(missing_ok=True)
+
+    def test_add_and_get_by_id(self, temp_store):
+        """Test adding and retrieving an interaction."""
+        interaction = Interaction(
+            id=str(uuid.uuid4()),
+            person_id="person-123",
+            timestamp=datetime.now(),
+            source_type="gmail",
+            title="Test Email",
+        )
+
+        temp_store.add(interaction)
+        retrieved = temp_store.get_by_id(interaction.id)
+
+        assert retrieved is not None
+        assert retrieved.id == interaction.id
+        assert retrieved.title == "Test Email"
+
+    def test_get_by_source(self, temp_store):
+        """Test retrieving interaction by source."""
+        interaction = Interaction(
+            id=str(uuid.uuid4()),
+            person_id="person-123",
+            timestamp=datetime.now(),
+            source_type="gmail",
+            title="Test Email",
+            source_id="msg-unique-123",
+        )
+
+        temp_store.add(interaction)
+        retrieved = temp_store.get_by_source("gmail", "msg-unique-123")
+
+        assert retrieved is not None
+        assert retrieved.source_id == "msg-unique-123"
+
+    def test_add_if_not_exists(self, temp_store):
+        """Test deduplication when adding."""
+        interaction1 = Interaction(
+            id=str(uuid.uuid4()),
+            person_id="person-123",
+            timestamp=datetime.now(),
+            source_type="gmail",
+            title="Original",
+            source_id="msg-same-id",
+        )
+
+        interaction2 = Interaction(
+            id=str(uuid.uuid4()),
+            person_id="person-123",
+            timestamp=datetime.now(),
+            source_type="gmail",
+            title="Duplicate",
+            source_id="msg-same-id",  # Same source_id
+        )
+
+        result1, added1 = temp_store.add_if_not_exists(interaction1)
+        assert added1 is True
+        assert result1.title == "Original"
+
+        result2, added2 = temp_store.add_if_not_exists(interaction2)
+        assert added2 is False
+        assert result2.title == "Original"  # Returns existing
+
+    def test_get_for_person(self, temp_store):
+        """Test getting interactions for a person."""
+        person_id = "person-abc"
+
+        # Add interactions at different times
+        for i, days_ago in enumerate([1, 5, 30, 500]):
+            interaction = Interaction(
+                id=str(uuid.uuid4()),
+                person_id=person_id,
+                timestamp=datetime.now() - timedelta(days=days_ago),
+                source_type="vault",
+                title=f"Note {i}",
+            )
+            temp_store.add(interaction)
+
+        # Default window is 3650 days (10 years), so all 4 interactions are included
+        results = temp_store.get_for_person(person_id)
+        assert len(results) == 4
+
+        # Explicit 365-day window excludes 500-day-old interaction
+        results = temp_store.get_for_person(person_id, days_back=365)
+        assert len(results) == 3  # Excludes 500 days ago
+
+        # Custom window
+        results = temp_store.get_for_person(person_id, days_back=10)
+        assert len(results) == 2  # Only 1 and 5 days ago
+
+        # With limit
+        results = temp_store.get_for_person(person_id, limit=2)
+        assert len(results) == 2
+
+        # Should be ordered by timestamp DESC (most recent first)
+        assert results[0].title == "Note 0"  # 1 day ago
+
+    def test_get_for_person_in_range(self, temp_store):
+        """get_for_person_in_range returns every interaction in the window,
+        with no row cap -- unlike get_for_person, which always applies
+        InteractionConfig's limit. CRM tone analysis needs the true
+        per-month count, not a capped sample."""
+        person_id = "person-range"
+
+        # More rows than get_for_person's default cap would ever return
+        # unbounded, plus one clearly outside the range on each side.
+        now = datetime.now()
+        for i, days_ago in enumerate([-5, 1, 2, 3, 4, 5, 100]):
+            interaction = Interaction(
+                id=str(uuid.uuid4()),
+                person_id=person_id,
+                timestamp=now - timedelta(days=days_ago),
+                source_type="imessage",
+                title=f"Message {i}",
+            )
+            temp_store.add(interaction)
+
+        results = temp_store.get_for_person_in_range(
+            person_id=person_id,
+            start_date=now - timedelta(days=6),
+            end_date=now,
+        )
+        # Excludes the 100-days-ago message (before start_date) and the
+        # 5-days-in-the-future one (after end_date).
+        assert len(results) == 5
+        assert all(r.person_id == person_id for r in results)
+        # Most recent first.
+        assert results[0].title == "Message 1"
+
+    def test_get_for_person_in_range_filters_by_source_type(self, temp_store):
+        person_id = "person-range-source"
+        now = datetime.now()
+        temp_store.add(Interaction(
+            id=str(uuid.uuid4()), person_id=person_id, timestamp=now,
+            source_type="imessage", title="iMessage",
+        ))
+        temp_store.add(Interaction(
+            id=str(uuid.uuid4()), person_id=person_id, timestamp=now,
+            source_type="gmail", title="Email",
+        ))
+
+        results = temp_store.get_for_person_in_range(
+            person_id=person_id,
+            start_date=now - timedelta(days=1),
+            end_date=now + timedelta(days=1),
+            source_type="imessage",
+        )
+        assert len(results) == 1
+        assert results[0].source_type == "imessage"
+
+    def test_get_for_person_in_range_only_returns_that_person(self, temp_store):
+        now = datetime.now()
+        temp_store.add(Interaction(
+            id=str(uuid.uuid4()), person_id="person-a", timestamp=now,
+            source_type="imessage", title="A's message",
+        ))
+        temp_store.add(Interaction(
+            id=str(uuid.uuid4()), person_id="person-b", timestamp=now,
+            source_type="imessage", title="B's message",
+        ))
+
+        results = temp_store.get_for_person_in_range(
+            person_id="person-a",
+            start_date=now - timedelta(days=1),
+            end_date=now + timedelta(days=1),
+        )
+        assert len(results) == 1
+        assert results[0].person_id == "person-a"
+
+    def test_get_monthly_interaction_counts_in_range(self, temp_store):
+        """get_monthly_interaction_counts_in_range groups by calendar month
+        without ever returning row data -- the lightweight freshness check
+        CRM tone analysis uses to avoid loading full rows on a cache hit."""
+        person_id = "person-monthly-counts"
+        now = datetime.now(timezone.utc)
+
+        # 3 messages in the current month, 2 in the previous month, 1
+        # clearly outside the query range.
+        for i in range(3):
+            temp_store.add(Interaction(
+                id=str(uuid.uuid4()), person_id=person_id,
+                timestamp=now.replace(day=1) + timedelta(hours=i),
+                source_type="imessage", title=f"current month {i}",
+            ))
+        prev_month = (now.replace(day=1) - timedelta(days=1)).replace(day=1)
+        for i in range(2):
+            temp_store.add(Interaction(
+                id=str(uuid.uuid4()), person_id=person_id,
+                timestamp=prev_month + timedelta(hours=i),
+                source_type="imessage", title=f"prev month {i}",
+            ))
+        temp_store.add(Interaction(
+            id=str(uuid.uuid4()), person_id=person_id,
+            timestamp=now - timedelta(days=400),
+            source_type="imessage", title="way outside range",
+        ))
+
+        counts = temp_store.get_monthly_interaction_counts_in_range(
+            person_id=person_id,
+            start_date=prev_month,
+            end_date=now.replace(day=1) + timedelta(days=1),
+        )
+
+        current_month_key = now.strftime("%Y-%m")
+        prev_month_key = prev_month.strftime("%Y-%m")
+        assert counts[current_month_key] == 3
+        assert counts[prev_month_key] == 2
+        assert sum(counts.values()) == 5  # excludes the one 400 days back
+
+    def test_get_monthly_interaction_counts_in_range_filters_by_source_and_person(self, temp_store):
+        now = datetime.now(timezone.utc)
+        temp_store.add(Interaction(
+            id=str(uuid.uuid4()), person_id="person-a", timestamp=now,
+            source_type="imessage", title="A imessage",
+        ))
+        temp_store.add(Interaction(
+            id=str(uuid.uuid4()), person_id="person-a", timestamp=now,
+            source_type="gmail", title="A email",
+        ))
+        temp_store.add(Interaction(
+            id=str(uuid.uuid4()), person_id="person-b", timestamp=now,
+            source_type="imessage", title="B imessage",
+        ))
+
+        counts = temp_store.get_monthly_interaction_counts_in_range(
+            person_id="person-a",
+            start_date=now - timedelta(days=1),
+            end_date=now + timedelta(days=1),
+            source_type="imessage",
+        )
+        assert sum(counts.values()) == 1
+
+    def test_get_monthly_interaction_counts_in_range_empty_when_nothing_in_range(self, temp_store):
+        now = datetime.now(timezone.utc)
+        temp_store.add(Interaction(
+            id=str(uuid.uuid4()), person_id="person-empty", timestamp=now,
+            source_type="imessage", title="msg",
+        ))
+        counts = temp_store.get_monthly_interaction_counts_in_range(
+            person_id="person-empty",
+            start_date=now + timedelta(days=10),
+            end_date=now + timedelta(days=20),
+        )
+        assert counts == {}
+
+    def test_month_grouping_is_utc_normalized_even_for_a_non_utc_offset_row(self, temp_store):
+        """get_monthly_interaction_counts_in_range's SQL grouping
+        (`strftime('%Y-%m', timestamp)`, which SQLite always evaluates in
+        UTC regardless of the stored offset) must agree with
+        `api/routes/crm.py`'s Python-side bucketing for the same row --
+        even when that row is stored with a non-UTC offset, not just when
+        (as every writer in this codebase does today) it's already
+        `+00:00`. Pins the dependency directly rather than relying on
+        production data happening to already be UTC."""
+        from api.routes.crm import _bucket_interactions_by_month_and_week
+
+        person_id = "person-non-utc-offset"
+        # 2026-06-30 22:00 at UTC-04:00 is 2026-07-01 02:00 UTC -- a genuine
+        # month-boundary crossing that only a UTC-normalizing comparison
+        # gets right on both sides.
+        ts = datetime(2026, 6, 30, 22, 0, tzinfo=timezone(timedelta(hours=-4)))
+        interaction = Interaction(
+            id=str(uuid.uuid4()), person_id=person_id, timestamp=ts,
+            source_type="imessage", title="→ boundary-crossing message",
+        )
+        temp_store.add(interaction)
+
+        counts = temp_store.get_monthly_interaction_counts_in_range(
+            person_id=person_id,
+            start_date=datetime(2026, 6, 1, tzinfo=timezone.utc),
+            end_date=datetime(2026, 7, 31, tzinfo=timezone.utc),
+        )
+        assert counts == {"2026-07": 1}  # SQL side: normalized to UTC
+
+        user_by_month_week, _ = _bucket_interactions_by_month_and_week([interaction])
+        assert set(user_by_month_week.keys()) == {"2026-07"}  # Python side must agree
+
+    def test_get_for_person_by_source_type(self, temp_store):
+        """Test filtering interactions by source type."""
+        person_id = "person-filter"
+
+        # Add different source types
+        for source in ["gmail", "gmail", "calendar", "vault"]:
+            interaction = Interaction(
+                id=str(uuid.uuid4()),
+                person_id=person_id,
+                timestamp=datetime.now(),
+                source_type=source,
+                title=f"Test {source}",
+            )
+            temp_store.add(interaction)
+
+        # Filter by source
+        gmail_results = temp_store.get_for_person(person_id, source_type="gmail")
+        assert len(gmail_results) == 2
+
+        calendar_results = temp_store.get_for_person(
+            person_id, source_type="calendar"
+        )
+        assert len(calendar_results) == 1
+
+    def test_get_interaction_counts(self, temp_store):
+        """Test getting interaction counts by source."""
+        person_id = "person-counts"
+
+        # Add various interactions
+        sources = ["gmail"] * 5 + ["calendar"] * 3 + ["vault"] * 2
+
+        for i, source in enumerate(sources):
+            interaction = Interaction(
+                id=str(uuid.uuid4()),
+                person_id=person_id,
+                timestamp=datetime.now() - timedelta(days=i),
+                source_type=source,
+                title=f"Test {i}",
+            )
+            temp_store.add(interaction)
+
+        counts = temp_store.get_interaction_counts(person_id)
+
+        assert counts.get("gmail") == 5
+        assert counts.get("calendar") == 3
+        assert counts.get("vault") == 2
+
+    def test_get_last_interaction(self, temp_store):
+        """Test getting most recent interaction."""
+        person_id = "person-last"
+
+        # Add interactions
+        for i, days_ago in enumerate([10, 5, 1]):
+            interaction = Interaction(
+                id=str(uuid.uuid4()),
+                person_id=person_id,
+                timestamp=datetime.now() - timedelta(days=days_ago),
+                source_type="vault",
+                title=f"Note {days_ago} days ago",
+            )
+            temp_store.add(interaction)
+
+        last = temp_store.get_last_interaction(person_id)
+        assert last is not None
+        assert "1 days ago" in last.title
+
+    def test_get_last_interaction_by_source(self, temp_store):
+        """Test getting most recent interaction per source type."""
+        person_id = "person-channel-recency"
+
+        # Add interactions across different channels at different times
+        # Gmail: 10 days ago, 5 days ago (most recent gmail = 5 days ago)
+        # iMessage: 2 days ago (most recent imessage = 2 days ago)
+        # Calendar: 30 days ago (most recent calendar = 30 days ago)
+        interactions = [
+            ("gmail", 10),
+            ("gmail", 5),
+            ("imessage", 2),
+            ("calendar", 30),
+        ]
+
+        for source, days_ago in interactions:
+            interaction = Interaction(
+                id=str(uuid.uuid4()),
+                person_id=person_id,
+                timestamp=datetime.now() - timedelta(days=days_ago),
+                source_type=source,
+                title=f"{source} {days_ago} days ago",
+            )
+            temp_store.add(interaction)
+
+        recency = temp_store.get_last_interaction_by_source(person_id)
+
+        # Should have 3 keys (gmail, imessage, calendar)
+        assert len(recency) == 3
+        assert "gmail" in recency
+        assert "imessage" in recency
+        assert "calendar" in recency
+
+        # Verify the most recent timestamp for each source
+        now = datetime.now()
+        gmail_days_ago = (now - recency["gmail"].replace(tzinfo=None)).days
+        imessage_days_ago = (now - recency["imessage"].replace(tzinfo=None)).days
+        calendar_days_ago = (now - recency["calendar"].replace(tzinfo=None)).days
+
+        assert gmail_days_ago == 5  # Most recent gmail was 5 days ago
+        assert imessage_days_ago == 2  # Most recent imessage was 2 days ago
+        assert calendar_days_ago == 30  # Most recent calendar was 30 days ago
+
+        # All returned datetimes should be timezone-aware
+        for dt in recency.values():
+            assert dt.tzinfo is not None
+
+    def test_get_last_interaction_by_source_empty(self, temp_store):
+        """Test channel recency for person with no interactions."""
+        recency = temp_store.get_last_interaction_by_source("nonexistent-person")
+        assert recency == {}
+
+    def test_delete(self, temp_store):
+        """Test deleting an interaction."""
+        interaction = Interaction(
+            id=str(uuid.uuid4()),
+            person_id="person-123",
+            timestamp=datetime.now(),
+            source_type="gmail",
+            title="To Delete",
+        )
+
+        temp_store.add(interaction)
+        assert temp_store.get_by_id(interaction.id) is not None
+
+        result = temp_store.delete(interaction.id)
+        assert result is True
+        assert temp_store.get_by_id(interaction.id) is None
+
+        # Delete non-existent
+        result = temp_store.delete("fake-id")
+        assert result is False
+
+    def test_delete_for_person(self, temp_store):
+        """Test deleting all interactions for a person."""
+        person_id = "person-to-delete"
+
+        # Add multiple interactions
+        for i in range(5):
+            interaction = Interaction(
+                id=str(uuid.uuid4()),
+                person_id=person_id,
+                timestamp=datetime.now(),
+                source_type="vault",
+                title=f"Note {i}",
+            )
+            temp_store.add(interaction)
+
+        # Also add for another person
+        other = Interaction(
+            id=str(uuid.uuid4()),
+            person_id="other-person",
+            timestamp=datetime.now(),
+            source_type="vault",
+            title="Other",
+        )
+        temp_store.add(other)
+
+        # Delete for specific person
+        deleted = temp_store.delete_for_person(person_id)
+        assert deleted == 5
+
+        # Verify other person's interactions still exist
+        assert temp_store.get_by_id(other.id) is not None
+
+    def test_statistics(self, temp_store):
+        """Test getting store statistics."""
+        # Add interactions for multiple people
+        for i in range(10):
+            interaction = Interaction(
+                id=str(uuid.uuid4()),
+                person_id=f"person-{i % 3}",  # 3 unique people
+                timestamp=datetime.now() - timedelta(days=i),
+                source_type=["gmail", "calendar", "vault"][i % 3],
+                title=f"Test {i}",
+            )
+            temp_store.add(interaction)
+
+        stats = temp_store.get_statistics()
+
+        assert stats["total_interactions"] == 10
+        assert stats["unique_people"] == 3
+        assert sum(stats["by_source"].values()) == 10
+
+    def test_format_interaction_history(self, temp_store):
+        """Test formatted markdown output."""
+        person_id = "person-format"
+
+        # Add some interactions
+        for i, (source, title) in enumerate(
+            [
+                ("gmail", "Re: Budget Update"),
+                ("calendar", "1:1 Meeting"),
+                ("vault", "Project Notes"),
+            ]
+        ):
+            interaction = Interaction(
+                id=str(uuid.uuid4()),
+                person_id=person_id,
+                timestamp=datetime.now() - timedelta(days=i),
+                source_type=source,
+                title=title,
+                source_link=f"https://example.com/{i}",
+            )
+            temp_store.add(interaction)
+
+        formatted = temp_store.format_interaction_history(person_id)
+
+        # Check structure
+        assert "**Summary:**" in formatted
+        assert "3 interactions" in formatted
+        assert "📧" in formatted
+        assert "📅" in formatted
+        assert "📝" in formatted
+        assert "Re: Budget Update" in formatted
+
+    def test_count(self, temp_store):
+        """Test counting interactions."""
+        assert temp_store.count() == 0
+
+        for i in range(3):
+            interaction = Interaction(
+                id=str(uuid.uuid4()),
+                person_id="person-123",
+                timestamp=datetime.now(),
+                source_type="vault",
+                title=f"Note {i}",
+            )
+            temp_store.add(interaction)
+
+        assert temp_store.count() == 3
+
+
+    def test_unique_constraint_prevents_duplicate_source(self, temp_store):
+        """Test that DB-level UNIQUE constraint blocks duplicate (source_type, source_id)."""
+        interaction1 = Interaction(
+            id=str(uuid.uuid4()),
+            person_id="person-123",
+            timestamp=datetime.now(),
+            source_type="gmail",
+            title="First",
+            source_id="msg-dup-1",
+        )
+        interaction2 = Interaction(
+            id=str(uuid.uuid4()),
+            person_id="person-456",
+            timestamp=datetime.now(),
+            source_type="gmail",
+            title="Second",
+            source_id="msg-dup-1",  # Same source_type + source_id
+        )
+
+        temp_store.add(interaction1)
+        temp_store.add(interaction2)  # Should be silently skipped via ON CONFLICT DO NOTHING
+
+        # Only the first should exist
+        result = temp_store.get_by_source("gmail", "msg-dup-1")
+        assert result is not None
+        assert result.title == "First"
+        assert temp_store.count() == 1
+
+    def test_null_source_id_allows_multiple_rows(self, temp_store):
+        """Test that NULL source_id rows are not affected by the UNIQUE constraint."""
+        for i in range(3):
+            interaction = Interaction(
+                id=str(uuid.uuid4()),
+                person_id="person-123",
+                timestamp=datetime.now(),
+                source_type="vault",
+                title=f"Note {i}",
+                source_id=None,
+            )
+            temp_store.add(interaction)
+
+        assert temp_store.count() == 3
+
+    def test_same_source_id_different_source_type(self, temp_store):
+        """Test that same source_id with different source_type is allowed."""
+        for source_type in ["gmail", "calendar", "vault"]:
+            interaction = Interaction(
+                id=str(uuid.uuid4()),
+                person_id="person-123",
+                timestamp=datetime.now(),
+                source_type=source_type,
+                title=f"Test {source_type}",
+                source_id="shared-id-123",
+            )
+            temp_store.add(interaction)
+
+        assert temp_store.count() == 3
+
+    def test_migration_idempotency(self, temp_store):
+        """Test that calling _init_db() twice doesn't break the store."""
+        # Add an interaction before re-init
+        interaction = Interaction(
+            id=str(uuid.uuid4()),
+            person_id="person-123",
+            timestamp=datetime.now(),
+            source_type="gmail",
+            title="Before re-init",
+            source_id="msg-idempotent",
+        )
+        temp_store.add(interaction)
+
+        # Re-run _init_db() — should be a no-op
+        temp_store._init_db()
+
+        # Verify data survived
+        result = temp_store.get_by_source("gmail", "msg-idempotent")
+        assert result is not None
+        assert result.title == "Before re-init"
+        assert temp_store.count() == 1
+
+    def test_strict_mode_rejects_nonexistent_person(self):
+        """Test that strict mode rejects interactions with nonexistent person_ids."""
+        from unittest.mock import patch, MagicMock
+
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            store = InteractionStore(f.name, strict=True)
+            try:
+                mock_person_store = MagicMock()
+                mock_person_store.get_canonical_id.return_value = "ghost-person"
+                mock_person_store.get_by_id.return_value = None
+
+                with patch(
+                    "api.services.person_entity.get_person_entity_store",
+                    return_value=mock_person_store,
+                ):
+                    interaction = Interaction(
+                        id=str(uuid.uuid4()),
+                        person_id="ghost-person",
+                        timestamp=datetime.now(),
+                        source_type="gmail",
+                        title="Orphan Email",
+                    )
+                    with pytest.raises(ValueError, match="does not exist"):
+                        store.add(interaction)
+            finally:
+                Path(f.name).unlink(missing_ok=True)
+
+    def test_strict_mode_allows_valid_person(self):
+        """Test that strict mode allows interactions with valid person_ids."""
+        from unittest.mock import patch, MagicMock
+
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            store = InteractionStore(f.name, strict=True)
+            try:
+                mock_person_store = MagicMock()
+                mock_person_store.get_canonical_id.return_value = "real-person"
+                mock_person_store.get_by_id.return_value = MagicMock()  # Person exists
+
+                with patch(
+                    "api.services.person_entity.get_person_entity_store",
+                    return_value=mock_person_store,
+                ):
+                    interaction = Interaction(
+                        id=str(uuid.uuid4()),
+                        person_id="real-person",
+                        timestamp=datetime.now(),
+                        source_type="gmail",
+                        title="Valid Email",
+                    )
+                    result = store.add(interaction)
+                    assert result.person_id == "real-person"
+                    assert store.count() == 1
+            finally:
+                Path(f.name).unlink(missing_ok=True)
+
+
+class TestInteractionFactories:
+    """Tests for interaction factory functions."""
+
+    def test_create_gmail_interaction(self):
+        """Test Gmail interaction factory."""
+        interaction = create_gmail_interaction(
+            person_id="person-123",
+            message_id="msg-abc",
+            subject="Test Subject",
+            timestamp=datetime(2024, 6, 15),
+            snippet="Email body preview...",
+        )
+
+        assert interaction.source_type == "gmail"
+        assert interaction.title == "Test Subject"
+        assert "mail.google.com" in interaction.source_link
+        assert interaction.source_id == "msg-abc"
+        assert interaction.id  # UUID should be generated
+
+    def test_create_calendar_interaction(self):
+        """Test Calendar interaction factory."""
+        interaction = create_calendar_interaction(
+            person_id="person-123",
+            event_id="event-xyz",
+            title="Team Meeting",
+            timestamp=datetime(2024, 6, 15, 14, 0),
+            snippet="Discuss Q3 goals",
+        )
+
+        assert interaction.source_type == "calendar"
+        assert interaction.title == "Team Meeting"
+        assert "calendar.google.com" in interaction.source_link
+        assert interaction.source_id == "event-xyz"
+
+    def test_create_vault_interaction(self):
+        """Test Vault interaction factory."""
+        interaction = create_vault_interaction(
+            person_id="person-123",
+            file_path="/Users/test/vault/notes/meeting.md",
+            title="Meeting Notes",
+            timestamp=datetime(2024, 6, 15),
+            snippet="We discussed...",
+            is_granola=False,
+        )
+
+        assert interaction.source_type == "vault"
+        assert interaction.title == "Meeting Notes"
+        assert "obsidian://" in interaction.source_link
+
+    def test_create_granola_interaction(self):
+        """Test Granola (meeting note) interaction factory."""
+        interaction = create_vault_interaction(
+            person_id="person-123",
+            file_path="/Users/test/vault/Granola/meeting.md",
+            title="Standup",
+            timestamp=datetime(2024, 6, 15),
+            is_granola=True,
+        )
+
+        assert interaction.source_type == "granola"
+
+
+class TestTimezoneHandling:
+    """Tests for timezone-aware datetime handling."""
+
+    def test_from_dict_naive_datetime_becomes_aware(self):
+        """Test that naive datetime strings become timezone-aware."""
+        data = {
+            "id": "test-id",
+            "person_id": "person-123",
+            "timestamp": "2024-06-15T10:30:00",  # No timezone
+            "source_type": "gmail",
+            "title": "Test Email",
+            "source_link": "https://example.com",
+            "source_id": "msg-123",
+            "created_at": "2024-06-15T11:00:00",  # No timezone
+        }
+        interaction = Interaction.from_dict(data)
+        assert interaction.timestamp.tzinfo is not None
+        assert interaction.created_at.tzinfo is not None
+
+    def test_from_row_naive_datetime_becomes_aware(self):
+        """Test that naive datetime from SQLite becomes timezone-aware."""
+        row = (
+            "id-1",
+            "person-123",
+            "2024-06-15T10:30:00",  # Naive timestamp
+            "calendar",
+            "Meeting Title",
+            "Snippet text",
+            "https://example.com",
+            "event-123",
+            "2024-06-15T11:00:00",  # Naive created_at
+        )
+        interaction = Interaction.from_row(row)
+        assert interaction.timestamp.tzinfo is not None
+        assert interaction.created_at.tzinfo is not None
+
+
+# =============================================================================
+# Batch Operations Tests
+# =============================================================================
+
+
+class TestBatchAdd:
+    """Tests for batch_add() transaction boundaries."""
+
+    @pytest.fixture
+    def temp_store(self):
+        """Create a temporary store for testing."""
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            store = InteractionStore(f.name, strict=False)
+            yield store
+            Path(f.name).unlink(missing_ok=True)
+
+    def _make_interaction(self, source_type="gmail", source_id=None, person_id="person-1"):
+        return Interaction(
+            id=str(uuid.uuid4()),
+            person_id=person_id,
+            timestamp=datetime.now(),
+            source_type=source_type,
+            title=f"Test {source_type}",
+            source_id=source_id or str(uuid.uuid4()),
+        )
+
+    def test_batch_add_inserts_all(self, temp_store):
+        """batch_add inserts N interactions in a single commit."""
+        interactions = [self._make_interaction() for _ in range(50)]
+
+        result = temp_store.batch_add(interactions)
+
+        assert result["added"] == 50
+        assert result["skipped"] == 0
+        assert temp_store.count() == 50
+
+    def test_batch_add_deduplicates(self, temp_store):
+        """batch_add skips duplicates via UNIQUE constraint."""
+        shared_source_id = "dup-source-123"
+        i1 = self._make_interaction(source_id=shared_source_id)
+        i2 = self._make_interaction(source_id=shared_source_id)
+
+        result = temp_store.batch_add([i1, i2])
+
+        assert result["added"] == 1
+        assert result["skipped"] == 1
+        assert temp_store.count() == 1
+
+    def test_batch_add_skips_existing(self, temp_store):
+        """batch_add skips interactions already in the database."""
+        existing = self._make_interaction(source_id="existing-1")
+        temp_store.add(existing)
+        assert temp_store.count() == 1
+
+        new = self._make_interaction(source_id="new-1")
+        dup = self._make_interaction(source_id="existing-1")
+
+        result = temp_store.batch_add([new, dup])
+
+        assert result["added"] == 1
+        assert result["skipped"] == 1
+        assert temp_store.count() == 2
+
+    def test_batch_add_empty_list(self, temp_store):
+        """batch_add with empty list returns zeros."""
+        result = temp_store.batch_add([])
+
+        assert result["added"] == 0
+        assert result["skipped"] == 0
+        assert result["affected_person_ids"] == set()
+
+    def test_batch_add_returns_affected_person_ids(self, temp_store):
+        """batch_add returns the set of canonical person IDs touched."""
+        i1 = self._make_interaction(person_id="person-A")
+        i2 = self._make_interaction(person_id="person-B")
+        i3 = self._make_interaction(person_id="person-A")
+
+        result = temp_store.batch_add([i1, i2, i3])
+
+        assert result["affected_person_ids"] == {"person-A", "person-B"}
+
+    def test_batch_add_atomicity(self, temp_store):
+        """Crash mid-batch results in zero inserts (rollback)."""
+        import sqlite3
+
+        interactions = [self._make_interaction() for _ in range(5)]
+
+        # Corrupt the 3rd row to trigger an error mid-transaction
+        # by closing the connection prematurely via monkey-patching
+        original_get = temp_store._get_connection
+
+        class FailingConnection:
+            """Wraps a real connection but fails on executemany."""
+
+            def __init__(self, conn):
+                self._conn = conn
+
+            def __getattr__(self, name):
+                return getattr(self._conn, name)
+
+            def executemany(self, *args, **kwargs):
+                raise sqlite3.OperationalError("simulated crash")
+
+            def rollback(self):
+                self._conn.rollback()
+
+            def close(self):
+                self._conn.close()
+
+        def failing_connection():
+            return FailingConnection(original_get())
+
+        temp_store._get_connection = failing_connection
+
+        with pytest.raises(sqlite3.OperationalError, match="simulated crash"):
+            temp_store.batch_add(interactions)
+
+        # Restore normal connection and verify nothing was committed
+        temp_store._get_connection = original_get
+        assert temp_store.count() == 0
+
+    def test_batch_add_skips_temp_artifacts(self, temp_store):
+        """batch_add filters out interactions with temp-dir source_ids."""
+        normal = self._make_interaction(source_id="real-source")
+        temp = self._make_interaction(source_id="/tmp/pytest-abc/file.txt")
+
+        result = temp_store.batch_add([normal, temp])
+
+        assert result["added"] == 1
+        assert temp_store.count() == 1
+
+
+class TestAtomicReplace:
+    """Tests for atomic_replace() transaction boundaries."""
+
+    @pytest.fixture
+    def temp_store(self):
+        """Create a temporary store for testing."""
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            store = InteractionStore(f.name, strict=False)
+            yield store
+            Path(f.name).unlink(missing_ok=True)
+
+    def _make_interaction(self, source_type="vault", source_id=None, person_id="person-1"):
+        return Interaction(
+            id=str(uuid.uuid4()),
+            person_id=person_id,
+            timestamp=datetime.now(),
+            source_type=source_type,
+            title=f"Test {source_type}",
+            source_id=source_id or str(uuid.uuid4()),
+        )
+
+    def test_atomic_replace_deletes_and_inserts(self, temp_store):
+        """atomic_replace removes old and adds new in one transaction."""
+        # Add some initial vault interactions
+        old = [self._make_interaction(source_type="vault") for _ in range(3)]
+        temp_store.batch_add(old)
+        assert temp_store.count() == 3
+
+        # Replace with 5 new ones
+        new = [self._make_interaction(source_type="vault") for _ in range(5)]
+        result = temp_store.atomic_replace("vault", new)
+
+        assert result["deleted"] == 3
+        assert result["added"] == 5
+        assert temp_store.count() == 5
+
+    def test_atomic_replace_only_affects_target_source_type(self, temp_store):
+        """atomic_replace only deletes interactions of the specified source_type."""
+        gmail = [self._make_interaction(source_type="gmail") for _ in range(3)]
+        vault = [self._make_interaction(source_type="vault") for _ in range(2)]
+        temp_store.batch_add(gmail + vault)
+        assert temp_store.count() == 5
+
+        new_vault = [self._make_interaction(source_type="vault")]
+        result = temp_store.atomic_replace("vault", new_vault)
+
+        assert result["deleted"] == 2
+        assert result["added"] == 1
+        assert temp_store.count() == 4  # 3 gmail + 1 new vault
+
+    def test_atomic_replace_with_empty_list(self, temp_store):
+        """atomic_replace with empty list just deletes existing."""
+        old = [self._make_interaction(source_type="vault") for _ in range(3)]
+        temp_store.batch_add(old)
+
+        result = temp_store.atomic_replace("vault", [])
+
+        assert result["deleted"] == 3
+        assert result["added"] == 0
+        assert temp_store.count() == 0
+
+    def test_atomic_replace_returns_affected_person_ids(self, temp_store):
+        """atomic_replace returns person IDs from both deleted and inserted."""
+        old = self._make_interaction(source_type="vault", person_id="old-person")
+        temp_store.batch_add([old])
+
+        new = self._make_interaction(source_type="vault", person_id="new-person")
+        result = temp_store.atomic_replace("vault", [new])
+
+        assert "old-person" in result["affected_person_ids"]
+        assert "new-person" in result["affected_person_ids"]
+
+    def test_atomic_replace_rollback_on_failure(self, temp_store):
+        """If insert fails, delete is also rolled back."""
+        import sqlite3
+
+        old = [self._make_interaction(source_type="vault") for _ in range(3)]
+        temp_store.batch_add(old)
+        assert temp_store.count() == 3
+
+        new = [self._make_interaction(source_type="vault") for _ in range(2)]
+
+        original_get = temp_store._get_connection
+
+        class FailOnExecutemany:
+            def __init__(self, conn):
+                self._conn = conn
+                self._exec_count = 0
+
+            def __getattr__(self, name):
+                return getattr(self._conn, name)
+
+            def execute(self, *args, **kwargs):
+                return self._conn.execute(*args, **kwargs)
+
+            def executemany(self, *args, **kwargs):
+                raise sqlite3.OperationalError("simulated crash during insert")
+
+            def rollback(self):
+                self._conn.rollback()
+
+            def close(self):
+                self._conn.close()
+
+        def failing_connection():
+            return FailOnExecutemany(original_get())
+
+        temp_store._get_connection = failing_connection
+
+        with pytest.raises(sqlite3.OperationalError, match="simulated crash"):
+            temp_store.atomic_replace("vault", new)
+
+        # Restore and verify: original data should be intact (rollback)
+        temp_store._get_connection = original_get
+        assert temp_store.count() == 3
+
+    def test_atomic_replace_on_empty_source_type(self, temp_store):
+        """atomic_replace on a source_type with no existing data just inserts."""
+        new = [self._make_interaction(source_type="vault") for _ in range(3)]
+        result = temp_store.atomic_replace("vault", new)
+
+        assert result["deleted"] == 0
+        assert result["added"] == 3
+        assert temp_store.count() == 3
+
+    def test_atomic_replace_rejects_mismatched_source_type(self, temp_store):
+        """atomic_replace raises ValueError if interactions have wrong source_type."""
+        mixed = [
+            self._make_interaction(source_type="vault"),
+            self._make_interaction(source_type="gmail"),  # Mismatch
+        ]
+
+        with pytest.raises(ValueError, match="mismatched source_type"):
+            temp_store.atomic_replace("vault", mixed)
+
+
+# ============================================================================
+# Tiered backup retention (_prune_backups)
+# ============================================================================
+
+
+class TestBackupRetention:
+    """Tiered retention policy: 5 daily + weekly to 35d + monthly to 1yr + quarterly beyond."""
+
+    @staticmethod
+    def _make_backup(d, ts: datetime):
+        """Create an empty backup file with the canonical filename and matching mtime."""
+        name = f"interactions.db.{ts.strftime('%Y%m%d_%H%M%S')}.backup"
+        p = d / name
+        p.touch()
+        return p
+
+    def test_keeps_5_most_recent_unconditionally(self, tmp_path):
+        from api.services.interaction_store import _prune_backups
+        now = datetime(2026, 5, 28, 12, 0, 0)
+        # 10 backups, one per day for the past 10 days.
+        for i in range(10):
+            self._make_backup(tmp_path, now - timedelta(days=i))
+
+        removed = _prune_backups(tmp_path, now=now)
+        kept = sorted(p.name for p in tmp_path.glob("*.backup"))
+
+        # 10 backups, days 0..9 by age:
+        #   days 0-4 → 5 daily slots (unconditional)
+        #   days 5,6 → both in week-0 bucket; only day 5 (newest) survives
+        #   days 7,8,9 → all in week-1 bucket; only day 7 (newest) survives
+        # → 5 + 2 = 7 kept, days 6/8/9 pruned.
+        assert len(kept) == 7
+        removed_names = {p.name for p in removed}
+        for prune_age in (6, 8, 9):
+            stamp = (now - timedelta(days=prune_age)).strftime("%Y%m%d_%H%M%S")
+            assert any(stamp in n for n in removed_names), \
+                f"day-{prune_age} backup should have been pruned; removed={sorted(removed_names)}"
+
+    def test_weekly_bucket_keeps_one_per_week(self, tmp_path):
+        from api.services.interaction_store import _prune_backups
+        now = datetime(2026, 5, 28, 12, 0, 0)
+        # Past 35 days: should end up with 5 daily + one per week (weeks 1-4)
+        for i in range(35):
+            self._make_backup(tmp_path, now - timedelta(days=i))
+
+        _prune_backups(tmp_path, now=now)
+        kept = sorted(p.name for p in tmp_path.glob("*.backup"))
+
+        # 5 daily (days 0-4) + week-0 bucket newest (day 5) + week-1 (day 7-or-newer)
+        # + week-2, week-3, week-4. That's 5 + 5 = 10 maximum.
+        assert 5 <= len(kept) <= 10
+
+    def test_monthly_bucket_kicks_in_past_35_days(self, tmp_path):
+        from api.services.interaction_store import _prune_backups
+        now = datetime(2026, 5, 28, 12, 0, 0)
+        # Backups every 5 days going back 6 months
+        for i in range(0, 180, 5):
+            self._make_backup(tmp_path, now - timedelta(days=i))
+
+        _prune_backups(tmp_path, now=now)
+        kept_dates = sorted(
+            datetime.strptime(p.name[len("interactions.db."):-len(".backup")], "%Y%m%d_%H%M%S")
+            for p in tmp_path.glob("*.backup")
+        )
+
+        # Past day 35 we should see roughly monthly granularity, not 5-day.
+        old = [d for d in kept_dates if (now - d).days > 35]
+        if len(old) >= 2:
+            gaps = [(old[i+1] - old[i]).days for i in range(len(old) - 1)]
+            # In the monthly tier, gaps should be on the order of a month, not 5 days.
+            assert max(gaps) >= 25, f"monthly tier should produce ~30-day gaps, got {gaps}"
+
+    def test_no_matching_files_returns_empty(self, tmp_path):
+        from api.services.interaction_store import _prune_backups
+        # Files with wrong shape — must be untouched.
+        (tmp_path / "interactions.db.notatimestamp.backup").touch()
+        (tmp_path / "something_else.txt").touch()
+        removed = _prune_backups(tmp_path)
+        assert removed == []
+        # The wrong-shape file should still exist (the helper ignores it).
+        assert (tmp_path / "interactions.db.notatimestamp.backup").exists()
+
+    def test_fewer_than_5_backups_nothing_pruned(self, tmp_path):
+        from api.services.interaction_store import _prune_backups
+        now = datetime(2026, 5, 28)
+        for i in range(3):
+            self._make_backup(tmp_path, now - timedelta(days=i))
+        removed = _prune_backups(tmp_path, now=now)
+        assert removed == []
+        assert len(list(tmp_path.glob("*.backup"))) == 3
+
+
+class TestMassMeetingExclusion:
+    """
+    Mass meetings must not contribute to relationship scoring.
+
+    A 90-person standing call yields one interaction row per attendee, so a
+    single weekly series can dominate a whole calendar history and inflate
+    strength scores for people who have never actually spoken.
+    """
+
+    @pytest.fixture
+    def temp_store(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            store = InteractionStore(f.name, strict=False)
+            yield store
+            Path(f.name).unlink(missing_ok=True)
+
+    @staticmethod
+    def _calendar(store, person_id, attendee_count, title="Meeting"):
+        store.add(Interaction(
+            id=str(uuid.uuid4()),
+            person_id=person_id,
+            timestamp=datetime.now(),
+            source_type="calendar",
+            title=title,
+            attendee_count=attendee_count,
+        ))
+
+    def _subtypes(self, store, person_id):
+        return {
+            r["subtype"]: r["count"]
+            for r in store.get_interaction_counts_with_subtypes(person_id)
+        }
+
+    def test_meeting_over_limit_is_excluded(self, temp_store):
+        """An event above the attendee limit contributes nothing."""
+        self._calendar(temp_store, "p1", InteractionConfig.MASS_MEETING_ATTENDEE_LIMIT + 1)
+
+        assert self._subtypes(temp_store, "p1") == {}
+
+    def test_meeting_at_limit_is_kept(self, temp_store):
+        """The limit is exclusive — exactly at the limit still counts."""
+        self._calendar(temp_store, "p1", InteractionConfig.MASS_MEETING_ATTENDEE_LIMIT)
+
+        assert self._subtypes(temp_store, "p1") == {"calendar_large_meeting": 1}
+
+    def test_small_meetings_are_unaffected(self, temp_store):
+        """Ordinary meetings keep their existing subtype buckets."""
+        self._calendar(temp_store, "p1", 1)
+        self._calendar(temp_store, "p1", 3)
+        self._calendar(temp_store, "p1", 10)
+
+        assert self._subtypes(temp_store, "p1") == {
+            "calendar_1on1": 1,
+            "calendar_small_group": 1,
+            "calendar_large_meeting": 1,
+        }
+
+    def test_null_attendee_count_is_kept(self, temp_store):
+        """
+        Rows predating the attendee_count column must survive.
+
+        `NULL > 50` is NULL in SQL, so a naive NOT(...) filter would silently
+        drop every legacy row instead of keeping it.
+        """
+        self._calendar(temp_store, "p1", None)
+
+        counts = temp_store.get_interaction_counts_with_subtypes("p1")
+        assert sum(r["count"] for r in counts) == 1
+
+    def test_non_calendar_sources_are_never_filtered(self, temp_store):
+        """The limit applies only to calendar rows."""
+        temp_store.add(Interaction(
+            id=str(uuid.uuid4()),
+            person_id="p1",
+            timestamp=datetime.now(),
+            source_type="gmail",
+            title="→ Subject",
+        ))
+
+        counts = temp_store.get_interaction_counts_with_subtypes("p1")
+        assert sum(r["count"] for r in counts) == 1
+
+    def test_mass_meeting_does_not_drown_out_real_contact(self, temp_store):
+        """The regression this guards: one 1:1 must not be buried by a big series."""
+        for _ in range(100):
+            self._calendar(temp_store, "p1", 91, title="Rise Leadership Call")
+        self._calendar(temp_store, "p1", 1, title="Coffee")
+
+        assert self._subtypes(temp_store, "p1") == {"calendar_1on1": 1}
+
+
+class TestMeFamilyAggregates:
+    """
+    Store-level tests for the Me/Family dashboard aggregate queries: plain
+    tuples/dicts computed in SQL instead of hydrating every interaction in
+    a window into an Interaction object.
+    """
+
+    @pytest.fixture
+    def temp_store(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            store = InteractionStore(f.name, strict=False)
+            yield store
+            Path(f.name).unlink(missing_ok=True)
+
+    @staticmethod
+    def _add(store, person_id, days_ago=0, source_type="imessage", title="Hi",
+              timestamp=None):
+        ts = timestamp if timestamp is not None else (
+            datetime.now(timezone.utc) - timedelta(days=days_ago)
+        )
+        store.add(Interaction(
+            id=str(uuid.uuid4()),
+            person_id=person_id,
+            timestamp=ts,
+            source_type=source_type,
+            title=title,
+        ))
+
+    # ---- get_span ----
+
+    def test_get_span_empty_store(self, temp_store):
+        earliest, latest = temp_store.get_span()
+        assert earliest is None
+        assert latest is None
+
+    def test_get_span_returns_min_and_max(self, temp_store):
+        self._add(temp_store, "p1", days_ago=100)
+        self._add(temp_store, "p1", days_ago=1)
+        self._add(temp_store, "p2", days_ago=50)
+
+        earliest, latest = temp_store.get_span()
+        assert earliest is not None and latest is not None
+        # The earliest timestamp should be the ~100-day-old one, latest the
+        # ~1-day-old one (string comparison works since both are ISO and
+        # generated moments apart with the same offset).
+        assert earliest < latest
+
+    def test_get_span_excludes_person_ids(self, temp_store):
+        self._add(temp_store, "self", days_ago=1)
+        self._add(temp_store, "p1", days_ago=200)
+
+        earliest, latest = temp_store.get_span(exclude_person_ids=["self"])
+        # With "self" excluded, only p1 (200 days ago) remains, so earliest
+        # and latest should be close together, not spanning to 1 day ago.
+        assert earliest == latest
+
+    def test_get_span_restricts_to_person_ids(self, temp_store):
+        self._add(temp_store, "p1", days_ago=1)
+        self._add(temp_store, "p2", days_ago=200)
+
+        earliest, latest = temp_store.get_span(person_ids=["p2"])
+        assert earliest == latest  # only p2's single interaction
+
+    # ---- get_daily_source_counts ----
+
+    def test_get_daily_source_counts_groups_by_day_and_source(self, temp_store):
+        now = datetime.now(timezone.utc)
+        self._add(temp_store, "p1", timestamp=now, source_type="imessage")
+        self._add(temp_store, "p1", timestamp=now, source_type="imessage")
+        self._add(temp_store, "p1", timestamp=now, source_type="gmail", title="→ Hi")
+
+        rows = temp_store.get_daily_source_counts(
+            now - timedelta(days=1), now + timedelta(days=1),
+        )
+        by_source = {source: cnt for _, source, cnt in rows}
+        assert by_source["imessage"] == 2
+        assert by_source["gmail"] == 1
+
+    def test_get_daily_source_counts_window_edges(self, temp_store):
+        now = datetime.now(timezone.utc)
+        self._add(temp_store, "p1", timestamp=now - timedelta(days=10))
+        self._add(temp_store, "p1", timestamp=now - timedelta(days=5))
+
+        # A 6-day window should only pick up the 5-day-old interaction.
+        rows = temp_store.get_daily_source_counts(
+            now - timedelta(days=6), now,
+        )
+        assert sum(cnt for _, _, cnt in rows) == 1
+
+    def test_get_daily_source_counts_gmail_sent_only(self, temp_store):
+        now = datetime.now(timezone.utc)
+        self._add(temp_store, "p1", timestamp=now, source_type="gmail", title="→ Sent")
+        self._add(temp_store, "p1", timestamp=now, source_type="gmail", title="← Received")
+        self._add(temp_store, "p1", timestamp=now, source_type="imessage", title="msg")
+
+        rows = temp_store.get_daily_source_counts(
+            now - timedelta(days=1), now + timedelta(days=1), gmail_sent_only=True,
+        )
+        by_source = {source: cnt for _, source, cnt in rows}
+        assert by_source.get("gmail") == 1  # only the sent one
+        assert by_source.get("imessage") == 1  # unaffected by the gmail rule
+
+    def test_get_daily_source_counts_exclude_and_restrict_ids(self, temp_store):
+        now = datetime.now(timezone.utc)
+        self._add(temp_store, "p1", timestamp=now)
+        self._add(temp_store, "p2", timestamp=now)
+        self._add(temp_store, "p3", timestamp=now)
+
+        rows = temp_store.get_daily_source_counts(
+            now - timedelta(days=1), now + timedelta(days=1),
+            person_ids=["p1", "p2"], exclude_person_ids=["p2"],
+        )
+        assert sum(cnt for _, _, cnt in rows) == 1  # only p1 survives both filters
+
+    def test_get_daily_source_counts_empty_person_ids_matches_nothing(self, temp_store):
+        now = datetime.now(timezone.utc)
+        self._add(temp_store, "p1", timestamp=now)
+
+        rows = temp_store.get_daily_source_counts(
+            now - timedelta(days=1), now + timedelta(days=1), person_ids=[],
+        )
+        assert rows == []
+
+    # ---- get_person_counts ----
+
+    def test_get_person_counts_basic(self, temp_store):
+        now = datetime.now(timezone.utc)
+        self._add(temp_store, "p1", timestamp=now)
+        self._add(temp_store, "p1", timestamp=now)
+        self._add(temp_store, "p2", timestamp=now)
+
+        counts = temp_store.get_person_counts(now - timedelta(days=1), now + timedelta(days=1))
+        assert counts == {"p1": 2, "p2": 1}
+
+    def test_get_person_counts_exact_boundary_matches_python_comparison(self, temp_store):
+        """
+        exact=True must reproduce Python's offset-aware datetime comparison
+        exactly, even when the stored row uses a different UTC offset than
+        the cutoff itself — this is the whole reason it uses julianday()
+        instead of plain string comparison for the precise bound.
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+        # Store the exact cutoff instant, but expressed in a -05:00 offset
+        # rather than UTC — a real-world case (interactions from different
+        # sources land with different offsets).
+        local_repr = cutoff.astimezone(timezone(timedelta(hours=-5)))
+        temp_store.add(Interaction(
+            id=str(uuid.uuid4()), person_id="boundary", timestamp=local_repr,
+            source_type="imessage", title="at cutoff",
+        ))
+        # And one instant before the cutoff (should be excluded).
+        before = cutoff - timedelta(seconds=1)
+        temp_store.add(Interaction(
+            id=str(uuid.uuid4()), person_id="boundary", timestamp=before,
+            source_type="imessage", title="before cutoff",
+        ))
+
+        counts = temp_store.get_person_counts(
+            cutoff, datetime.now(timezone.utc) + timedelta(days=1), exact=True,
+        )
+        # Only the at-cutoff (inclusive) interaction should count, not the
+        # one a second before it, regardless of the stored offset.
+        assert counts.get("boundary") == 1
+
+    def test_get_person_counts_end_inclusive_false_excludes_boundary(self, temp_store):
+        now = datetime.now(timezone.utc)
+        boundary = now - timedelta(days=10)
+        temp_store.add(Interaction(
+            id=str(uuid.uuid4()), person_id="p1", timestamp=boundary,
+            source_type="imessage", title="at boundary",
+        ))
+
+        inclusive = temp_store.get_person_counts(
+            now - timedelta(days=20), boundary, exact=True, end_inclusive=True,
+        )
+        exclusive = temp_store.get_person_counts(
+            now - timedelta(days=20), boundary, exact=True, end_inclusive=False,
+        )
+        assert inclusive.get("p1") == 1
+        assert exclusive.get("p1", 0) == 0
+
+    def test_get_person_counts_gmail_sent_only(self, temp_store):
+        now = datetime.now(timezone.utc)
+        self._add(temp_store, "p1", timestamp=now, source_type="gmail", title="→ Sent")
+        self._add(temp_store, "p1", timestamp=now, source_type="gmail", title="← Received")
+
+        counts = temp_store.get_person_counts(
+            now - timedelta(days=1), now + timedelta(days=1), gmail_sent_only=True,
+        )
+        assert counts.get("p1") == 1
+
+    # ---- get_daily_person_source_counts ----
+
+    def test_get_daily_person_source_counts_groups_by_day_person_and_source(self, temp_store):
+        now = datetime.now(timezone.utc)
+        self._add(temp_store, "p1", timestamp=now, source_type="imessage")
+        self._add(temp_store, "p1", timestamp=now, source_type="imessage")
+        self._add(temp_store, "p1", timestamp=now, source_type="gmail", title="→ Hi")
+        self._add(temp_store, "p2", timestamp=now, source_type="phone")
+
+        rows = temp_store.get_daily_person_source_counts(
+            now - timedelta(days=1), now + timedelta(days=1),
+        )
+        as_dict = {(day, pid, source): cnt for day, pid, source, cnt in rows}
+        day_key = now.strftime('%Y-%m-%d')
+        assert as_dict.get((day_key, "p1", "imessage")) == 2
+        assert as_dict.get((day_key, "p1", "gmail")) == 1
+        assert as_dict.get((day_key, "p2", "phone")) == 1
+        # One grouped row for p1's two imessage rows, not two individual rows.
+        assert len([r for r in rows if r[1] == "p1" and r[2] == "imessage"]) == 1
+
+    def test_get_daily_person_source_counts_gmail_sent_only(self, temp_store):
+        now = datetime.now(timezone.utc)
+        self._add(temp_store, "p1", timestamp=now, source_type="gmail", title="→ Sent")
+        self._add(temp_store, "p1", timestamp=now, source_type="gmail", title="← Received")
+
+        rows = temp_store.get_daily_person_source_counts(
+            now - timedelta(days=1), now + timedelta(days=1), gmail_sent_only=True,
+        )
+        total = sum(cnt for _, pid, source, cnt in rows if pid == "p1" and source == "gmail")
+        assert total == 1
+
+    # ---- get_person_julianday_timestamps ----
+
+    def test_get_person_julianday_timestamps_restricted_and_covering(self, temp_store):
+        now = datetime.now(timezone.utc)
+        self._add(temp_store, "p1", timestamp=now, source_type="imessage")
+        self._add(temp_store, "p1", timestamp=now - timedelta(days=1), source_type="gmail", title="← Received")
+        self._add(temp_store, "p2", timestamp=now, source_type="imessage")
+
+        rows = temp_store.get_person_julianday_timestamps(
+            now - timedelta(days=2), now + timedelta(days=1), person_ids=["p1"],
+        )
+        # Both of p1's rows returned regardless of source_type (unlike the
+        # health-score path, neglected-contacts considers every interaction
+        # type) and p2 is excluded by person_ids.
+        assert len(rows) == 2
+        assert all(pid == "p1" for pid, _jd in rows)
+        jds = sorted(jd for _pid, jd in rows)
+        # The two interactions are ~1 day apart.
+        assert 0.9 < (jds[1] - jds[0]) < 1.1
+
+    def test_get_person_julianday_timestamps_exclude_person_ids(self, temp_store):
+        now = datetime.now(timezone.utc)
+        self._add(temp_store, "p1", timestamp=now)
+        self._add(temp_store, "p2", timestamp=now)
+
+        rows = temp_store.get_person_julianday_timestamps(
+            now - timedelta(days=1), now + timedelta(days=1),
+            person_ids=["p1", "p2"], exclude_person_ids=["p2"],
+        )
+        assert {pid for pid, _jd in rows} == {"p1"}
+
+    def test_get_julianday_matches_person_julianday_timestamps(self, temp_store):
+        """get_julianday(now) should be directly comparable to (and roughly
+        equal to, for a "now" timestamp) the julianday values
+        get_person_julianday_timestamps returns for a row stored at "now"."""
+        now = datetime.now(timezone.utc)
+        self._add(temp_store, "p1", timestamp=now)
+
+        # end_date is a day-string bound (not exact) here, and its own
+        # calendar day is excluded (the documented end-date quirk — see
+        # _range_predicate) — push the upper bound into tomorrow so "now"'s
+        # row isn't sitting on that excluded boundary.
+        rows = temp_store.get_person_julianday_timestamps(
+            now - timedelta(days=1), now + timedelta(days=1), person_ids=["p1"],
+        )
+        assert len(rows) == 1
+        stored_jd = rows[0][1]
+        now_jd = temp_store.get_julianday(now)
+        assert abs(now_jd - stored_jd) < 0.0001  # well under a second
+
+    # ---- get_bucketed_counts ----
+
+    def test_get_bucketed_counts_matches_manual_bucketing(self, temp_store):
+        now = datetime.now(timezone.utc)
+        # One interaction per day for the last 5 days.
+        for days_ago in range(5):
+            self._add(temp_store, "p1", timestamp=now - timedelta(days=days_ago), source_type="imessage")
+
+        # Three time points 2 days apart: buckets are
+        # (points[0]-2d, points[0]], (points[0], points[1]], (points[1], points[2]].
+        points = [now - timedelta(days=4), now - timedelta(days=2), now]
+        counts = temp_store.get_bucketed_counts(points, person_ids=["p1"])
+        assert len(counts) == 3
+        assert sum(counts) == 5  # every interaction falls in exactly one bucket
+
+    def test_get_bucketed_counts_respects_source_types_and_exclusion(self, temp_store):
+        now = datetime.now(timezone.utc)
+        self._add(temp_store, "p1", timestamp=now, source_type="imessage")
+        self._add(temp_store, "p1", timestamp=now, source_type="vault")  # excluded by source_types
+        self._add(temp_store, "p2", timestamp=now, source_type="imessage")  # excluded by exclude_person_ids
+
+        counts = temp_store.get_bucketed_counts(
+            [now], person_ids=["p1", "p2"], exclude_person_ids=["p2"],
+            source_types=["imessage"],
+        )
+        assert counts == [1]
+
+    def test_get_bucketed_counts_empty_time_points(self, temp_store):
+        assert temp_store.get_bucketed_counts([]) == []
+
+    # ---- _range_predicate pool_start_date/pool_end_date ----
+
+    def test_pool_bounds_clip_an_exact_window_that_extends_before_the_pool(self, temp_store):
+        """
+        An exact-mode window (e.g. a trend period) that reaches further
+        back than the outer "pool" window (e.g. days_back) must be clipped
+        to the pool.
+        """
+        now = datetime.now(timezone.utc)
+        pool_start = now - timedelta(days=10)  # e.g. "days_back=10"
+        exact_start = now - timedelta(days=30)  # e.g. a 30-day trend window
+
+        self._add(temp_store, "p1", timestamp=now - timedelta(days=5))  # inside the pool
+        self._add(temp_store, "p1", timestamp=now - timedelta(days=20))  # before the pool
+
+        # Without pool bounds: both rows count (the exact window alone
+        # reaches back 30 days).
+        unclipped = temp_store.get_person_counts(exact_start, now, exact=True)
+        assert unclipped.get("p1") == 2
+
+        # With pool bounds: only the row inside the pool counts.
+        clipped = temp_store.get_person_counts(
+            exact_start, now, exact=True, pool_start_date=pool_start, pool_end_date=now,
+        )
+        assert clipped.get("p1") == 1
+
+    def test_get_person_counts_no_exact_end_bound(self, temp_store):
+        """end_date=None with exact=True omits the exact upper bound
+        entirely (matching e.g. the original `if ts >= thirty_days_ago:`
+        check, which had no upper cutoff of its own)."""
+        now = datetime.now(timezone.utc)
+        self._add(temp_store, "p1", timestamp=now)
+
+        counts = temp_store.get_person_counts(
+            now - timedelta(days=1), None, exact=True,
+            pool_start_date=now - timedelta(days=2), pool_end_date=now + timedelta(days=1),
+        )
+        assert counts.get("p1") == 1
+
+    # ---- get_all_in_range: new person_ids restriction ----
+
+    def test_get_all_in_range_person_ids_restricts_results(self, temp_store):
+        now = datetime.now(timezone.utc)
+        self._add(temp_store, "p1", timestamp=now)
+        self._add(temp_store, "p2", timestamp=now)
+
+        results = temp_store.get_all_in_range(
+            start_date=now - timedelta(days=1), end_date=now + timedelta(days=1),
+            person_ids=["p1"],
+        )
+        assert {i.person_id for i in results} == {"p1"}
+
+    def test_get_all_in_range_empty_person_ids_matches_nothing(self, temp_store):
+        now = datetime.now(timezone.utc)
+        self._add(temp_store, "p1", timestamp=now)
+
+        results = temp_store.get_all_in_range(
+            start_date=now - timedelta(days=1), end_date=now + timedelta(days=1),
+            person_ids=[],
+        )
+        assert results == []
+
+    def test_get_all_in_range_person_ids_combines_with_exclude(self, temp_store):
+        now = datetime.now(timezone.utc)
+        self._add(temp_store, "p1", timestamp=now)
+        self._add(temp_store, "p2", timestamp=now)
+
+        results = temp_store.get_all_in_range(
+            start_date=now - timedelta(days=1), end_date=now + timedelta(days=1),
+            person_ids=["p1", "p2"], exclude_person_ids=["p2"],
+        )
+        assert {i.person_id for i in results} == {"p1"}

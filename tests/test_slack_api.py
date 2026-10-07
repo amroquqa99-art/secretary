@@ -1,0 +1,750 @@
+"""
+Tests for api/routes/slack.py
+
+Tests Slack integration endpoints for search, conversations, and sync.
+"""
+import pytest
+from unittest.mock import MagicMock, patch
+from fastapi.testclient import TestClient
+
+from api.main import app
+
+
+# =============================================================================
+# Fixtures
+# =============================================================================
+
+@pytest.fixture
+def client():
+    """Create a test client for the API."""
+    return TestClient(app)
+
+
+@pytest.fixture
+def mock_slack_client():
+    """Create a mock Slack client."""
+    client = MagicMock()
+    client.is_connected.return_value = True
+    return client
+
+
+@pytest.fixture
+def mock_slack_indexer():
+    """Create a mock Slack indexer."""
+    indexer = MagicMock()
+    indexer.get_message_count.return_value = 1500
+    indexer.get_indexed_channels.return_value = ["C123", "C456"]
+    return indexer
+
+
+@pytest.fixture
+def sample_search_results():
+    """Sample search results from indexer."""
+    return [
+        {
+            "content": "Let's discuss the budget tomorrow",
+            "channel_id": "C123",
+            "channel_name": "general",
+            "channel_type": "channel",
+            "user_id": "U123",
+            "user_name": "john.doe",
+            "timestamp": "2026-01-30T10:00:00",
+            "thread_ts": None,
+            "score": 0.95,
+            "semantic_score": 0.92,
+            "recency_score": 0.98,
+        },
+        {
+            "content": "Budget approved by finance",
+            "channel_id": "C456",
+            "channel_name": "finance",
+            "channel_type": "channel",
+            "user_id": "U456",
+            "user_name": "jane.smith",
+            "timestamp": "2026-01-29T15:30:00",
+            "thread_ts": "1706540000.000000",
+            "score": 0.88,
+            "semantic_score": 0.85,
+            "recency_score": 0.91,
+        },
+    ]
+
+
+# =============================================================================
+# GET /api/slack/status Tests
+# =============================================================================
+
+@pytest.mark.unit
+class TestSlackStatus:
+    """Tests for GET /api/slack/status endpoint."""
+
+    def test_status_when_disabled(self, client):
+        """Test status when Slack is disabled."""
+        with patch("api.routes.slack.is_slack_enabled", return_value=False):
+            response = client.get("/api/slack/status")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["enabled"] is False
+        assert data["connected"] is False
+        assert data["indexed_messages"] == 0
+        assert data["indexed_channels"] == 0
+
+    def test_status_when_enabled_and_connected(
+        self, client, mock_slack_client, mock_slack_indexer
+    ):
+        """Test status when Slack is enabled and connected."""
+        with patch("api.routes.slack.is_slack_enabled", return_value=True), \
+             patch("api.routes.slack.get_slack_client", return_value=mock_slack_client), \
+             patch("api.routes.slack.get_slack_indexer", return_value=mock_slack_indexer):
+            response = client.get("/api/slack/status")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["enabled"] is True
+        assert data["connected"] is True
+        assert data["indexed_messages"] == 1500
+        assert data["indexed_channels"] == 2
+
+    def test_status_handles_connection_error(self, client):
+        """Test status when connection check fails."""
+        with patch("api.routes.slack.is_slack_enabled", return_value=True), \
+             patch("api.routes.slack.get_slack_client", side_effect=Exception("Connection failed")):
+            response = client.get("/api/slack/status")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["enabled"] is True
+        assert data["connected"] is False
+
+
+# =============================================================================
+# POST /api/slack/search Tests
+# =============================================================================
+
+@pytest.mark.unit
+class TestSlackSearch:
+    """Tests for POST /api/slack/search endpoint."""
+
+    def test_search_when_disabled(self, client):
+        """Test search when Slack is disabled."""
+        with patch("api.routes.slack.is_slack_enabled", return_value=False):
+            response = client.post(
+                "/api/slack/search",
+                json={"query": "budget"}
+            )
+
+        assert response.status_code == 503
+        assert "not enabled" in response.json()["detail"].lower()
+
+    def test_search_success(
+        self, client, mock_slack_indexer, sample_search_results
+    ):
+        """Test successful search."""
+        mock_slack_indexer.search.return_value = sample_search_results
+
+        with patch("api.routes.slack.is_slack_enabled", return_value=True), \
+             patch("api.routes.slack.get_slack_indexer", return_value=mock_slack_indexer):
+            response = client.post(
+                "/api/slack/search",
+                json={"query": "budget"}
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data["results"]) == 2
+        assert data["total_indexed"] == 1500
+        assert "query_time_ms" in data
+
+    def test_search_result_fields(
+        self, client, mock_slack_indexer, sample_search_results
+    ):
+        """Test search result field structure."""
+        mock_slack_indexer.search.return_value = sample_search_results
+
+        with patch("api.routes.slack.is_slack_enabled", return_value=True), \
+             patch("api.routes.slack.get_slack_indexer", return_value=mock_slack_indexer):
+            response = client.post(
+                "/api/slack/search",
+                json={"query": "budget"}
+            )
+
+        assert response.status_code == 200
+        result = response.json()["results"][0]
+
+        assert result["content"] == "Let's discuss the budget tomorrow"
+        assert result["channel_id"] == "C123"
+        assert result["channel_name"] == "general"
+        assert result["user_name"] == "john.doe"
+        assert result["score"] == 0.95
+
+    def test_search_with_filters(
+        self, client, mock_slack_indexer, sample_search_results
+    ):
+        """Test search with channel and user filters."""
+        mock_slack_indexer.search.return_value = sample_search_results[:1]
+
+        with patch("api.routes.slack.is_slack_enabled", return_value=True), \
+             patch("api.routes.slack.get_slack_indexer", return_value=mock_slack_indexer):
+            response = client.post(
+                "/api/slack/search",
+                json={
+                    "query": "budget",
+                    "channel_id": "C123",
+                    "channel_type": "channel",
+                    "user_id": "U123",
+                    "top_k": 10
+                }
+            )
+
+        assert response.status_code == 200
+        mock_slack_indexer.search.assert_called_once_with(
+            query="budget",
+            top_k=10,
+            channel_id="C123",
+            channel_type="channel",
+            user_id="U123"
+        )
+
+    def test_search_empty_query_validation(self, client):
+        """Test that empty query is rejected."""
+        with patch("api.routes.slack.is_slack_enabled", return_value=True):
+            response = client.post(
+                "/api/slack/search",
+                json={"query": ""}
+            )
+
+        # FastAPI validation error (400 or 422)
+        assert response.status_code in (400, 422)
+
+    def test_search_top_k_limits(self, client, mock_slack_indexer):
+        """Test top_k validation limits."""
+        mock_slack_indexer.search.return_value = []
+
+        with patch("api.routes.slack.is_slack_enabled", return_value=True), \
+             patch("api.routes.slack.get_slack_indexer", return_value=mock_slack_indexer):
+            # top_k too high
+            response = client.post(
+                "/api/slack/search",
+                json={"query": "test", "top_k": 200}
+            )
+            assert response.status_code in (400, 422)
+
+            # top_k too low
+            response = client.post(
+                "/api/slack/search",
+                json={"query": "test", "top_k": 0}
+            )
+            assert response.status_code in (400, 422)
+
+
+# =============================================================================
+# GET /api/slack/search Tests
+# =============================================================================
+
+@pytest.mark.unit
+class TestSlackSearchGet:
+    """Tests for GET /api/slack/search endpoint."""
+
+    def test_search_get_success(
+        self, client, mock_slack_indexer, sample_search_results
+    ):
+        """Test GET search endpoint."""
+        mock_slack_indexer.search.return_value = sample_search_results
+
+        with patch("api.routes.slack.is_slack_enabled", return_value=True), \
+             patch("api.routes.slack.get_slack_indexer", return_value=mock_slack_indexer):
+            response = client.get("/api/slack/search?q=budget")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data["results"]) == 2
+
+    def test_search_get_with_params(
+        self, client, mock_slack_indexer, sample_search_results
+    ):
+        """Test GET search with query parameters."""
+        mock_slack_indexer.search.return_value = sample_search_results[:1]
+
+        with patch("api.routes.slack.is_slack_enabled", return_value=True), \
+             patch("api.routes.slack.get_slack_indexer", return_value=mock_slack_indexer):
+            response = client.get(
+                "/api/slack/search",
+                params={
+                    "q": "budget",
+                    "top_k": 5,
+                    "channel_id": "C123"
+                }
+            )
+
+        assert response.status_code == 200
+
+    def test_search_get_missing_query(self, client):
+        """Test GET search without query parameter."""
+        with patch("api.routes.slack.is_slack_enabled", return_value=True):
+            response = client.get("/api/slack/search")
+
+        # FastAPI validation error (400 or 422)
+        assert response.status_code in (400, 422)
+
+
+# =============================================================================
+# GET /api/slack/conversations Tests
+# =============================================================================
+
+@pytest.mark.unit
+class TestSlackConversations:
+    """Tests for GET /api/slack/conversations endpoint."""
+
+    def test_conversations_when_disabled(self, client):
+        """Test conversations when Slack is disabled."""
+        with patch("api.routes.slack.is_slack_enabled", return_value=False):
+            response = client.get("/api/slack/conversations")
+
+        assert response.status_code == 503
+
+    def test_conversations_success(self, client, mock_slack_client):
+        """Test listing conversations successfully."""
+        # Create mock channel objects
+        mock_channel = MagicMock()
+        mock_channel.channel_id = "C123"
+        mock_channel.name = "general"
+        mock_channel.is_private = False
+        mock_channel.is_im = False
+        mock_channel.is_mpim = False
+        mock_channel.member_count = 50
+
+        mock_slack_client.list_channels.return_value = [mock_channel]
+
+        with patch("api.routes.slack.is_slack_enabled", return_value=True), \
+             patch("api.routes.slack.get_slack_client", return_value=mock_slack_client):
+            response = client.get("/api/slack/conversations")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["total"] == 1
+        assert len(data["channels"]) == 1
+        assert data["channels"][0]["channel_id"] == "C123"
+        assert data["channels"][0]["display_name"] == "#general"
+
+    def test_conversations_dm_display_name(self, client, mock_slack_client):
+        """Test DM display name formatting."""
+        mock_channel = MagicMock()
+        mock_channel.channel_id = "D123"
+        mock_channel.name = "U456"
+        mock_channel.is_private = True
+        mock_channel.is_im = True
+        mock_channel.is_mpim = False
+        mock_channel.member_count = 2
+
+        mock_user = MagicMock()
+        mock_user.real_name = "John Doe"
+        mock_user.display_name = "johnd"
+        mock_user.username = "john.doe"
+
+        mock_slack_client.list_channels.return_value = [mock_channel]
+        mock_slack_client.get_user_cached.return_value = mock_user
+
+        with patch("api.routes.slack.is_slack_enabled", return_value=True), \
+             patch("api.routes.slack.get_slack_client", return_value=mock_slack_client):
+            response = client.get("/api/slack/conversations")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert "DM with John Doe" in data["channels"][0]["display_name"]
+
+    def test_conversations_api_error(self, client, mock_slack_client):
+        """Test handling of Slack API errors."""
+        from api.services.slack_integration import SlackAPIError
+
+        mock_slack_client.list_channels.side_effect = SlackAPIError("rate_limited")
+
+        with patch("api.routes.slack.is_slack_enabled", return_value=True), \
+             patch("api.routes.slack.get_slack_client", return_value=mock_slack_client):
+            response = client.get("/api/slack/conversations")
+
+        assert response.status_code == 502
+        assert "slack api error" in response.json()["detail"].lower()
+
+
+# =============================================================================
+# POST /api/slack/sync Tests
+# =============================================================================
+
+@pytest.mark.unit
+class TestSlackSync:
+    """Tests for POST /api/slack/sync endpoint."""
+
+    def test_sync_when_disabled(self, client):
+        """Test sync when Slack is disabled."""
+        with patch("api.routes.slack.is_slack_enabled", return_value=False):
+            response = client.post("/api/slack/sync")
+
+        assert response.status_code == 503
+
+    def test_sync_success(self, client):
+        """Test successful sync."""
+        sync_result = {
+            "status": "success",
+            "users": {"created": 5, "updated": 10},
+            "messages": {
+                "messages_indexed": 150,
+                "interactions_created": 30,
+                "errors": []
+            },
+            "elapsed_seconds": 5.5,
+            "errors": []
+        }
+
+        with patch("api.routes.slack.is_slack_enabled", return_value=True), \
+             patch("api.routes.slack.run_slack_sync", return_value=sync_result):
+            response = client.post("/api/slack/sync")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "success"
+        assert data["messages_indexed"] == 150
+        assert data["interactions_created"] == 30
+        assert data["users_synced"] == 15
+        assert data["elapsed_seconds"] == 5.5
+
+    def test_sync_with_full_flag(self, client):
+        """Test sync with full=true flag."""
+        sync_result = {
+            "status": "success",
+            "messages_indexed": 500,
+            "interactions_created": 100,
+            "elapsed_seconds": 30.0,
+            "errors": []
+        }
+
+        with patch("api.routes.slack.is_slack_enabled", return_value=True), \
+             patch("api.routes.slack.run_slack_sync", return_value=sync_result) as mock_sync:
+            response = client.post("/api/slack/sync?full=true")
+
+        assert response.status_code == 200
+        mock_sync.assert_called_once_with(full=True)
+
+    def test_sync_handles_errors(self, client):
+        """Test sync error handling."""
+        with patch("api.routes.slack.is_slack_enabled", return_value=True), \
+             patch("api.routes.slack.run_slack_sync", side_effect=Exception("Sync failed")):
+            response = client.post("/api/slack/sync")
+
+        assert response.status_code == 500
+        assert "sync failed" in response.json()["detail"].lower()
+
+
+# =============================================================================
+# GET /api/slack/channels/{channel_id}/messages Tests
+# =============================================================================
+
+@pytest.mark.unit
+class TestSlackChannelMessages:
+    """Tests for GET /api/slack/channels/{channel_id}/messages endpoint."""
+
+    def test_channel_messages_when_disabled(self, client):
+        """Test channel messages when Slack is disabled."""
+        with patch("api.routes.slack.is_slack_enabled", return_value=False):
+            response = client.get("/api/slack/channels/C123/messages")
+
+        assert response.status_code == 503
+
+    def test_channel_messages_success(self, client, mock_slack_client):
+        """Test getting channel messages successfully."""
+        mock_message = MagicMock()
+        mock_message.to_dict.return_value = {
+            "ts": "1706540000.000000",
+            "user": "U123",
+            "text": "Hello world",
+        }
+
+        mock_slack_client.get_channel_history.return_value = [mock_message]
+
+        with patch("api.routes.slack.is_slack_enabled", return_value=True), \
+             patch("api.routes.slack.get_slack_client", return_value=mock_slack_client):
+            response = client.get("/api/slack/channels/C123/messages")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["count"] == 1
+        assert len(data["messages"]) == 1
+
+    def test_channel_messages_with_limit(self, client, mock_slack_client):
+        """Test channel messages with limit parameter."""
+        mock_slack_client.get_channel_history.return_value = []
+
+        with patch("api.routes.slack.is_slack_enabled", return_value=True), \
+             patch("api.routes.slack.get_slack_client", return_value=mock_slack_client):
+            response = client.get("/api/slack/channels/C123/messages?limit=50")
+
+        assert response.status_code == 200
+        mock_slack_client.get_channel_history.assert_called_once()
+        call_kwargs = mock_slack_client.get_channel_history.call_args[1]
+        assert call_kwargs["limit"] == 50
+
+    def test_channel_messages_with_timestamps(self, client, mock_slack_client):
+        """Test channel messages with timestamp filters."""
+        mock_slack_client.get_channel_history.return_value = []
+
+        with patch("api.routes.slack.is_slack_enabled", return_value=True), \
+             patch("api.routes.slack.get_slack_client", return_value=mock_slack_client):
+            response = client.get(
+                "/api/slack/channels/C123/messages",
+                params={
+                    "oldest": "2026-01-01T00:00:00",
+                    "latest": "2026-01-30T23:59:59"
+                }
+            )
+
+        assert response.status_code == 200
+
+    def test_channel_messages_invalid_timestamp(self, client, mock_slack_client):
+        """Test channel messages with invalid timestamp format."""
+        with patch("api.routes.slack.is_slack_enabled", return_value=True), \
+             patch("api.routes.slack.get_slack_client", return_value=mock_slack_client):
+            response = client.get(
+                "/api/slack/channels/C123/messages",
+                params={"oldest": "invalid-timestamp"}
+            )
+
+        assert response.status_code == 400
+        assert "invalid" in response.json()["detail"].lower()
+
+    def test_channel_messages_api_error(self, client, mock_slack_client):
+        """Test handling of Slack API errors."""
+        from api.services.slack_integration import SlackAPIError
+
+        mock_slack_client.get_channel_history.side_effect = SlackAPIError("channel_not_found")
+
+        with patch("api.routes.slack.is_slack_enabled", return_value=True), \
+             patch("api.routes.slack.get_slack_client", return_value=mock_slack_client):
+            response = client.get("/api/slack/channels/C123/messages")
+
+        assert response.status_code == 502
+
+
+# =============================================================================
+# Response Model Tests
+# =============================================================================
+
+@pytest.mark.unit
+class TestSlackResponseModels:
+    """Tests for response model structure validation."""
+
+    def test_status_response_structure(self, client):
+        """Test SlackStatusResponse has all required fields."""
+        with patch("api.routes.slack.is_slack_enabled", return_value=False):
+            response = client.get("/api/slack/status")
+
+        assert response.status_code == 200
+        data = response.json()
+
+        required_fields = ["enabled", "connected", "indexed_messages", "indexed_channels"]
+        for field in required_fields:
+            assert field in data, f"Missing field: {field}"
+
+    def test_search_response_structure(
+        self, client, mock_slack_indexer, sample_search_results
+    ):
+        """Test SlackSearchResponse has all required fields."""
+        mock_slack_indexer.search.return_value = sample_search_results
+
+        with patch("api.routes.slack.is_slack_enabled", return_value=True), \
+             patch("api.routes.slack.get_slack_indexer", return_value=mock_slack_indexer):
+            response = client.post(
+                "/api/slack/search",
+                json={"query": "test"}
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+
+        required_fields = ["results", "query_time_ms", "total_indexed"]
+        for field in required_fields:
+            assert field in data, f"Missing field: {field}"
+
+        # Check result structure
+        result = data["results"][0]
+        result_fields = [
+            "content", "channel_id", "channel_name", "channel_type",
+            "user_id", "user_name", "timestamp", "score"
+        ]
+        for field in result_fields:
+            assert field in result, f"Missing result field: {field}"
+
+
+# =============================================================================
+# GET /api/slack/my-messages Tests
+# =============================================================================
+
+@pytest.mark.unit
+class TestSlackMyMessages:
+    """Tests for GET /api/slack/my-messages — the day-pull endpoint."""
+
+    def _match(self, ts="1751980000.000100", text="hello team",
+               channel=None, permalink=None):
+        return {
+            "type": "message",
+            "ts": ts,
+            "text": text,
+            "user": "U08GTEST001",
+            "username": "testuser",
+            "channel": channel or {"id": "C123", "name": "general",
+                                   "is_private": False},
+            "permalink": permalink or "https://example.slack.com/archives/C123/p1751980000000100",
+        }
+
+    def _mock_client(self, matches=None, user_id="U08GTEST001",
+                     truncated=False, total_available=None):
+        matches = matches if matches is not None else []
+        mock = MagicMock()
+        mock.auth_test.return_value = {"ok": True, "user_id": user_id, "user": "testuser"}
+        mock.search_messages.return_value = {
+            "matches": matches,
+            "truncated": truncated,
+            "total_available": total_available if total_available is not None else len(matches),
+        }
+        return mock
+
+    def test_when_disabled(self, client):
+        with patch("api.routes.slack.is_slack_enabled", return_value=False):
+            response = client.get("/api/slack/my-messages?date=2026-07-08")
+
+        assert response.status_code == 503
+
+    def test_invalid_date_rejected(self, client):
+        with patch("api.routes.slack.is_slack_enabled", return_value=True):
+            response = client.get("/api/slack/my-messages?date=July-8th")
+
+        assert response.status_code == 400
+
+    def test_non_zero_padded_date_rejected(self, client):
+        """strptime alone would accept 2026-7-8 — the endpoint must not."""
+        with patch("api.routes.slack.is_slack_enabled", return_value=True):
+            response = client.get("/api/slack/my-messages?date=2026-7-8")
+
+        assert response.status_code == 400
+
+    def test_malformed_user_rejected(self, client):
+        """user is interpolated into the Slack query — a crafted value must
+        not be able to replace the from: filter."""
+        mock = self._mock_client()
+
+        with patch("api.routes.slack.is_slack_enabled", return_value=True), \
+             patch("api.routes.slack.get_slack_client", return_value=mock):
+            response = client.get(
+                "/api/slack/my-messages",
+                params={"date": "2026-07-08", "user": "foo bar on:2020-01-01"},
+            )
+
+        assert response.status_code == 400
+        mock.search_messages.assert_not_called()
+
+    def test_success_builds_query_from_auth_test(self, client):
+        mock = self._mock_client(matches=[self._match()])
+
+        with patch("api.routes.slack.is_slack_enabled", return_value=True), \
+             patch("api.routes.slack.get_slack_client", return_value=mock):
+            response = client.get("/api/slack/my-messages?date=2026-07-08")
+
+        assert response.status_code == 200
+        mock.auth_test.assert_called_once()
+        query = mock.search_messages.call_args.kwargs["query"]
+        assert query == "from:<@U08GTEST001> on:2026-07-08"
+
+        data = response.json()
+        assert data["date"] == "2026-07-08"
+        assert data["user_id"] == "U08GTEST001"
+        assert data["total"] == 1
+        assert data["truncated"] is False
+        assert data["total_available"] == 1
+        assert data["messages"][0]["text"] == "hello team"
+        assert data["messages"][0]["channel_id"] == "C123"
+        assert data["messages"][0]["channel_name"] == "general"
+
+    def test_explicit_user_param_skips_auth_test(self, client):
+        mock = self._mock_client()
+
+        with patch("api.routes.slack.is_slack_enabled", return_value=True), \
+             patch("api.routes.slack.get_slack_client", return_value=mock):
+            response = client.get("/api/slack/my-messages?date=2026-07-08&user=U99EXPLICIT")
+
+        assert response.status_code == 200
+        mock.auth_test.assert_not_called()
+        query = mock.search_messages.call_args.kwargs["query"]
+        assert "from:<@U99EXPLICIT>" in query
+
+    def test_truncated_pull_surfaced_in_response(self, client):
+        """A >max_pages day must not masquerade as a complete pull."""
+        mock = self._mock_client(matches=[self._match()],
+                                 truncated=True, total_available=1234)
+
+        with patch("api.routes.slack.is_slack_enabled", return_value=True), \
+             patch("api.routes.slack.get_slack_client", return_value=mock):
+            response = client.get("/api/slack/my-messages?date=2026-07-08")
+
+        data = response.json()
+        assert data["truncated"] is True
+        assert data["total_available"] == 1234
+        assert data["total"] == 1
+
+    def test_missing_scope_gives_actionable_403(self, client):
+        from api.services.slack_integration import SlackAPIError
+
+        mock = self._mock_client()
+        mock.search_messages.side_effect = SlackAPIError("missing_scope")
+
+        with patch("api.routes.slack.is_slack_enabled", return_value=True), \
+             patch("api.routes.slack.get_slack_client", return_value=mock):
+            response = client.get("/api/slack/my-messages?date=2026-07-08")
+
+        assert response.status_code == 403
+        assert "search:read" in response.json()["detail"]
+
+    def test_other_slack_error_gives_502(self, client):
+        from api.services.slack_integration import SlackAPIError
+
+        mock = self._mock_client()
+        mock.search_messages.side_effect = SlackAPIError("fatal_error")
+
+        with patch("api.routes.slack.is_slack_enabled", return_value=True), \
+             patch("api.routes.slack.get_slack_client", return_value=mock):
+            response = client.get("/api/slack/my-messages?date=2026-07-08")
+
+        assert response.status_code == 502
+
+    def test_channel_type_derivation(self, client):
+        matches = [
+            self._match(ts="1751980000.000100",
+                        channel={"id": "D1", "name": "U123", "is_im": True}),
+            self._match(ts="1751980001.000100",
+                        channel={"id": "G1", "name": "mpdm-a--b--c-1",
+                                 "is_mpim": True, "is_private": True}),
+            self._match(ts="1751980002.000100",
+                        channel={"id": "G2", "name": "private-proj",
+                                 "is_private": True}),
+            self._match(ts="1751980003.000100",
+                        channel={"id": "C1", "name": "general"}),
+        ]
+        mock = self._mock_client(matches=matches)
+
+        with patch("api.routes.slack.is_slack_enabled", return_value=True), \
+             patch("api.routes.slack.get_slack_client", return_value=mock):
+            response = client.get("/api/slack/my-messages?date=2026-07-08")
+
+        types = [m["channel_type"] for m in response.json()["messages"]]
+        assert types == ["im", "mpim", "group", "channel"]
+
+    def test_thread_ts_extracted_from_permalink(self, client):
+        matches = [self._match(
+            permalink="https://example.slack.com/archives/C123/p1751980000000100"
+                      "?thread_ts=1751970000.000500&cid=C123",
+        )]
+        mock = self._mock_client(matches=matches)
+
+        with patch("api.routes.slack.is_slack_enabled", return_value=True), \
+             patch("api.routes.slack.get_slack_client", return_value=mock):
+            response = client.get("/api/slack/my-messages?date=2026-07-08")
+
+        assert response.json()["messages"][0]["thread_ts"] == "1751970000.000500"

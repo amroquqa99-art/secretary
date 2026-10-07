@@ -1,0 +1,486 @@
+"""Tests for card-assignment threading into CodexExecutor:
+model/effort flags, host resolution, remote ssh wrapping + pgid capture,
+and the unknown-host failure path (no ssh call).
+"""
+from __future__ import annotations
+
+import json
+import tomllib
+from pathlib import Path
+from typing import Iterable
+
+import pytest
+
+from api.services.agent_worker.codex_executor import _IDENTITY_ENV_VARS, CodexExecutor
+from api.services.agent_worker.session_store import STATUS_FAILED, SessionStore
+from api.services.agent_worker.transcript_store import TranscriptStore
+
+
+pytestmark = pytest.mark.unit
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_cwd(tmp_path, monkeypatch):
+    """`execute()` falls back to `os.getcwd()` when a task carries no
+    `working_dir` (the tests below never set one), which then feeds
+    `git_discipline_text` a real git inspection of wherever the process
+    happens to be running. Confine that fallback to this test's own
+    tmp_path."""
+    monkeypatch.chdir(tmp_path)
+
+
+class _FakeStdout:
+    def __init__(self, lines: list[str]):
+        self._lines = list(lines)
+        self._idx = 0
+
+    def readline(self) -> str:
+        if self._idx >= len(self._lines):
+            return ""
+        line = self._lines[self._idx]
+        self._idx += 1
+        return line
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        line = self.readline()
+        if line == "":
+            raise StopIteration
+        return line
+
+
+class _FakeStderr:
+    def read(self) -> str:
+        return ""
+
+
+class _FakeProc:
+    def __init__(self, lines: list[str], pid: int = 5151, returncode: int = 0):
+        self.stdout = _FakeStdout(lines)
+        self.stderr = _FakeStderr()
+        self.pid = pid
+        self.returncode = returncode
+
+    def wait(self, timeout: float | None = None) -> int:
+        return self.returncode
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        pass
+
+    def kill(self):
+        pass
+
+
+def _lines_for(events: Iterable[dict], pgid_line: str | None = None) -> list[str]:
+    lines = [json.dumps(e) + "\n" for e in events]
+    return ([pgid_line] if pgid_line else []) + lines
+
+
+_THREAD_EVENT = {"type": "thread.started", "thread_id": "cx-thread-1"}
+_TURN_COMPLETED = {"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}}
+_SESSION_COMPLETED = {"type": "session.completed"}
+_AGENT_MESSAGE_COMPLETED = {
+    "type": "item.completed",
+    "item": {"type": "agent_message", "text": "done remotely"},
+}
+
+
+def _build(tmp_path: Path, monkeypatch, *, spawn_calls: list, lines: list[str],
+           agent_hosts: dict | None = None):
+    store = SessionStore(db_path=tmp_path / "sessions.db")
+    transcripts = TranscriptStore(transcripts_dir=tmp_path / "transcripts")
+
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_hosts", agent_hosts or {}, raising=False)
+
+    def _spawn_fn(cmd, **kwargs):
+        spawn_calls.append((cmd, kwargs))
+        return _FakeProc(lines)
+
+    executor = CodexExecutor(
+        session_store=store, transcript_store=transcripts, spawn_fn=_spawn_fn,
+    )
+    return store, executor
+
+
+def test_model_and_effort_flags_in_argv(tmp_path, monkeypatch):
+    """AC2: a codex-tagged task with model/effort fields spawns with
+    `--model gpt-5.5` and `-c model_reasoning_effort=high`."""
+    spawn_calls: list = []
+    lines = _lines_for([_THREAD_EVENT, _TURN_COMPLETED, _SESSION_COMPLETED])
+    store, executor = _build(tmp_path, monkeypatch, spawn_calls=spawn_calls, lines=lines)
+    session = store.create(task_id="t1", routing="codex", model="gpt-5.5", effort="high")
+    outcome = executor.execute(session, {"description": "do the thing"})
+    assert outcome.status != STATUS_FAILED
+    cmd = spawn_calls[0][0]
+    assert "--model" in cmd and cmd[cmd.index("--model") + 1] == "gpt-5.5"
+    assert "-c" in cmd
+    assert "model_reasoning_effort=high" in cmd
+
+
+def _mcp_env_vars_override(cmd: list[str]) -> str | None:
+    """Locate the `-c mcp_servers.lifeos.env_vars=[...]` argv pair's value,
+    or None when no such pair is present."""
+    for i, tok in enumerate(cmd):
+        if tok == "-c" and i + 1 < len(cmd) and cmd[i + 1].startswith(
+            "mcp_servers.lifeos.env_vars=",
+        ):
+            return cmd[i + 1]
+    return None
+
+
+def _write_codex_config_with_lifeos_server(tmp_path: Path, monkeypatch) -> None:
+    """Point CODEX_HOME at a tmp config declaring `[mcp_servers.lifeos]` —
+    `_build_command` only adds the identity `env_vars` override when the
+    operator's Codex config actually has that server, since overriding
+    `env_vars` on a server that doesn't exist breaks Codex's config loader."""
+    codex_home = tmp_path / "codex_home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text('[mcp_servers.lifeos]\ncommand = "py"\n')
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+
+def test_identity_env_vars_forwarded_via_mcp_env_vars_override(tmp_path, monkeypatch):
+    """Codex only forwards parent env vars listed in a stdio MCP server's own
+    `env_vars` config key, so without this `-c` override a configured
+    `[mcp_servers.lifeos]` block (command + args only) never sees
+    LIFEOS_AGENT_SESSION_ID/_ATTEMPT_ID/_TURN_ID and `lifeos_agent_*` tools
+    can't attest the caller. Assert the override is present, TOML-parseable,
+    and names exactly the three identity vars — for a fresh execute() when
+    the lifeos MCP server is configured."""
+    _write_codex_config_with_lifeos_server(tmp_path, monkeypatch)
+    spawn_calls: list = []
+    lines = _lines_for([_THREAD_EVENT, _TURN_COMPLETED, _SESSION_COMPLETED])
+    store, executor = _build(tmp_path, monkeypatch, spawn_calls=spawn_calls, lines=lines)
+    session = store.create(task_id="t1", routing="codex")
+    outcome = executor.execute(session, {"description": "do the thing"})
+    assert outcome.status != STATUS_FAILED
+    cmd = spawn_calls[0][0]
+    override = _mcp_env_vars_override(cmd)
+    assert override is not None, f"no mcp_servers.lifeos.env_vars override found in {cmd}"
+    parsed = tomllib.loads(override)
+    assert parsed["mcp_servers"]["lifeos"]["env_vars"] == list(_IDENTITY_ENV_VARS)
+
+
+def test_pre_existing_operator_env_vars_are_preserved_in_override(tmp_path, monkeypatch):
+    """A bare `-c mcp_servers.lifeos.env_vars=[...]` REPLACES rather than
+    extends an operator's own `env_vars` list (verified: a config with
+    `env_vars = ["SYNTHETIC_FORWARDED_VAR"]` plus the identity-only override
+    left the effective list as only the override). Assert the override
+    instead carries the union — the operator's pre-existing var, then the
+    three identity names — so nothing already forwarded to the lifeos MCP
+    child is silently dropped."""
+    codex_home = tmp_path / "codex_home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text(
+        '[mcp_servers.lifeos]\ncommand = "py"\n'
+        'env_vars = ["SYNTHETIC_FORWARDED_VAR"]\n'
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    spawn_calls: list = []
+    lines = _lines_for([_THREAD_EVENT, _TURN_COMPLETED, _SESSION_COMPLETED])
+    store, executor = _build(tmp_path, monkeypatch, spawn_calls=spawn_calls, lines=lines)
+    session = store.create(task_id="t1", routing="codex")
+    outcome = executor.execute(session, {"description": "do the thing"})
+    assert outcome.status != STATUS_FAILED
+    cmd = spawn_calls[0][0]
+    override = _mcp_env_vars_override(cmd)
+    assert override is not None, f"no mcp_servers.lifeos.env_vars override found in {cmd}"
+    parsed = tomllib.loads(override)
+    env_vars = parsed["mcp_servers"]["lifeos"]["env_vars"]
+    assert env_vars == ["SYNTHETIC_FORWARDED_VAR", *_IDENTITY_ENV_VARS]
+
+
+def test_no_mcp_env_vars_override_when_lifeos_server_not_configured(tmp_path, monkeypatch):
+    """The regression this guards: passing `-c mcp_servers.lifeos.env_vars=
+    [...]` when Codex's config has NO `[mcp_servers.lifeos]` server creates a
+    server entry with no `command`, which fails Codex's config loader
+    entirely ("invalid transport"). A fresh open-source install — which
+    today just runs context-blind and logs the executor's missing-MCP
+    warning — must keep working rather than hard-failing every `#codex`
+    task, so no override should be added when the block is absent."""
+    codex_home = tmp_path / "codex_home_empty"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))  # no config.toml at all
+    spawn_calls: list = []
+    lines = _lines_for([_THREAD_EVENT, _TURN_COMPLETED, _SESSION_COMPLETED])
+    store, executor = _build(tmp_path, monkeypatch, spawn_calls=spawn_calls, lines=lines)
+    session = store.create(task_id="t1", routing="codex")
+    outcome = executor.execute(session, {"description": "do the thing"})
+    assert outcome.status != STATUS_FAILED
+    cmd = spawn_calls[0][0]
+    assert _mcp_env_vars_override(cmd) is None, (
+        f"mcp_servers.lifeos.env_vars override present with no lifeos MCP "
+        f"server configured — this would crash a real codex spawn: {cmd}"
+    )
+
+
+def test_board_assigned_model_reaches_argv_via_set_assignment(tmp_path, monkeypatch):
+    """Codex mirror: drives the real dispatch write
+    path — `SessionStore.create` then `SessionStore.set_assignment`, like
+    `worker._dispatch` does — rather than passing `model=` straight to
+    `create()`, so a regression in how `CodexExecutor` reads `session.model`
+    would be caught the same way the Claude Code test catches it."""
+    spawn_calls: list = []
+    lines = _lines_for([_THREAD_EVENT, _TURN_COMPLETED, _SESSION_COMPLETED])
+    store, executor = _build(tmp_path, monkeypatch, spawn_calls=spawn_calls, lines=lines)
+    store.create(task_id="t1", routing="codex")
+    store.set_assignment("t1", model="gpt-5.5", effort="high")
+    session = store.get("t1")
+    assert session.model == "gpt-5.5"  # sanity: the write path actually landed
+    outcome = executor.execute(session, {"description": "do the thing"})
+    assert outcome.status != STATUS_FAILED
+    cmd = spawn_calls[0][0]
+    assert "--model" in cmd and cmd[cmd.index("--model") + 1] == "gpt-5.5"
+    assert "model_reasoning_effort=high" in cmd
+
+
+def test_no_model_field_omits_flag(tmp_path, monkeypatch):
+    spawn_calls: list = []
+    lines = _lines_for([_THREAD_EVENT, _TURN_COMPLETED, _SESSION_COMPLETED])
+    store, executor = _build(tmp_path, monkeypatch, spawn_calls=spawn_calls, lines=lines)
+    session = store.create(task_id="t1", routing="codex")
+    executor.execute(session, {"description": "do the thing"})
+    cmd = spawn_calls[0][0]
+    assert "--model" not in cmd
+    assert not any("model_reasoning_effort" in part for part in cmd)
+
+
+def test_max_effort_maps_to_xhigh(tmp_path, monkeypatch):
+    spawn_calls: list = []
+    lines = _lines_for([_THREAD_EVENT, _TURN_COMPLETED, _SESSION_COMPLETED])
+    store, executor = _build(tmp_path, monkeypatch, spawn_calls=spawn_calls, lines=lines)
+    session = store.create(task_id="t1", routing="codex", effort="max")
+    executor.execute(session, {"description": "do the thing"})
+    cmd = spawn_calls[0][0]
+    assert "model_reasoning_effort=xhigh" in cmd
+
+
+def test_remote_host_wraps_argv_in_ssh_and_captures_pgid(tmp_path, monkeypatch):
+    """AC5 for codex: host field maps to a registered ssh target."""
+    spawn_calls: list = []
+    lines = _lines_for(
+        [_THREAD_EVENT, _AGENT_MESSAGE_COMPLETED, _TURN_COMPLETED, _SESSION_COMPLETED],
+        pgid_line="PGID:1212\n",
+    )
+    store, executor = _build(
+        tmp_path, monkeypatch, spawn_calls=spawn_calls, lines=lines,
+        agent_hosts={"studio": "user@studio.example"},
+    )
+    session = store.create(task_id="t1", routing="codex", host="studio", model="gpt-5.5")
+    outcome = executor.execute(session, {"description": "do the thing"})
+    assert outcome.status != STATUS_FAILED
+    # Prove the pgid-line strip leaves the JSON stream
+    # aligned for codex too — a real completion event's text must still
+    # reach `final_text`.
+    assert outcome.final_text == "done remotely"
+    cmd = spawn_calls[0][0]
+    assert cmd[0] == "ssh"
+    assert "user@studio.example" in cmd
+    remote_command = cmd[-1]
+    assert "env -u" in remote_command
+    assert f"LIFEOS_AGENT_SESSION_ID={session.session_id}" in remote_command
+    assert "setsid bash -c" in remote_command
+    assert " -C " not in remote_command
+    assert str(tmp_path) not in remote_command
+    assert spawn_calls[0][1]["cwd"] == str(tmp_path)
+    assert spawn_calls[0][1]["env"]["LIFEOS_AGENT_SESSION_ID"] == session.session_id
+    assert "ANTHROPIC_API_KEY" not in spawn_calls[0][1]["env"]
+
+    refreshed = store.get("t1")
+    assert refreshed.remote_pgid == 1212
+
+
+def test_remote_target_spawn_omits_mcp_env_vars_override(tmp_path, monkeypatch):
+    """`_build_command`'s config check reads the API host's own
+    config.toml, which says nothing about a board-assigned remote host's
+    own Codex install — that host loads its own config over ssh. Adding
+    the `env_vars` override there risks the same config-loader crash on a
+    remote host with no lifeos server configured. Even with the API host's
+    own config declaring the lifeos server (so a local spawn WOULD get the
+    override — see `test_identity_env_vars_forwarded_via_mcp_env_vars_override`),
+    a remote-target spawn must not."""
+    _write_codex_config_with_lifeos_server(tmp_path, monkeypatch)
+    spawn_calls: list = []
+    lines = _lines_for(
+        [_THREAD_EVENT, _AGENT_MESSAGE_COMPLETED, _TURN_COMPLETED, _SESSION_COMPLETED],
+        pgid_line="PGID:2020\n",
+    )
+    store, executor = _build(
+        tmp_path, monkeypatch, spawn_calls=spawn_calls, lines=lines,
+        agent_hosts={"studio": "user@studio.example"},
+    )
+    session = store.create(task_id="t1", routing="codex", host="studio")
+    outcome = executor.execute(session, {"description": "do the thing"})
+    assert outcome.status != STATUS_FAILED
+    cmd = spawn_calls[0][0]
+    assert cmd[0] == "ssh"
+    remote_command = cmd[-1]
+    assert "mcp_servers.lifeos.env_vars" not in remote_command, (
+        f"override present in a remote-target spawn's argv — the remote "
+        f"host's own Codex config governs, not the API host's: {remote_command}"
+    )
+
+
+def test_remote_host_keeps_explicit_remote_directory_out_of_local_spawn_cwd(
+    tmp_path, monkeypatch,
+):
+    spawn_calls: list = []
+    lines = _lines_for(
+        [_THREAD_EVENT, _AGENT_MESSAGE_COMPLETED, _TURN_COMPLETED, _SESSION_COMPLETED],
+        pgid_line="PGID:1313\n",
+    )
+    store, executor = _build(
+        tmp_path,
+        monkeypatch,
+        spawn_calls=spawn_calls,
+        lines=lines,
+        agent_hosts={"studio": "user@studio.example"},
+    )
+    session = store.create(task_id="t-explicit", routing="codex", host="studio")
+    remote_dir = "/srv/checkouts/SyntheticRepo"
+
+    outcome = executor.execute(
+        session,
+        {"description": "do the thing", "working_dir": remote_dir},
+    )
+
+    assert outcome.status != STATUS_FAILED
+    remote_command = spawn_calls[0][0][-1]
+    assert f"-C {remote_dir}" in remote_command
+    assert spawn_calls[0][1]["cwd"] == str(tmp_path)
+
+
+def test_unknown_host_fails_without_ssh_call(tmp_path, monkeypatch):
+    spawn_calls: list = []
+    store, executor = _build(
+        tmp_path, monkeypatch, spawn_calls=spawn_calls, lines=[],
+        agent_hosts={"studio": "user@studio.example"},
+    )
+    session = store.create(task_id="t1", routing="codex", host="nonexistent-box")
+    outcome = executor.execute(session, {"description": "do the thing"})
+    assert outcome.status == STATUS_FAILED
+    assert "nonexistent-box" in outcome.reason
+    assert spawn_calls == []
+
+
+class _FakeStderrWithText:
+    def __init__(self, text: str):
+        self._text = text
+
+    def read(self) -> str:
+        return self._text
+
+
+class _FailingSshProc:
+    def __init__(self, stderr_text: str, returncode: int = 255, pid: int = 6161):
+        self.stdout = _FakeStdout([])
+        self.stderr = _FakeStderrWithText(stderr_text)
+        self.pid = pid
+        self.returncode = returncode
+
+    def wait(self, timeout: float | None = None) -> int:
+        return self.returncode
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        pass
+
+    def kill(self):
+        pass
+
+
+def test_remote_ssh_failure_reason_includes_stderr(tmp_path, monkeypatch):
+    """Codex mirror: an unreachable-host ssh
+    failure's stderr must land in `outcome.reason`."""
+    spawn_calls: list = []
+    fake_token = "Bearer SYNTHETICFAKECREDENTIAL1234567890"
+    ssh_stderr = f"ssh: connect to host studio port 22: Connection refused {fake_token}\n"
+    store = SessionStore(db_path=tmp_path / "sessions.db")
+    transcripts = TranscriptStore(transcripts_dir=tmp_path / "transcripts")
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_hosts", {"studio": "user@studio.example"}, raising=False)
+
+    def _spawn_fn(cmd, **kwargs):
+        spawn_calls.append((cmd, kwargs))
+        return _FailingSshProc(ssh_stderr)
+
+    executor = CodexExecutor(
+        session_store=store, transcript_store=transcripts, spawn_fn=_spawn_fn,
+    )
+    session = store.create(task_id="t1", routing="codex", host="studio")
+    outcome = executor.execute(session, {"description": "do the thing"})
+    assert outcome.status == STATUS_FAILED
+    assert "studio" in outcome.reason
+    assert "Connection refused" in outcome.reason
+    assert fake_token not in outcome.reason
+    assert "Bearer <REDACTED>" in outcome.reason
+
+
+class _HangingStdout:
+    """`readline()` never returns — simulates an ssh client stuck past TCP
+    connect. `ConnectTimeout` doesn't bound this. Codex mirror of the
+    ClaudeCodeExecutor test double."""
+
+    def readline(self) -> str:
+        import threading
+        threading.Event().wait()
+        return ""  # pragma: no cover — unreachable
+
+
+class _HangingProc:
+    def __init__(self, pid: int = 8888):
+        self.stdout = _HangingStdout()
+        self.stderr = _FakeStderr()
+        self.pid = pid
+        self.returncode = None
+        self._terminated = False
+
+    def poll(self):
+        return None if not self._terminated else -15
+
+    def terminate(self):
+        self._terminated = True
+
+    def wait(self, timeout: float | None = None) -> int:
+        return -15
+
+    def kill(self):
+        self._terminated = True
+
+
+def test_remote_host_unresponsive_pgid_read_fails_within_deadline(tmp_path, monkeypatch):
+    """Codex mirror: a hung ssh client whose `PGID:`
+    line never arrives must not block the executor forever."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_ssh_connect_timeout", 0, raising=False)
+
+    spawn_calls: list = []
+    store = SessionStore(db_path=tmp_path / "sessions.db")
+    transcripts = TranscriptStore(transcripts_dir=tmp_path / "transcripts")
+    monkeypatch.setattr(settings, "agent_hosts", {"studio": "user@studio.example"}, raising=False)
+
+    def _spawn_fn(cmd, **kwargs):
+        spawn_calls.append((cmd, kwargs))
+        return _HangingProc()
+
+    executor = CodexExecutor(
+        session_store=store, transcript_store=transcripts, spawn_fn=_spawn_fn,
+    )
+    session = store.create(task_id="t1", routing="codex", host="studio")
+
+    import time
+    start = time.monotonic()
+    outcome = executor.execute(session, {"description": "do the thing"})
+    elapsed = time.monotonic() - start
+
+    assert outcome.status == STATUS_FAILED
+    assert "studio" in outcome.reason
+    assert elapsed < 30

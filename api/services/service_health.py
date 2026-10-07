@@ -1,0 +1,512 @@
+"""
+Service Health Registry for LifeOS.
+
+Tracks availability and degradation of external services:
+- ChromaDB (vector store)
+- Google APIs (Calendar, Gmail)
+- Telegram (notifications)
+- Embedding model (sentence-transformers)
+- Vault filesystem (Obsidian)
+- Backup storage (NVMe)
+
+Provides:
+- Real-time service status tracking
+- Degradation event recording (when fallbacks are used)
+- Severity-based alerting (CRITICAL = immediate, WARNING = batched)
+- /health/services endpoint data
+
+Usage:
+    from api.services.service_health import get_service_health, record_degradation
+
+    # Record when a fallback is used
+    record_degradation("google_calendar", "event_lookup", "cached_events", "Connection refused")
+
+    # Mark service state changes
+    mark_service_healthy("chromadb")
+    mark_service_failed("chromadb", "Connection timeout", Severity.CRITICAL)
+
+    # Get current status
+    registry = get_service_health()
+    summary = registry.get_summary()
+"""
+import logging
+import threading
+from dataclasses import dataclass
+from datetime import datetime, timezone, timedelta
+from enum import Enum
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+
+class ServiceStatus(str, Enum):
+    """Service availability status."""
+    HEALTHY = "healthy"
+    DEGRADED = "degraded"
+    UNAVAILABLE = "unavailable"
+    UNKNOWN = "unknown"
+
+
+class Severity(str, Enum):
+    """Alert severity levels."""
+    CRITICAL = "critical"  # Immediate alert
+    WARNING = "warning"    # Batched nightly
+    INFO = "info"          # Log only
+
+
+# Service configuration: name -> (default severity, description)
+SERVICE_CONFIG = {
+    "chromadb": (Severity.CRITICAL, "Vector store (ChromaDB)"),
+    "google_calendar": (Severity.WARNING, "Google Calendar API"),
+    "google_gmail": (Severity.WARNING, "Gmail API"),
+    "telegram": (Severity.INFO, "Telegram bot notifications"),
+    "embedding_model": (Severity.CRITICAL, "Sentence transformers model"),
+    "vault_filesystem": (Severity.CRITICAL, "Obsidian vault filesystem"),
+    "backup_storage": (Severity.WARNING, "NVMe backup drive"),
+    "bm25_index": (Severity.WARNING, "BM25 keyword search index"),
+}
+
+
+@dataclass
+class ServiceState:
+    """Current state of a service."""
+    status: ServiceStatus = ServiceStatus.UNKNOWN
+    last_check: Optional[datetime] = None
+    last_healthy: Optional[datetime] = None
+    last_failed: Optional[datetime] = None
+    failure_streak_start: Optional[datetime] = None  # When current failure streak began
+    failure_count: int = 0
+    consecutive_failures: int = 0
+    last_error: Optional[str] = None
+    using_fallback: bool = False
+    fallback_name: Optional[str] = None
+
+
+@dataclass
+class DegradationEvent:
+    """Record of a degradation event (fallback used)."""
+    timestamp: datetime
+    service: str
+    operation: str
+    fallback_used: str
+    original_error: Optional[str] = None
+
+
+# Minimum time between critical alerts for the same service (prevents spam)
+CRITICAL_ALERT_COOLDOWN_MINUTES = 5
+
+# Grace period after startup before alerting (handles restarts)
+STARTUP_GRACE_PERIOD_SECONDS = 30
+
+# Minimum consecutive failures before alerting (handles transient issues)
+MIN_CONSECUTIVE_FAILURES_FOR_ALERT = 3
+
+# Minimum duration (seconds) a service must be continuously failing before alerting.
+# Prevents false alerts during dev restarts or transient ChromaDB/SQLite blips.
+FAILURE_DURATION_THRESHOLD_SECONDS = 120
+
+
+class ServiceHealthRegistry:
+    """
+    Registry tracking health of all external services.
+
+    Thread-safe singleton that maintains:
+    - Current status of each service
+    - Recent degradation events (last 24h)
+    - Critical issues requiring attention
+
+    Alert rate limiting:
+    - CRITICAL alerts only sent on state transition (healthy → failed)
+    - 5-minute cooldown between alerts for the same service (handles flapping)
+    """
+
+    _instance: Optional["ServiceHealthRegistry"] = None
+    _lock = threading.Lock()
+
+    def __new__(cls) -> "ServiceHealthRegistry":
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._initialized = False
+        return cls._instance
+
+    def __init__(self):
+        if self._initialized:
+            return
+
+        self._states: dict[str, ServiceState] = {}
+        self._degradation_events: list[DegradationEvent] = []
+        self._alert_cooldowns: dict[str, datetime] = {}  # service -> last alert time
+        self._maintenance_until: Optional[datetime] = None  # Suppress all alerts until this time
+        self._state_lock = threading.Lock()
+        self._event_lock = threading.Lock()
+        self._startup_time = datetime.now(timezone.utc)  # Track when registry was created
+
+        # Initialize states for known services
+        for service in SERVICE_CONFIG:
+            self._states[service] = ServiceState()
+
+        self._initialized = True
+
+    def enter_maintenance(self, duration_seconds: int) -> None:
+        """
+        Suppress all CRITICAL alerts for the given duration.
+
+        Use this before operations that may cause transient service unavailability
+        (nightly sync, reindex, manual ChromaDB restarts, etc.).
+        """
+        self._maintenance_until = datetime.now(timezone.utc) + timedelta(seconds=duration_seconds)
+        logger.info(f"Maintenance mode: alerts suppressed for {duration_seconds}s")
+
+    def exit_maintenance(self) -> None:
+        """Exit maintenance mode early."""
+        self._maintenance_until = None
+        logger.info("Maintenance mode ended")
+
+    @property
+    def in_maintenance(self) -> bool:
+        """Check if we're currently in maintenance mode."""
+        if self._maintenance_until is None:
+            return False
+        if datetime.now(timezone.utc) >= self._maintenance_until:
+            self._maintenance_until = None  # Auto-expire
+            return False
+        return True
+
+    def mark_healthy(self, service: str) -> None:
+        """
+        Mark a service as healthy.
+
+        Resets consecutive failure count and updates timestamps.
+        """
+        with self._state_lock:
+            if service not in self._states:
+                self._states[service] = ServiceState()
+
+            state = self._states[service]
+            now = datetime.now(timezone.utc)
+
+            # Only log transition if coming from non-healthy state
+            was_unhealthy = state.status in (ServiceStatus.UNAVAILABLE, ServiceStatus.DEGRADED)
+
+            state.status = ServiceStatus.HEALTHY
+            state.last_check = now
+            state.last_healthy = now
+            state.consecutive_failures = 0
+            state.failure_streak_start = None
+            state.using_fallback = False
+            state.fallback_name = None
+
+            if was_unhealthy:
+                logger.info(f"Service recovered: {service}")
+
+    def mark_failed(
+        self,
+        service: str,
+        error: str,
+        severity: Optional[Severity] = None,
+    ) -> None:
+        """
+        Mark a service as unavailable.
+
+        Increments failure counts and optionally triggers immediate alert
+        for CRITICAL severity (rate-limited to prevent spam).
+
+        Alert conditions:
+        - Not within startup grace period (handles restarts)
+        - Minimum consecutive failures reached (handles transient issues)
+        - Respects cooldown period (5 min) to handle flapping services
+        """
+        should_alert = False
+        now = datetime.now(timezone.utc)
+
+        with self._state_lock:
+            if service not in self._states:
+                self._states[service] = ServiceState()
+
+            state = self._states[service]
+
+            state.status = ServiceStatus.UNAVAILABLE
+            state.last_check = now
+            state.last_failed = now
+            state.failure_count += 1
+            state.consecutive_failures += 1
+            state.last_error = error[:500] if error else None  # Truncate long errors
+
+            # Track when this failure streak started
+            if state.failure_streak_start is None:
+                state.failure_streak_start = now
+
+            # Get default severity if not specified
+            if severity is None:
+                severity = SERVICE_CONFIG.get(service, (Severity.WARNING, ""))[0]
+
+            # Log the failure (only first time or first consecutive)
+            if state.consecutive_failures == 1:
+                logger.warning(f"Service failed: {service} - {error[:100]}")
+
+            # Determine if we should send an alert
+            if severity == Severity.CRITICAL:
+                # Check maintenance mode (nightly sync, reindex, manual operations)
+                if self.in_maintenance:
+                    logger.info(f"Suppressing alert for {service} - maintenance mode active")
+                # Check startup grace period (don't alert during restarts)
+                elif (now - self._startup_time).total_seconds() < STARTUP_GRACE_PERIOD_SECONDS:
+                    logger.info(f"Suppressing alert for {service} - within startup grace period")
+                # Check minimum consecutive failures (handles transient issues)
+                elif state.consecutive_failures < MIN_CONSECUTIVE_FAILURES_FOR_ALERT:
+                    logger.info(f"Suppressing alert for {service} - only {state.consecutive_failures} consecutive failures")
+                # Check failure duration (handles dev restarts / transient blips)
+                elif (now - state.failure_streak_start).total_seconds() < FAILURE_DURATION_THRESHOLD_SECONDS:
+                    logger.info(
+                        f"Suppressing alert for {service} - failing for only "
+                        f"{(now - state.failure_streak_start).total_seconds():.0f}s "
+                        f"(threshold: {FAILURE_DURATION_THRESHOLD_SECONDS}s)"
+                    )
+                else:
+                    # Check cooldown
+                    last_alert = self._alert_cooldowns.get(service)
+                    cooldown = timedelta(minutes=CRITICAL_ALERT_COOLDOWN_MINUTES)
+
+                    if last_alert is None or (now - last_alert) > cooldown:
+                        should_alert = True
+                        self._alert_cooldowns[service] = now
+
+        # Send alert outside lock
+        if should_alert:
+            self._send_critical_alert(service, error)
+
+    def mark_degraded(
+        self,
+        service: str,
+        fallback_name: str,
+    ) -> None:
+        """Mark a service as degraded (using fallback)."""
+        with self._state_lock:
+            if service not in self._states:
+                self._states[service] = ServiceState()
+
+            state = self._states[service]
+            state.status = ServiceStatus.DEGRADED
+            state.last_check = datetime.now(timezone.utc)
+            state.using_fallback = True
+            state.fallback_name = fallback_name
+
+    def record_degradation(
+        self,
+        service: str,
+        operation: str,
+        fallback_used: str,
+        original_error: Optional[str] = None,
+    ) -> None:
+        """
+        Record a degradation event (fallback was used).
+
+        These are collected for the nightly health report.
+        """
+        event = DegradationEvent(
+            timestamp=datetime.now(timezone.utc),
+            service=service,
+            operation=operation,
+            fallback_used=fallback_used,
+            original_error=original_error[:200] if original_error else None,
+        )
+
+        with self._event_lock:
+            self._degradation_events.append(event)
+            # Auto-cleanup old events (> 24h)
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+            self._degradation_events = [
+                e for e in self._degradation_events if e.timestamp > cutoff
+            ]
+
+        # Also mark the service as degraded
+        self.mark_degraded(service, fallback_used)
+
+        logger.info(
+            f"Degradation: {service}/{operation} -> {fallback_used}"
+            + (f" (error: {original_error[:50]})" if original_error else "")
+        )
+
+    def get_state(self, service: str) -> Optional[ServiceState]:
+        """Get current state of a service."""
+        with self._state_lock:
+            return self._states.get(service)
+
+    def get_degradation_events(self, hours: int = 24) -> list[DegradationEvent]:
+        """Get degradation events from the last N hours."""
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+        with self._event_lock:
+            return [e for e in self._degradation_events if e.timestamp > cutoff]
+
+    def clear_degradation_events(self) -> int:
+        """Clear degradation events (call after including in nightly report)."""
+        with self._event_lock:
+            count = len(self._degradation_events)
+            self._degradation_events.clear()
+            return count
+
+    def get_critical_issues(self) -> list[tuple[str, str]]:
+        """Get list of critical issues requiring attention."""
+        issues = []
+        with self._state_lock:
+            for service, state in self._states.items():
+                severity = SERVICE_CONFIG.get(service, (Severity.WARNING, ""))[0]
+                if severity == Severity.CRITICAL and state.status == ServiceStatus.UNAVAILABLE:
+                    issues.append((service, state.last_error or "Unknown error"))
+        return issues
+
+    def get_summary(self) -> dict:
+        """
+        Get summary of all service health for /health/services endpoint.
+
+        Returns dict with:
+        - overall_status: healthy/degraded/critical
+        - services: dict of service -> status info
+        - degradation_events: recent fallback usage
+        - critical_issues: services needing immediate attention
+        """
+        with self._state_lock:
+            services = {}
+            for service, config in SERVICE_CONFIG.items():
+                state = self._states.get(service, ServiceState())
+                severity, description = config
+
+                services[service] = {
+                    "status": state.status.value,
+                    "description": description,
+                    "severity": severity.value,
+                    "last_check": state.last_check.isoformat() if state.last_check else None,
+                    "last_error": state.last_error,
+                    "failure_count": state.failure_count,
+                    "consecutive_failures": state.consecutive_failures,
+                    "using_fallback": state.using_fallback,
+                    "fallback_name": state.fallback_name,
+                }
+
+        # Get degradation events
+        events = self.get_degradation_events(hours=24)
+        event_summaries = [
+            {
+                "timestamp": e.timestamp.isoformat(),
+                "service": e.service,
+                "operation": e.operation,
+                "fallback": e.fallback_used,
+            }
+            for e in events[-20:]  # Last 20 events
+        ]
+
+        # Determine overall status
+        critical_issues = self.get_critical_issues()
+
+        with self._state_lock:
+            has_degraded = any(
+                s.status == ServiceStatus.DEGRADED for s in self._states.values()
+            )
+            has_unavailable = any(
+                s.status == ServiceStatus.UNAVAILABLE for s in self._states.values()
+            )
+
+        if critical_issues:
+            overall = "critical"
+        elif has_unavailable or has_degraded:
+            overall = "degraded"
+        else:
+            overall = "healthy"
+
+        # Monarch session age — surface re-auth need before
+        # the monthly sync 401s. Cheap (just file mtime), no network.
+        monarch_session = None
+        try:
+            from api.services.monarch import get_session_status
+            monarch_session = get_session_status()
+        except Exception:
+            monarch_session = None
+        if monarch_session and monarch_session.get("status") in ("expired", "missing"):
+            overall = "degraded" if overall == "healthy" else overall
+
+        return {
+            "overall_status": overall,
+            "services": services,
+            "degradation_events": event_summaries,
+            "degradation_count_24h": len(events),
+            "critical_issues": [
+                {"service": svc, "error": err} for svc, err in critical_issues
+            ],
+            "monarch_session": monarch_session,
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def _send_critical_alert(self, service: str, error: str) -> None:
+        """Send immediate alert for critical service failure."""
+        try:
+            from api.services.notifications import send_alert
+
+            description = SERVICE_CONFIG.get(service, (None, service))[1]
+            send_alert(
+                subject=f"CRITICAL: {description} unavailable",
+                body=f"Service '{service}' has failed.\n\nError: {error}\n\nThis is a critical service that may impact core functionality.",
+            )
+        except Exception as e:
+            logger.error(f"Failed to send critical alert for {service}: {e}")
+
+
+# Module-level singleton accessor
+_registry: Optional[ServiceHealthRegistry] = None
+
+
+def get_service_health() -> ServiceHealthRegistry:
+    """Get the service health registry singleton."""
+    global _registry
+    if _registry is None:
+        _registry = ServiceHealthRegistry()
+    return _registry
+
+
+# Convenience functions for common operations
+
+def record_degradation(
+    service: str,
+    operation: str,
+    fallback_used: str,
+    original_error: Optional[str] = None,
+) -> None:
+    """Record a degradation event (convenience wrapper)."""
+    get_service_health().record_degradation(service, operation, fallback_used, original_error)
+
+
+def mark_service_healthy(service: str) -> None:
+    """Mark a service as healthy (convenience wrapper)."""
+    get_service_health().mark_healthy(service)
+
+
+def mark_service_failed(
+    service: str,
+    error: str,
+    severity: Optional[Severity] = None,
+) -> None:
+    """Mark a service as failed (convenience wrapper)."""
+    get_service_health().mark_failed(service, error, severity)
+
+
+def enter_maintenance(duration_seconds: int) -> None:
+    """Suppress CRITICAL alerts for the given duration (convenience wrapper)."""
+    get_service_health().enter_maintenance(duration_seconds)
+
+
+def exit_maintenance() -> None:
+    """Exit maintenance mode early (convenience wrapper)."""
+    get_service_health().exit_maintenance()
+
+
+def reset_service_health() -> None:
+    """
+    Reset the service health registry singleton.
+
+    For testing only - allows tests to start with fresh state.
+    """
+    global _registry
+    # Also reset the class-level singleton
+    ServiceHealthRegistry._instance = None
+    _registry = None

@@ -1,0 +1,43 @@
+#!/bin/bash
+#
+# LifeOS Post-commit Hook
+#
+# Normalizes commit timestamps to 12:00 UTC (privacy: hides work schedule).
+# Never restarts anything — production restart is a deployment concern only
+# (scripts/deploy.sh), and #983's candidate publisher needs every commit's
+# timestamp already normalized before it constructs a candidate, with no
+# other side effect this hook could introduce.
+#
+# Installation:
+#   cp scripts/post-commit .git/hooks/post-commit
+#   chmod +x .git/hooks/post-commit
+#
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# If we're in .git/hooks, go up to project root
+if [[ "$SCRIPT_DIR" == *".git/hooks"* ]]; then
+    PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+else
+    PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+fi
+
+cd "$PROJECT_DIR"
+
+# Normalize commit timestamps to 12:00 UTC (privacy: hides work schedule).
+# Recursion is prevented by the _LIFEOS_SKIP_DATE_NORMALIZE guard alone, not
+# by bypassing hooks — --no-verify only skips pre-commit/commit-msg, which
+# was never what stopped this hook re-triggering itself. #983 requires
+# every hook to keep running normally here; the amend below runs with no
+# hook-bypass flag at all.
+if [ -z "$_LIFEOS_SKIP_DATE_NORMALIZE" ]; then
+    AUTHOR_DATE=$(git log -1 --format='%aI')
+    COMMIT_DATE=$(git log -1 --format='%cI')
+    NORM_DATE="$(date -u -d "$(git log -1 --format='%ad' --date=short) 12:00" '+%Y-%m-%dT12:00:00+00:00')"
+
+    if [ "$AUTHOR_DATE" != "$NORM_DATE" ] || [ "$COMMIT_DATE" != "$NORM_DATE" ]; then
+        _LIFEOS_SKIP_DATE_NORMALIZE=1 \
+        GIT_AUTHOR_DATE="$NORM_DATE" GIT_COMMITTER_DATE="$NORM_DATE" \
+            git commit --amend --no-edit --date="$NORM_DATE" >/dev/null 2>&1
+    fi
+fi

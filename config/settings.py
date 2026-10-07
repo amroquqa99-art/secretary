@@ -1,0 +1,1998 @@
+"""
+LifeOS Configuration Settings
+"""
+import json
+import logging
+import os
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Annotated
+
+import frontmatter
+from dotenv import dotenv_values
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+from pydantic import Field, field_validator
+
+logger = logging.getLogger(__name__)
+
+# Registry of specialized Telegram bots (beyond the primary). Committed, no
+# secrets — each entry references the env var holding its token.
+# The tracked file is a TEMPLATE listing every persona this repo ships.
+# Each install selects its own subset in an untracked local override, so one
+# person enabling "finance" doesn't commit that choice for everyone, and a
+# `git pull` never clobbers a local selection. Local wins entirely when present
+# (it replaces the template rather than merging, so removing an entry there
+# actually removes it).
+_TELEGRAM_BOTS_FILE = Path("config/telegram_bots.json")
+_TELEGRAM_BOTS_LOCAL_FILE = Path("config/telegram_bots.local.json")
+
+
+def _telegram_bots_source() -> "Path | None":
+    """Which registry file to read: the local override, else the template."""
+    if _TELEGRAM_BOTS_LOCAL_FILE.exists():
+        return _TELEGRAM_BOTS_LOCAL_FILE
+    if _TELEGRAM_BOTS_FILE.exists():
+        return _TELEGRAM_BOTS_FILE
+    return None
+_PRIMARY_PERSONA_FILE = Path("config/personas/primary.md")
+_BOT_NAME_RE = re.compile(r"^[a-z0-9_-]+$")
+
+# Anchors path defaults to the repo root rather than the process's working
+# directory, so the call sites that derive a data-store path from
+# `Path(settings.chroma_path).parent` resolve correctly regardless of the
+# caller's cwd. `settings.py` lives at `config/settings.py`, so its
+# grandparent is the repo root.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+@dataclass(frozen=True)
+class PersonaDefinition:
+    """Credential-free identity and prompt metadata for one persona.
+
+    A definition is usable by HTTP and voice surfaces without implying that a
+    Telegram listener can run.  Telegram credentials and routing metadata stay
+    on the separate :class:`TelegramBotConfig` runtime projection below.
+    """
+    id: str
+    label: str = ""
+    persona: str = ""
+    orchestrates: bool = False
+    voice: tuple[str, ...] = ()
+    # Reserved persona metadata: parsed for compatibility, but still inert.
+    model: str = ""
+    persona_file: str = ""
+
+
+@dataclass(frozen=True)
+class TelegramBotConfig:
+    """A single Telegram bot surface: its token, authorized chat, and persona.
+
+    ``name`` doubles as the per-bot state-file suffix, so it must be filesystem
+    safe. ``persona`` is a system-prompt preamble injected for this bot's chats
+    (empty for the primary bot). ``label`` is an optional human-friendly display
+    name surfaced to HTTP clients; when blank, callers fall back to the
+    capitalized ``name``. ``orchestrates`` marks a bot that drives Claude Code
+    sessions (e.g. the doctor self-repair bot) instead of being pure chat — such
+    a bot owns its own agent-session reply threads rather than redirecting coding
+    tasks to the primary bot. ``backend`` selects which pipeline answers
+    this bot's turns: ``"hermes"`` (the default for every registry entry, i.e.
+    every specialized bot) targets the Hermes proxy (``/api/hermes/ask/stream``),
+    the same backend ``/chat`` prefers when it's available; ``"lifeos"``
+    targets the native pipeline directly. The primary bot always resolves to
+    ``"lifeos"`` regardless of this field (see ``Settings.telegram_primary_bot``)
+    — it has no registry entry to set it from. A ``"hermes"`` bot falls back to
+    ``"lifeos"`` for a given turn, with a one-time in-channel disclosure,
+    whenever Hermes is unconfigured or unreachable (``chat_via_api``'s
+    ``HermesUnavailable``) — see ``TelegramBotListener._run_chat_turn``.
+    """
+    name: str
+    token: str
+    chat_id: str
+    persona: str = ""
+    label: str = ""
+    orchestrates: bool = False
+    backend: str = "hermes"
+    # Parsed from the persona file's optional YAML frontmatter (see _parse_persona).
+    # `voice` rules are consumed on voice turns (the chat route appends them to the
+    # system prompt). `model` is RESERVED — parsed and stored here but not read
+    # by any code path; the orchestrator resolves its model from anthropic_model +
+    # per-turn escalation, so setting a persona `model` is a no-op.
+    voice: tuple[str, ...] = ()
+    model: str = ""
+    # The registry's `persona_file` path, kept alongside the already-parsed
+    # `persona` body so `resolve_persona(surface=...)` can look for a sibling
+    # surface-variant file (see `_surface_variant_body`) without re-reading
+    # the registry. Empty when the bot has no persona_file, matching `persona`.
+    persona_file: str = ""
+
+
+@dataclass(frozen=True)
+class _PersonaRegistryRecord:
+    """Parsed registry row before projecting it to a Telegram bot."""
+    definition: PersonaDefinition
+    token: str
+    token_env: str
+    chat_id: str
+    backend: str
+
+
+def _parse_persona(text: str, name: str = "") -> "tuple[str, tuple[str, ...], str]":
+    """Split a persona file into ``(body, voice, model)``.
+
+    Personas may carry a leading YAML frontmatter block (``id`` / ``model`` /
+    ``voice``); only the **body** becomes the system-prompt preamble, so the
+    frontmatter never leaks into the prompt. Files without frontmatter pass
+    through unchanged. The body is returned verbatim (no ``str.format``) so a
+    persona may contain literal ``{...}`` examples. ``voice``/``model`` are parsed
+    for the orchestrator to consume later; they are inert here.
+    """
+    try:
+        post = frontmatter.loads(text)
+    except Exception as e:  # noqa: BLE001 — a malformed persona file must not take down
+        # the whole bot registry (telegram_bots is an uncached property feeding
+        # resolve_persona / list_http_personas). Degrade to the raw file as the preamble.
+        logger.warning(f"persona file {name!r}: frontmatter parse failed ({e}); using the raw file as the preamble")
+        return text.strip(), (), ""
+    meta = post.metadata or {}
+    raw_voice = meta.get("voice") or []
+    if raw_voice and not isinstance(raw_voice, list):
+        logger.warning(f"persona file {name!r}: `voice` must be a YAML list; ignoring {type(raw_voice).__name__}")
+        raw_voice = []
+    voice = tuple(s for v in raw_voice if (s := str(v).strip()))  # drop blank rules
+    model = str(meta.get("model") or "").strip()
+    fid = meta.get("id")
+    if fid and name and str(fid) != name:
+        logger.warning(f"persona file id={fid!r} does not match bot name {name!r}")
+    return post.content.strip(), voice, model
+
+
+def _surface_variant_body(persona_file: str, default_body: str, surface: "str | None", name: str) -> str:
+    """The persona body for ``surface``, falling back to ``default_body``.
+
+    General mechanism for a persona whose execution model genuinely differs
+    by surface (e.g. `doctor` on Telegram/web, which drives a headless Claude
+    Code session with a shell, vs. on Hermes, which has MCP tools and no
+    shell). ``surface=None`` — the default for every call site that hasn't
+    opted in — always returns ``default_body`` untouched, with no extra
+    filesystem access. A named surface checks for a sibling ``<stem>.<surface><suffix>``
+    file next to ``persona_file`` (e.g. ``config/personas/doctor.md`` ->
+    ``config/personas/doctor.hermes.md``); if it exists, its body (parsed the
+    same way, frontmatter stripped) replaces the default one. A persona with
+    no such sibling — the common case — resolves identically on every
+    surface, so adding a variant for one persona never affects any other, and
+    a new persona gains the mechanism for free just by dropping the file in.
+    """
+    if not surface or not persona_file:
+        return default_body
+    pf = Path(persona_file)
+    variant_path = pf.parent / f"{pf.stem}.{surface}{pf.suffix}"
+    if not variant_path.exists():
+        return default_body
+    try:
+        return _parse_persona(variant_path.read_text(), f"{name} ({surface})")[0]
+    except OSError as e:
+        logger.warning(f"persona {name!r}: could not read surface variant {variant_path}: {e}")
+        return default_body
+
+
+def _load_primary_persona(surface: "str | None" = None) -> "tuple[str, tuple[str, ...], str]":
+    """Load the primary persona from ``config/personas/primary.md`` if present.
+
+    Primary has no registry entry, so its preamble (and ``voice``/``model``) come
+    from this file directly. An absent file → no preamble, the historical default.
+    ``surface`` behaves as in ``resolve_persona`` — see ``_surface_variant_body``.
+    """
+    try:
+        body, voice, model = _parse_persona(_PRIMARY_PERSONA_FILE.read_text(), "primary")
+    except OSError:
+        return "", (), ""
+    return _surface_variant_body(str(_PRIMARY_PERSONA_FILE), body, surface, "primary"), voice, model
+
+
+# Capabilities advertised to HTTP clients. The primary persona and any
+# orchestrating bot (e.g. the doctor self-repair bot) drive Claude Code
+# sessions, so they advertise handoff/agent; pure-chat specialized bots do not.
+ORCHESTRATOR_PERSONA_CAPABILITIES = ("handoff", "agent")
+
+
+@dataclass(frozen=True)
+class PersonaInfo:
+    """An HTTP-visible chat persona (no secrets) for the discovery endpoint."""
+    id: str
+    label: str
+    capabilities: list = field(default_factory=list)
+    orchestrates: bool = False
+
+
+class Settings(BaseSettings):
+    """Application settings loaded from environment variables."""
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore"
+    )
+
+    # Paths (use LIFEOS_ prefix)
+    vault_path: Path = Field(
+        default=_REPO_ROOT / "vault",
+        alias="LIFEOS_VAULT_PATH"
+    )
+    chroma_path: Path = Field(
+        default=_REPO_ROOT / "data" / "chromadb",
+        alias="LIFEOS_CHROMA_PATH"
+    )
+    chroma_url: str = Field(
+        default="http://localhost:8001",
+        alias="LIFEOS_CHROMA_URL",
+        description="ChromaDB server URL"
+    )
+
+    # Voice gateway (whisper-relay). LifeOS reverse-proxies /api/voice/* here so
+    # the browser stays same-origin for mic/HTTPS. See ADR-016.
+    voice_gateway_url: str = Field(
+        default="http://127.0.0.1:9788",
+        alias="LIFEOS_VOICE_GATEWAY_URL",
+        description="whisper-relay voice gateway base URL"
+    )
+
+    # Smart turn endpointing: while auto-continue is on, the web client
+    # runs an energy VAD on the live recording stream and, once this much
+    # trailing silence follows speech, POSTs the audio-so-far to the bare-STT
+    # route (POST /api/voice/transcribe) to check whether the user sounds done.
+    # Read by GET /api/chat/config -> web/chat/voice.js; both are pure client-
+    # side timing knobs, not used anywhere server-side.
+    voice_endpoint_silence_ms: int = Field(
+        default=1600,
+        alias="LIFEOS_VOICE_ENDPOINT_SILENCE_MS",
+        description="Trailing silence (ms) after speech in auto-mode voice recording "
+                    "before a candidate turn-endpoint check runs"
+    )
+    voice_endpoint_hard_cap_ms: int = Field(
+        default=3000,
+        alias="LIFEOS_VOICE_ENDPOINT_HARD_CAP_MS",
+        description="Continuous silence (ms) in auto-mode voice recording that finalizes "
+                    "the turn regardless of the completeness check, so it can never hang"
+    )
+    # Idle timeout: a disjoint budget from the two above, for the
+    # opposite situation -- no speech at all yet this recording, so there is
+    # no trailing silence for voice_endpoint_silence_ms/_hard_cap_ms to
+    # measure. Once this much silence passes with nothing spoken, the client stops
+    # and discards the recording (no turn submitted) rather than leaving the
+    # mic open indefinitely. Read by GET /api/chat/config -> web/chat/voice.js,
+    # same pattern as the two settings above -- also a pure client-side
+    # timing knob, not used anywhere server-side.
+    voice_idle_timeout_ms: int = Field(
+        default=10000,
+        alias="LIFEOS_VOICE_IDLE_TIMEOUT_MS",
+        description="Silence (ms) with no speech detected at all in auto-mode voice "
+                    "recording before the client stops and discards it unsubmitted"
+    )
+    # Reserved for an optional LLM completeness classifier for ambiguous
+    # candidate transcripts (no terminal punctuation, no trailing filler word
+    # either) — see isTranscriptComplete()'s doc comment in web/chat/voice.js.
+    # Not implemented: it would need a new server endpoint (a classify call
+    # analogous to conversation_titler.py's generate_text() use). Left False
+    # and unwired on the client — flipping it currently has no effect; the
+    # heuristic alone governs every completeness decision.
+    voice_endpoint_semantic: bool = Field(
+        default=False,
+        alias="LIFEOS_VOICE_ENDPOINT_SEMANTIC",
+        description="Reserved for an optional LLM completeness classifier for ambiguous "
+                    "auto-mode turn endpoints. Not implemented — has no effect yet; the "
+                    "heuristic alone governs completeness regardless of this setting."
+    )
+
+    # Agent text backend (OpenClaw voice-adapter). LifeOS proxies the "Agent"
+    # text backend to /api/ask/stream here, adding the bearer token server-side
+    # so it's never exposed to the browser. Empty url = Agent disabled.
+    agent_backend_url: str = Field(
+        default="",
+        alias="LIFEOS_AGENT_BACKEND_URL",
+        description="Agent text backend base URL (empty disables the Agent toggle)"
+    )
+    agent_backend_token: str = Field(
+        default="",
+        alias="LIFEOS_AGENT_BACKEND_TOKEN",
+        description="Optional bearer token for the Agent text backend"
+    )
+
+    # Hermes text backend (an agent harness reached as a gateway). Proxied
+    # the same way as the Agent backend above — same shared factory, same
+    # server-side bearer injection. Empty url = Hermes disabled, and /chat's
+    # default backend resolution falls back to lifeos.
+    hermes_backend_url: str = Field(
+        default="",
+        alias="LIFEOS_HERMES_BACKEND_URL",
+        description="Hermes text backend base URL (empty disables the Hermes option)"
+    )
+    hermes_backend_token: str = Field(
+        default="",
+        alias="LIFEOS_HERMES_BACKEND_TOKEN",
+        description="Bearer token shared with Hermes. Sent by LifeOS on outbound calls to "
+                    "the Hermes text backend (optional there — Hermes may not require one), "
+                    "and required from Hermes on inbound calls to "
+                    "POST /api/hermes/resolve-persona (#644) — empty disables that endpoint."
+    )
+
+    hermes_task_questions: bool = Field(
+        default=False,
+        alias="LIFEOS_HERMES_TASK_QUESTIONS",
+        description="Deliver a Hermes-assigned task's clarification questions to the Hermes "
+                    "Telegram DM instead of LifeOS's primary bot. Off until Hermes's own "
+                    "Telegram plugin forwards a threaded reply to POST /api/hermes/deposit-answer; "
+                    "without that, a question sent there has no path back and the task stalls. "
+                    "Progress and terminal notices use the Hermes channel regardless."
+    )
+
+    agent_hook_token: str = Field(
+        default="",
+        alias="LIFEOS_AGENT_HOOK_TOKEN",
+        description="Bearer token required from scripts/lifeos-agent-hook.sh on inbound calls "
+                    "to POST /api/agents/cli-sessions/events (#849) — the endpoint that lets a "
+                    "Claude Code or Codex session on any machine register itself with /agents. "
+                    "Empty disables the endpoint (503): a fresh clone doesn't accept "
+                    "unauthenticated session writes over the tailnet until an operator sets one."
+    )
+
+    # Bounded lifetime for a chat turn that has detached from its client:
+    # a disconnect does not stop generation, but an abandoned turn still needs
+    # a ceiling so it can't run forever with nobody watching. Matches the read
+    # timeout the proxy already gives a voice/agent/hermes turn (api/routes/
+    # _proxy.py's TIMEOUT), so a detached turn's own clock (which starts at
+    # detach, not at turn start) doesn't cut it off any earlier than a connected
+    # one already tolerates.
+    detached_turn_timeout_seconds: float = Field(
+        default=300.0,
+        alias="LIFEOS_DETACHED_TURN_TIMEOUT_SECONDS",
+        description="How long a chat turn may keep running after its client disconnects before it's cancelled"
+    )
+
+    # Default /chat input mode. Off (text) by default so a fresh clone without a
+    # voice gateway isn't dropped onto a non-functional dock; set true to make
+    # voice the default. A ?mode= URL param or a stored preference still wins.
+    chat_default_voice: bool = Field(
+        default=False,
+        alias="LIFEOS_CHAT_DEFAULT_VOICE",
+        description="Make voice the default /chat input mode"
+    )
+
+    # Code directory (parent directory containing LifeOS and other projects)
+    code_dir: str = Field(default="~/Code", alias="LIFEOS_CODE_DIR")
+
+    # Server (port 8000 is canonical - keep in sync with scripts/server.sh)
+    port: int = Field(default=8000, alias="LIFEOS_PORT")
+    host: str = Field(default="0.0.0.0", alias="LIFEOS_HOST")
+
+    # Threshold for the request-timing middleware's slow-request warning log
+    # and the slow_count field in GET /api/perf/routes. Milliseconds,
+    # wall-clock, per request.
+    slow_request_ms: int = Field(
+        default=500,
+        alias="LIFEOS_SLOW_REQUEST_MS",
+        description="Requests slower than this (ms) get one WARNING log "
+                    "line and count toward slow_count in GET /api/perf/routes."
+    )
+
+    # Host guard: the ONE machine allowed to run this API server. A
+    # second live server elsewhere writes to its own SQLite/Chroma copy that
+    # silently diverges from the real one, so clients pointed at the wrong
+    # host get stale answers with no signal anything is wrong. Empty
+    # (default) disables the guard entirely — a fresh clone must never be
+    # blocked from starting. Set it only once you've deliberately designated
+    # a host; api/main.py then refuses to start anywhere else.
+    server_hostname: str = Field(
+        default="",
+        alias="LIFEOS_SERVER_HOSTNAME",
+        description="Hostname (as returned by `socket.gethostname()`/`hostname`) "
+                    "of the one machine designated to run the LifeOS API server. "
+                    "Empty (default) disables the guard. When set, api/main.py "
+                    "and scripts/server.sh refuse to start on any other machine "
+                    "— point that machine's clients at LIFEOS_API_URL instead of "
+                    "running a second server."
+    )
+
+    # The HTTPS front `tailscale serve` publishes (scripts/setup-tailscale.sh).
+    # Also the one non-local origin CORS allows, so a browser loading the UI from
+    # the tailnet hostname can call the API. Empty simply drops it from the list.
+    tailnet_https_url: str = Field(default="", alias="TAILNET_HTTPS_URL")
+
+    # API Keys (no prefix - standard env var names)
+    anthropic_api_key: str = Field(default="", alias="ANTHROPIC_API_KEY")
+
+    # Embedding Model
+    # mxbai-embed-large-v1: Top-tier 1024-dim model, stable and well-tested
+    # Override via LIFEOS_EMBEDDING_MODEL for constrained hardware (e.g., all-MiniLM-L6-v2)
+    embedding_model: str = Field(
+        default="mixedbread-ai/mxbai-embed-large-v1",
+        alias="LIFEOS_EMBEDDING_MODEL"
+    )
+    embedding_cache_dir: str = Field(
+        default="",
+        alias="LIFEOS_EMBEDDING_CACHE",
+        description="Directory for caching embedding model files (leave empty for HuggingFace default)"
+    )
+    embedding_batch_size: int = Field(
+        default=8,
+        alias="LIFEOS_EMBEDDING_BATCH_SIZE",
+        description="Max texts per model.encode() batch. Bounds peak VRAM per "
+                    "embedding call so a large document's chunks can't spike GPU "
+                    "memory in one allocation and exhaust the iGPU's SDMA queues, "
+                    "freezing the host (issue #483). Semantically neutral — "
+                    "batching changes only peak memory, not the embedding values."
+    )
+    embedding_gpu_lock_enabled: bool = Field(
+        default=True,
+        alias="LIFEOS_EMBEDDING_GPU_LOCK_ENABLED",
+        description="Serialize GPU embedding across processes (API server, agent "
+                    "worker, nightly sync, ad-hoc scripts) via a cross-process file "
+                    "lock, so they can't all grab GPU compute queues at once and "
+                    "exhaust the iGPU's 8 SDMA queues (issue #521). Disable if the "
+                    "lock file ever causes more trouble than the contention it "
+                    "prevents."
+    )
+    embedding_gpu_lock_path: str = Field(
+        default="./data/gpu_embed.lock",
+        alias="LIFEOS_EMBEDDING_GPU_LOCK_PATH",
+        description="flock() path used to serialize GPU embedding across "
+                    "processes (#521). Relative paths resolve against the process "
+                    "cwd; every LifeOS process (systemd services set "
+                    "WorkingDirectory to the project root, and scripts/docs "
+                    "instruct running from the project root) shares that cwd, so "
+                    "the default resolves to the same file everywhere without "
+                    "needing an absolute path. Set to empty to disable the lock."
+    )
+    embedding_gpu_lock_timeout_seconds: float = Field(
+        default=300.0,
+        alias="LIFEOS_EMBEDDING_GPU_LOCK_TIMEOUT",
+        description="Max seconds to wait for the cross-process GPU embedding "
+                    "lock before giving up and falling back to CPU for the rest "
+                    "of this process's lifetime, rather than deadlocking or "
+                    "piling onto whichever process is already using the GPU "
+                    "(#521)."
+    )
+
+    # Chunking
+    chunk_size: int = 500  # tokens
+    chunk_overlap: int = 100  # tokens (20% overlap for better boundary handling)
+
+    # Search
+    default_top_k: int = 20
+
+    # LLM Backend: "anthropic" (default), "local", or "remote" (makes the
+    # already-configured paid OpenAI-compatible provider below the standing
+    # default engine, not just a per-turn picker option; see ADR-024). See
+    # get_local_llm() in api/services/llm_client.py for the
+    # resolution logic and its no-key/not-configured error paths.
+    llm_backend: str = Field(default="anthropic", alias="LIFEOS_LLM_BACKEND")
+
+    # Anthropic model for orchestration
+    anthropic_model: str = Field(default="claude-haiku-4-5", alias="LIFEOS_ANTHROPIC_MODEL")
+
+    # Anthropic model for specialist calls (relationship insights, fact
+    # extraction, tone analysis) — Sonnet-tier for quality, independent of the
+    # orchestrator model above. Pin ALIASES here (e.g. claude-sonnet-5),
+    # never dated snapshots (claude-*-20YYMMDD): snapshots retire and start
+    # returning 404, silently breaking every specialist feature.
+    anthropic_specialist_model: str = Field(
+        default="claude-sonnet-5", alias="LIFEOS_ANTHROPIC_SPECIALIST_MODEL"
+    )
+
+    # Local LLM (OpenAI-compatible server, e.g. llama-server)
+    local_llm_url: str = Field(default="http://localhost:8080", alias="LIFEOS_LOCAL_LLM_URL")
+    local_llm_timeout: int = Field(default=90, alias="LIFEOS_LOCAL_LLM_TIMEOUT")
+    local_llm_model: str = Field(
+        default="unsloth/gemma-4-26B-A4B-it-GGUF",
+        alias="LIFEOS_LLM_MODEL",
+        description="HuggingFace GGUF model ID for llama-server"
+    )
+
+    # Routing target (query_router, fact filtering, entity-cleanup auto-hide —
+    # see _get_local_routing_client). Optional override so routing calls can
+    # eventually point at a distinct llama-server instance without touching
+    # local_llm_url, which chat synthesis uses. Empty (default) falls back to
+    # that global value — see routing_llm_url — so a fresh clone behaves
+    # exactly as it would with no routing override configured. llama-server serves one model per
+    # process and ignores the request's "model" field, so on this
+    # architecture "which model" *is* "which URL" — there is no separate
+    # model-name setting to wire up.
+    local_routing_llm_url: str = Field(
+        default="",
+        alias="LIFEOS_LOCAL_ROUTING_LLM_URL",
+        description="Optional dedicated llama-server endpoint for routing/"
+                    "validation calls. Empty (default) falls back to "
+                    "LIFEOS_LOCAL_LLM_URL. Set this to point routing at a "
+                    "second llama-server that has a different model loaded — "
+                    "that's the actual mechanism for selecting a distinct "
+                    "routing model, since llama-server ignores the request's "
+                    "model field."
+    )
+    # Summarization target (indexer document summaries — see
+    # api/services/summarizer.py). Same optional-override shape as
+    # local_routing_llm_url above: empty (default) falls back to
+    # local_llm_url, so a fresh clone and Nathan's llama-server install behave
+    # exactly as they do today.
+    #
+    # Unlike llama-server, which serves one model per process and ignores the
+    # request's "model" field, an Ollama endpoint REQUIRES a real model name --
+    # so this pair needs a model setting where local_routing_llm_url did not.
+    # Taylor's Mac mini has no llama-server but does run Ollama, which is the
+    # case this exists for: without it her every summary fails with connection
+    # refused and the vault index silently loses its whole summary layer.
+    summarizer_llm_url: str = Field(
+        default="",
+        alias="LIFEOS_SUMMARIZER_LLM_URL",
+        description="Optional dedicated OpenAI-compatible endpoint for "
+                    "document summarization. Empty (default) falls back to "
+                    "LIFEOS_LOCAL_LLM_URL. Point it at an Ollama server "
+                    "(e.g. http://localhost:11434) on hosts with no "
+                    "llama-server, and set LIFEOS_SUMMARIZER_MODEL to match."
+    )
+    summarizer_model: str = Field(
+        default="local",
+        alias="LIFEOS_SUMMARIZER_MODEL",
+        description="Model name sent in the summarization request. The "
+                    "default 'local' is a placeholder llama-server ignores; "
+                    "Ollama requires a real tag (e.g. 'qwen2.5:3b-instruct')."
+    )
+    router_enable_thinking: bool = Field(
+        default=False,
+        alias="LIFEOS_ROUTER_ENABLE_THINKING",
+        description="Whether query_router's LLM routing call requests "
+                    "reasoning/thinking from the local model. Default False "
+                    "(#566/#567). The broader correctness A/B this was "
+                    "waiting on has now run: 12 labelled cases through the "
+                    "real QueryRouter._llm_route — thinking ON 24.65s mean, "
+                    "OFF 3.00s mean (8.2x), with IDENTICAL correctness "
+                    "(11/12 both ways, and the single miss is the same in "
+                    "both modes — a pre-existing router limitation on "
+                    "general-knowledge queries, unrelated to thinking). "
+                    "Decisions agreed on 9/12; of the 3 that differed, "
+                    "thinking-off selected FEWER irrelevant sources on 2 "
+                    "(no vault search for 'did anyone message me', none for "
+                    "'draft a reply to an email') and one justified extra "
+                    "(people, for a query naming a person). Routing is "
+                    "source classification — it does not benefit from "
+                    "chain-of-thought. Set True to restore reasoning."
+    )
+    local_agent_enable_thinking: bool = Field(
+        default=False,
+        alias="LIFEOS_LOCAL_AGENT_ENABLE_THINKING",
+        description="Whether run_agent_loop's tool-round and synthesis calls "
+                    "request reasoning/thinking from a LOCAL model (Anthropic "
+                    "backend ignores this — see agent_loop._select_client). "
+                    "Default False (#567): measured on the real orchestrator "
+                    "with Gemma 4 26B-A4B, 6 multi-step questions — thinking "
+                    "ON 233.0s mean / 1032 char answers, thinking OFF 72.6s "
+                    "mean / 1714 char answers, 6/6 answered either way. "
+                    "3.2x faster with LONGER answers; time-to-first-token "
+                    "~195s -> ~60s. Answer quality was reviewed side by side "
+                    "on the four most judgement-heavy questions and showed no "
+                    "regression (thinking-off was better on two: it cited "
+                    "task ids and surfaced more recent items). The reasoning "
+                    "budget was crowding out the answer — the same mechanism "
+                    "as the starvation that can empty it entirely on a "
+                    "reasoning-heavy model. Set True to restore reasoning."
+    )
+
+    @property
+    def routing_llm_url(self) -> str:
+        """Resolved routing-target URL: the dedicated override if set, else local_llm_url."""
+        return self.local_routing_llm_url or self.local_llm_url
+
+    # Paid OpenAI-compatible remote provider — e.g. Fireworks running
+    # DeepSeek/Qwen/etc. An explicit per-turn model pick (like "gemma"/local),
+    # never something the escalation ladder can reach on its own (ADR-018):
+    # NON_API_RUNGS in agent_loop.py already filters any non-local rung out
+    # of an operator-configured ladder, so naming this provider there is a
+    # no-op, not a bypass. Configured as provider + model + key + rates here
+    # so swapping the upstream model is a settings change, not a code change.
+    remote_llm_base_url: str = Field(
+        default="", alias="LIFEOS_REMOTE_LLM_URL",
+        description="Base URL of an OpenAI-compatible remote provider "
+                    "(e.g. https://api.fireworks.ai/inference/v1). Empty "
+                    "(default) disables the provider entirely — it's hidden "
+                    "from the chat model picker and model_override=\"remote\" "
+                    "is ignored."
+    )
+    remote_llm_model: str = Field(
+        default="", alias="LIFEOS_REMOTE_LLM_MODEL",
+        description="Model id to send in the request body, e.g. "
+                    "accounts/fireworks/models/deepseek-v4-flash-0731."
+    )
+    remote_llm_api_key: str = Field(
+        default="", alias="LIFEOS_REMOTE_LLM_API_KEY",
+        description="Bearer token for the remote provider."
+    )
+    remote_llm_label: str = Field(
+        default="Remote", alias="LIFEOS_REMOTE_LLM_LABEL",
+        description="Display label for the chat model picker option."
+    )
+    remote_llm_timeout: int = Field(
+        default=90, alias="LIFEOS_REMOTE_LLM_TIMEOUT",
+        description="Request timeout (seconds) for the remote provider."
+    )
+    remote_llm_input_price_per_mtok: float | None = Field(
+        default=None, alias="LIFEOS_REMOTE_LLM_INPUT_PRICE_PER_MTOK",
+        description="USD per million input tokens. Unset (default, distinct "
+                    "from 0.0) means the rate isn't known — a turn on this "
+                    "provider then records as unpriced rather than a guess, "
+                    "the same 'we don't know, don't invent' convention #613 "
+                    "gave the usage store an unpriced column for."
+    )
+    remote_llm_output_price_per_mtok: float | None = Field(
+        default=None, alias="LIFEOS_REMOTE_LLM_OUTPUT_PRICE_PER_MTOK",
+        description="USD per million output tokens. See "
+                    "remote_llm_input_price_per_mtok for the unset/0.0 distinction."
+    )
+
+    @property
+    def remote_llm_configured(self) -> bool:
+        """True once there's enough to actually run a turn: URL, model, and
+        key. Pricing is independent — an operator can wire up the endpoint
+        before rates are known; such a turn still runs, it just records as
+        unpriced (see remote_llm_input_price_per_mtok)."""
+        return bool(self.remote_llm_base_url and self.remote_llm_model and self.remote_llm_api_key)
+
+    # TypeSafe's Jev typed-judgment API — an opt-in provider for calibrated
+    # choice/score/noul answers, distinct from the generative LLM providers
+    # above. Empty (default) means no surface that consults it makes a
+    # network call; each caller is independently opt-in on top of this key
+    # being set (see api/services/jev_client.py).
+    typesafe_api_key: str = Field(
+        default="", alias="TYPESAFE_API_KEY",
+        description="Bearer token for TypeSafe's Jev API "
+                    "(https://docs.typesafe.ai). Empty (default) disables "
+                    "every Jev-backed judgment; each surface falls back to "
+                    "its existing behavior."
+    )
+
+    @property
+    def jev_configured(self) -> bool:
+        """True once a TypeSafe API key is set. Mirrors remote_llm_configured's
+        "configured" convention — a key is the only prerequisite, there's no
+        separate URL/model to wire up."""
+        return bool(self.typesafe_api_key)
+
+    # GitHub login whose repos `directory_resolver._github_repos()` lists as
+    # working-directory candidates. Empty (default) resolves it from
+    # `gh api user -q .login` instead, caching the result on disk.
+    github_owner: str = Field(default="", alias="LIFEOS_GITHUB_OWNER")
+
+    jev_orchestrator: str = Field(
+        default="off",
+        alias="LIFEOS_JEV_ORCHESTRATOR",
+        description="Controls the chat orchestrator's Jev shadow instrumentation "
+                    "(see `api/services/jev_orchestrator_shadow.py`). One of: `off` "
+                    "(default) — no Jev call, no `jev_preturn`/`jev_inloop` span; "
+                    "`shadow` — a pre-turn judgment runs concurrently with the "
+                    "first round and an in-loop judgment runs after each round "
+                    "from the second on, both recorded as perf-trace spans, and "
+                    "neither changes the tool catalog, round cap, or model choice "
+                    "for the turn. In `shadow` mode, TypeSafe receives the current "
+                    "message, the last two conversation turns, and (for in-loop "
+                    "calls) each round's tool names, argument summaries, and "
+                    "300-char result previews; none of that reaches a log line or "
+                    "a perf-trace span. Effectively `off` whenever no TypeSafe key "
+                    "is configured (`typesafe_api_key`/`jev_configured`), "
+                    "regardless of this setting. An unrecognized value logs a "
+                    "warning and is treated as `off`."
+    )
+
+    jev_vault_tagging: str = Field(
+        default="off",
+        alias="LIFEOS_JEV_VAULT_TAGGING",
+        description="Controls Jev-backed vault tagging (`api/services/vault_tagger.py`). "
+                    "One of `off` (default), `shadow`, `on`. Effectively `off` without "
+                    "a TypeSafe key. Only notes under `LIFEOS_JEV_VAULT_TAG_PATHS` and "
+                    "not classed restricted on-box are sent."
+    )
+    jev_vault_tag_paths: str = Field(
+        default="",
+        alias="LIFEOS_JEV_VAULT_TAG_PATHS",
+        description="Comma-separated vault-relative folder prefixes whose notes may be "
+                    "sent to Jev for tagging. Empty (default) sends nothing; `*` allows "
+                    "every folder."
+    )
+
+    jev_vault_restricted_paths: str = Field(
+        default="Lifelogs,Omi,Therapy,Relationship,Finance",
+        alias="LIFEOS_JEV_VAULT_RESTRICTED_PATHS",
+        description="Comma-separated folder names or vault-relative prefixes whose "
+                    "notes are classed restricted and never sent to Jev for tagging. "
+                    "An explicitly empty value disables path-based restriction; "
+                    "tag-based restriction stays in effect."
+    )
+    jev_vault_restricted_tags: str = Field(
+        default="therapy,private,finance,confidential",
+        alias="LIFEOS_JEV_VAULT_RESTRICTED_TAGS",
+        description="Comma-separated note tags (frontmatter or inline) whose notes, "
+                    "and those of their nested children, are classed restricted and "
+                    "never sent to Jev for tagging. An explicitly empty value "
+                    "disables tag-based restriction."
+    )
+    # Lets the agent worker's `local` route fall back to the remote
+    # OpenAI-compatible provider above when the local llama-server isn't
+    # reachable. Exists for a real deployment with NO other #agent executor
+    # (no Claude Code, no Codex, no local llama-server, no Anthropic key) —
+    # without this, #agent tasks there have nowhere to run. Default False +
+    # empty remote config (default) is byte-identical everywhere, including
+    # the maintainer's own install, which has every
+    # other executor and no remote config. This is a fallback, not a new
+    # route: an explicit `#agent local` on a host with a live llama-server
+    # is unaffected — see agent_worker/local_executor.py's selection logic.
+    # It is also never a rung an escalation ladder can climb to on its own:
+    # NON_API_RUNGS in agent_loop.py only ever names "local" (the on-box
+    # llama-server route via `_select_client(force_local=True)`), which
+    # doesn't consult this flag at all — that selection logic lives solely
+    # in agent_worker/local_executor.py, a different code path from the
+    # chat orchestrator's escalation ladder.
+    agent_remote_executor: bool = Field(
+        default=False, alias="LIFEOS_AGENT_REMOTE_EXECUTOR",
+        description="Opt-in: when the remote provider above is configured "
+                    "(remote_llm_configured) and the local llama-server is "
+                    "unreachable at session start, the agent worker's local "
+                    "route runs the session on the remote provider instead "
+                    "of failing. Off by default; also a no-op unless the "
+                    "remote provider is fully configured."
+    )
+
+    # MCP HTTP transport (used by remote agent platforms; local Claude Code keeps stdio)
+    mcp_http_port: int = Field(
+        default=8765,
+        alias="LIFEOS_MCP_HTTP_PORT",
+        description="Port for the MCP HTTP transport (lifeos-mcp-http systemd unit)"
+    )
+    mcp_http_host: str = Field(
+        default="127.0.0.1",
+        alias="LIFEOS_MCP_HTTP_HOST",
+        description="Bind address for the MCP HTTP transport. Default 127.0.0.1 so only "
+                    "the local Cloudflare Tunnel daemon can reach it; the tunnel handles "
+                    "public exposure."
+    )
+    mcp_bearer_token: str = Field(
+        default="",
+        alias="LIFEOS_MCP_BEARER_TOKEN",
+        description="Bearer token required by the MCP HTTP transport. Generate with "
+                    "`openssl rand -hex 32`. Empty disables the HTTP transport."
+    )
+    oauth_operator_logins: str = Field(
+        default="",
+        alias="LIFEOS_OAUTH_OPERATOR_LOGINS",
+        description="Comma-separated Tailscale logins allowed to approve apps on the MCP "
+                    "OAuth consent page. Empty disables the OAuth endpoints entirely."
+    )
+    oauth_issuer_url: str = Field(
+        default="",
+        alias="LIFEOS_OAUTH_ISSUER_URL",
+        description="Public https base URL of the MCP HTTP transport, advertised as the "
+                    "OAuth issuer and used to build the metadata, token and resource URLs."
+    )
+    oauth_allowed_redirect_hosts: str = Field(
+        default="claude.ai,claude.com,chatgpt.com",
+        alias="LIFEOS_OAUTH_ALLOWED_REDIRECT_HOSTS",
+        description="Comma-separated hosts an https OAuth redirect URI may name at dynamic "
+                    "client registration. Loopback redirects are always allowed."
+    )
+    oauth_authorize_url: str = Field(
+        default="",
+        alias="LIFEOS_OAUTH_AUTHORIZE_URL",
+        description="Tailnet-only URL of the OAuth consent page, when it is served on a "
+                    "different origin from the issuer. Empty means <issuer>/oauth/authorize."
+    )
+
+    # Agent Worker — external worker that picks up #agent-tagged tasks.
+    # See docs/guides/agent-worker-setup.md and epic #98 for the full design.
+    agent_worker_poll_seconds: float = Field(
+        default=60.0,
+        alias="LIFEOS_AGENT_WORKER_POLL_SECONDS",
+        description="How often the agent worker polls for new #agent tasks."
+    )
+    human_queue_poll_seconds: float = Field(
+        default=300.0,
+        alias="LIFEOS_HUMAN_QUEUE_POLL_SECONDS",
+        description="How often the agent worker checks Human-queue cards' "
+                    "done_when conditions (#852)."
+    )
+    agent_worker_autostart: bool = Field(
+        default=False,
+        alias="LIFEOS_AGENT_WORKER_AUTOSTART",
+        description="Enable systemd auto-start on boot for the agent worker. "
+                    "Off by default — opt-in via setup-systemd.sh."
+    )
+    agent_default_budget_dollars: float = Field(
+        default=10.0,
+        alias="LIFEOS_AGENT_DEFAULT_BUDGET_DOLLARS",
+        description="Default per-task dollar budget when the task title doesn't "
+                    "specify one — a backstop against a runaway, not a quota "
+                    "ordinary tasks are expected to approach."
+    )
+    agent_default_wall_seconds: int = Field(
+        default=14400,
+        alias="LIFEOS_AGENT_DEFAULT_WALL_SECONDS",
+        description="Default per-task wall-clock budget (seconds); 14400 = 4h."
+    )
+    agent_default_max_tokens: int | None = Field(
+        default=None,
+        alias="LIFEOS_AGENT_DEFAULT_MAX_TOKENS",
+        description="Default per-task token budget (input + output combined). "
+                    "None (default) means no token cap applies — the dollar and "
+                    "wall-clock budgets are the real backstops. Set only when a "
+                    "task title names one explicitly (e.g. \"50k tokens\")."
+    )
+    agent_default_route: str = Field(
+        default="",
+        alias="LIFEOS_AGENT_DEFAULT_ROUTE",
+        description="Route preflight dispatches to instead of `ask` when a task "
+                    "has no routing cues at all (#707) — for a single-executor "
+                    "install (e.g. local-only, no Claude Code/Codex/Managed "
+                    "Agents) there's nothing useful to ask about. Empty (default) "
+                    "keeps today's behavior: no cues -> ask the operator. Only "
+                    "applies when preflight would otherwise land on `ask` purely "
+                    "for lack of cues; ambiguity, sanity failures, and preflight "
+                    "LLM errors always still ask. Tag overrides (#local, #cloud, "
+                    "etc.) always win over this. Value is validated in "
+                    "agent_worker/preflight.py against the known routing "
+                    "destinations (local/claude/claude_code/codex/ask); an "
+                    "invalid value logs an error and falls back to `ask` rather "
+                    "than silently misrouting."
+    )
+    agent_daily_cap_dollars: float = Field(
+        default=100.0,
+        alias="LIFEOS_AGENT_DAILY_CAP_DOLLARS",
+        description="Global daily cap across all agent tasks. New tasks are not "
+                    "claimed once today's cumulative spend would exceed this."
+    )
+    agent_clarification_timeout_hours: int = Field(
+        default=72,
+        alias="LIFEOS_AGENT_CLARIFICATION_TIMEOUT_HOURS",
+        description="How long an #agent-blocked task waits for a Telegram reply "
+                    "before being abandoned. Used by Issue F."
+    )
+    agent_stuck_session_timeout_minutes: int = Field(
+        default=15,
+        alias="LIFEOS_AGENT_STUCK_SESSION_TIMEOUT_MINUTES",
+        description="How long a top-level claude_code/codex session may sit at "
+                    "status=claimed with an undelivered queued message before "
+                    "the stuck-session sweep alerts the operator by name."
+    )
+    agent_output_dir: str = Field(
+        default="LifeOS/Tasks/Agent Output",
+        alias="LIFEOS_AGENT_OUTPUT_DIR",
+        description="Vault-relative directory where agent-created artifacts "
+                    "(Markdown notes, CSVs) land. The local executor writes "
+                    "here directly; the worker's spillover for long outputs "
+                    "also writes here. Path is joined under LIFEOS_VAULT_PATH."
+    )
+    agent_preflight_model: str = Field(
+        default="claude-haiku-4-5",
+        alias="LIFEOS_AGENT_PREFLIGHT_MODEL",
+        description="Anthropic model used for the Haiku preflight call that "
+                    "classifies #agent tasks (budget, routing, ambiguity, sanity)."
+    )
+    agent_preflight_engine: str = Field(
+        default="auto",
+        alias="LIFEOS_AGENT_PREFLIGHT_ENGINE",
+        description="Which LLM client `_default_llm_caller` builds for the "
+                    "preflight classifier call (#808). One of: `auto` (default) "
+                    "— today's fallback order, Anthropic-if-key -> local llama "
+                    "-> #699 remote provider, byte-identical to pre-#808 "
+                    "behavior; `remote` — build the #654 remote provider "
+                    "(e.g. Fireworks/DeepSeek) first, unprobed, when "
+                    "remote_llm_configured, else fall through to the `auto` "
+                    "order with a logged warning; `anthropic` — force the "
+                    "Anthropic branch, else fall through to `auto` with a "
+                    "logged warning; `local` — force the local llama-server "
+                    "client (still probed via is_available(), same as the "
+                    "`auto` chain's own local check). An unrecognized value "
+                    "logs a warning and is treated as `auto`. This only "
+                    "changes which client runs the preflight classifier — it "
+                    "has no effect on which engine an #agent task itself is "
+                    "dispatched to."
+    )
+    agent_jev_destructive_gate: str = Field(
+        default="shadow",
+        alias="LIFEOS_AGENT_JEV_DESTRUCTIVE_GATE",
+        description="Controls the Jev destructiveness judgment that runs "
+                    "alongside preflight's regex-based sanity gate (see "
+                    "`agent_worker/preflight.py`'s `_apply_destructive_judgment`). "
+                    "One of: `off` — no Jev call; `shadow` (default) — the "
+                    "judgment runs and its harm score / irreversible "
+                    "probability are recorded on the preflight result and "
+                    "logged, but never change `sane`/`sane_fatal`; `block` — "
+                    "a harm score >= 2.5 or an irreversible probability >= "
+                    "0.85 parks the task for operator approval (non-fatal "
+                    "`sane=False`), never cancels it. Effectively `off` "
+                    "whenever no TypeSafe key is configured "
+                    "(`typesafe_api_key`/`jev_configured`), regardless of "
+                    "this setting. The regex sanity gate runs unconditionally "
+                    "in every mode. An unrecognized value logs a warning and "
+                    "is treated as `shadow`."
+    )
+    agent_managed_model: str = Field(
+        default="claude-sonnet-5",
+        alias="LIFEOS_AGENT_MANAGED_MODEL",
+        description="Anthropic model the Managed Agents executor uses for "
+                    "Claude-routed #agent tasks. Informational only — the "
+                    "actual model is whatever the agent preset says; this "
+                    "value is just used for client-side token-cost accounting."
+    )
+    agent_managed_model_for_tests: str = Field(
+        default="",
+        alias="LIFEOS_AGENT_MANAGED_MODEL_FOR_TESTS",
+        description="Optional dev-only override of `agent_managed_model` used "
+                    "when iterating on the cloud agent path. Set to e.g. "
+                    "`claude-haiku-4-5` to swap cost accounting to the cheaper "
+                    "model during iteration. Empty (default) means no override. "
+                    "This only changes client-side dollar accounting; the "
+                    "actual remote model is still the agent preset's setting."
+    )
+    agent_escalation_model: str = Field(
+        default="",
+        alias="LIFEOS_AGENT_ESCALATION_MODEL",
+        description="Anthropic model the chat orchestrator retries a turn on when "
+                    "it detects a refusal/impossibility claim followed by the user "
+                    "pushing back ('do research', 'you're wrong'). Empty (default) "
+                    "disables escalation — safe for fresh clones and the local "
+                    "backend. Since #584 this no longer names the model the turn "
+                    "climbs to: automatic escalation is limited to non-API engines "
+                    "(claude_code / codex / local), so this setting only switches "
+                    "escalation ON. A model named here is still reachable when the "
+                    "operator asks for it ('escalate to opus'). Only applies to the "
+                    "Anthropic backend."
+    )
+    agent_escalation_ladder: str = Field(
+        default="",
+        alias="LIFEOS_AGENT_ESCALATION_LADDER",
+        description="Ordered, comma-separated escalation rungs climbed on each "
+                    "successive refusal+pushback cycle (#305c). Rungs must be "
+                    "non-API engines — 'claude_code' and 'codex' (subscription "
+                    "CLIs, handed off to a worker session) or 'local' (on-box "
+                    "Gemma). Empty (default) is [claude_code, codex]. Anthropic "
+                    "model ids are accepted for backwards compatibility but "
+                    "dropped from the climb with a log line: LifeOS never puts a "
+                    "turn on the API without being asked (#584)."
+    )
+    agent_cost_confirm_threshold_dollars: float = Field(
+        default=1.0,
+        alias="LIFEOS_AGENT_COST_CONFIRM_THRESHOLD_DOLLARS",
+        description="When preflight's cost estimate for a managed-agent task "
+                    "exceeds this dollar threshold, the orchestrator must "
+                    "confirm with the operator before dispatching (#139 §7). "
+                    "Set to 0 to disable confirmation (auto-dispatch all "
+                    "managed tasks regardless of estimate)."
+    )
+    agent_viz_prefetch_enabled: bool = Field(
+        default=True,
+        alias="LIFEOS_AGENT_VIZ_PREFETCH_ENABLED",
+        description="When true, a background loop walks the /agents snapshot "
+                    "between user actions and pre-computes Gemma summaries for "
+                    "any session that doesn't already have one cached, yielding "
+                    "to the agent worker when it's running. Set false to make "
+                    "summaries strictly click-on-demand."
+    )
+    claude_code_viz_enabled: bool = Field(
+        default=True,
+        alias="LIFEOS_CLAUDE_CODE_VIZ_ENABLED",
+        description="When true, the /agents page also surfaces local Claude "
+                    "Code CLI sessions discovered under "
+                    "$LIFEOS_CLAUDE_CODE_PROJECTS_DIR (default ~/.claude/projects). "
+                    "Read-only. Set false to scope the viz to LifeOS agent "
+                    "worker sessions only."
+    )
+    claude_code_projects_dir: str = Field(
+        default="~/.claude/projects",
+        alias="LIFEOS_CLAUDE_CODE_PROJECTS_DIR",
+        description="Filesystem root containing per-cwd Claude Code transcript "
+                    "directories. Each child dir is one working directory "
+                    "(slashes replaced by hyphens) and holds *.jsonl files, "
+                    "one per CLI session."
+    )
+    claude_code_lookback_days: int = Field(
+        default=7,
+        alias="LIFEOS_CLAUDE_CODE_LOOKBACK_DAYS",
+        description="Only ingest Claude Code session jsonl files modified "
+                    "within this many days. Keeps the snapshot lean — older "
+                    "transcripts can still be opened on demand by direct id."
+    )
+    codex_viz_enabled: bool = Field(
+        default=True,
+        alias="LIFEOS_CODEX_VIZ_ENABLED",
+        description="When true, the /agents page also surfaces local Codex "
+                    "CLI sessions discovered under "
+                    "$LIFEOS_CODEX_SESSIONS_DIR (default ~/.codex/sessions). "
+                    "Read-only. Set false to omit Codex sessions from the viz."
+    )
+    codex_sessions_dir: str = Field(
+        default="~/.codex/sessions",
+        alias="LIFEOS_CODEX_SESSIONS_DIR",
+        description="Filesystem root containing Codex CLI rollout files, "
+                    "organized as `<year>/<month>/<day>/rollout-*.jsonl`. "
+                    "One JSONL per session."
+    )
+    codex_lookback_days: int = Field(
+        default=7,
+        alias="LIFEOS_CODEX_LOOKBACK_DAYS",
+        description="Only ingest Codex rollout files modified within this many "
+                    "days. Older transcripts can still be opened on demand by "
+                    "direct id via the events endpoint."
+    )
+    codex_models_cache_path: str = Field(
+        default="~/.codex/models_cache.json",
+        alias="LIFEOS_CODEX_MODELS_CACHE_PATH",
+        description="Path to the Codex CLI's own model-catalog cache "
+                    "(`{\"fetched_at\", \"models\": [...]}`), read by "
+                    "GET /api/agents/models for the codex engine's picker "
+                    "list. Missing/unreadable/empty falls back to a live "
+                    "OpenAI models list call when LIFEOS_OPENAI_API_KEY is "
+                    "set, else an empty list (not an error)."
+    )
+    openai_api_key: str = Field(
+        default="",
+        alias="LIFEOS_OPENAI_API_KEY",
+        description="Optional OpenAI API key, used ONLY as the model-catalog "
+                    "fallback (GET /api/agents/models) when the Codex CLI's "
+                    "own models_cache.json is missing or unreadable. Never "
+                    "used to run turns — Codex sessions are subscription-"
+                    "billed through the CLI itself, never the API."
+    )
+    codex_resume_enabled: bool = Field(
+        default=False,
+        alias="LIFEOS_CODEX_RESUME_ENABLED",
+        description="When true, the /agents UI exposes a 'Resume' button on "
+                    "terminal-state Codex sessions that spawns a local "
+                    "terminal running the configured resume command. Opt-in "
+                    "because spawning GUI terminals from a systemd service "
+                    "depends on the operator's desktop environment."
+    )
+    codex_resume_cmd: str = Field(
+        default="wezterm cli spawn --cwd {cwd} -- {inner_command}",
+        alias="LIFEOS_CODEX_RESUME_CMD",
+        description="Launcher command for resuming a Codex session. Same "
+                    "substitution surface as LIFEOS_CC_RESUME_CMD: "
+                    "`{session_id}`, `{cwd}`, `{inner_command}`, URL-encoded "
+                    "`{session_id_url}` / `{cwd_url}`. Parsed with shlex.split."
+    )
+    codex_resume_inner_cmd: str = Field(
+        default="codex resume {session_id}",
+        alias="LIFEOS_CODEX_RESUME_INNER_CMD",
+        description="Command run *inside* the spawned terminal — the actual "
+                    "`codex resume` invocation. Substitutions: `{session_id}`, "
+                    "`{cwd}`. Set to empty to skip the inner command."
+    )
+    # Card assignment to a host other than the API host, over ssh.
+    #
+    # `NoDecode`: pydantic-settings' own
+    # complex-field JSON pre-decode runs BEFORE `mode="before"` validators —
+    # for a plain `dict[str, str]` field that pre-decode raises straight out
+    # of `Settings()` on an empty string or malformed JSON, so
+    # `_parse_agent_hosts` below never even runs for those cases despite the
+    # docstring's promise. `NoDecode` opts this field out of that pre-decode
+    # so the validator receives the raw env string and its empty/invalid
+    # branches actually execute.
+    agent_hosts: Annotated[dict[str, str], NoDecode] = Field(
+        default_factory=dict,
+        alias="LIFEOS_AGENT_HOSTS",
+        description="JSON object mapping a board-facing host name (e.g. "
+                    "\"studio\") to the ssh target the worker/API should "
+                    "connect to for it (e.g. \"user@studio.example\", or a "
+                    "name from ~/.ssh/config). Operator configuration — never "
+                    "committed with real values. Default {} disables every "
+                    "remote host: a task naming a host not in this map lands "
+                    "at #agent-failed rather than running anywhere. Invalid "
+                    "JSON logs a warning and is treated as {}."
+    )
+
+    @field_validator("agent_hosts", mode="before")
+    @classmethod
+    def _parse_agent_hosts(cls, value):
+        if isinstance(value, dict):
+            return value
+        if value in (None, ""):
+            return {}
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError:
+                logger.warning("LIFEOS_AGENT_HOSTS is not valid JSON — ignoring, no remote hosts configured")
+                return {}
+            if not isinstance(parsed, dict):
+                logger.warning("LIFEOS_AGENT_HOSTS must be a JSON object — ignoring, no remote hosts configured")
+                return {}
+            return parsed
+        return {}
+
+    agent_ssh_connect_timeout: int = Field(
+        default=10,
+        alias="LIFEOS_AGENT_SSH_CONNECT_TIMEOUT",
+        description="Seconds ssh may spend establishing a connection to a "
+                    "board-assigned remote host before giving up (`ssh -o "
+                    "ConnectTimeout=<this>`). Applies to remote spawn, remote "
+                    "kill, and remote resume/focus alike."
+    )
+    # Mirrors each registered host's Claude Code / Codex transcripts onto
+    # this box over ssh+rsync so a remote session shows tokens, cost, and a
+    # transcript feed on /agents exactly like a local one.
+    agent_transcript_mirror_enabled: bool = Field(
+        default=True,
+        alias="LIFEOS_AGENT_TRANSCRIPT_MIRROR_ENABLED",
+        description="When true, a background loop periodically pulls new "
+                    "Claude Code and Codex transcript files from every host "
+                    "in LIFEOS_AGENT_HOSTS. Safe to leave on by default: "
+                    "agent_hosts defaults to {}, so with no hosts registered "
+                    "the mirror never runs anything."
+    )
+    agent_transcript_mirror_dir: str = Field(
+        default="data/agent-transcript-mirror",
+        alias="LIFEOS_AGENT_TRANSCRIPT_MIRROR_DIR",
+        description="Root directory the transcript mirror writes into, one "
+                    "subdirectory per registered host "
+                    "(`<root>/<host>/claude_code/`, `<root>/<host>/codex/`). "
+                    "Read-only mirror of remote data — never written to by "
+                    "anything else."
+    )
+    agent_transcript_mirror_interval_seconds: int = Field(
+        default=120,
+        alias="LIFEOS_AGENT_TRANSCRIPT_MIRROR_INTERVAL_SECONDS",
+        description="How often the transcript mirror loop re-pulls each "
+                    "registered host. Each pull is an incremental rsync, so "
+                    "a short interval costs little when nothing changed."
+    )
+    agent_model_catalog_ttl_seconds: int = Field(
+        default=86400,
+        alias="LIFEOS_AGENT_MODEL_CATALOG_TTL_SECONDS",
+        description="How long GET /api/agents/models caches each engine's "
+                    "model list before re-querying providers. Default 24h — "
+                    "model catalogs change rarely and every provider call "
+                    "costs a round trip (Anthropic) or a filesystem read "
+                    "(Codex's models_cache.json)."
+    )
+    agent_default_model_family_claude: str = Field(
+        default="opus",
+        alias="LIFEOS_AGENT_DEFAULT_MODEL_FAMILY_CLAUDE",
+        description="Model family GET /api/agents/models picks as the "
+                    "claude engine's default: the newest catalog id whose "
+                    "family segment (claude-<family>-<version...>) matches. "
+                    "Tracks new releases automatically — no operator action "
+                    "needed when a newer model in the same family appears."
+    )
+    agent_default_model_family_codex: str = Field(
+        default="sol",
+        alias="LIFEOS_AGENT_DEFAULT_MODEL_FAMILY_CODEX",
+        description="Model family GET /api/agents/models picks as the "
+                    "codex engine's default: the newest catalog id whose "
+                    "family segment (gpt-<version...>-<family>) matches."
+    )
+    remote_llm_model_options: str = Field(
+        default="",
+        alias="LIFEOS_REMOTE_LLM_MODEL_OPTIONS",
+        description="Comma-separated additional model ids the configured "
+                    "remote provider (LIFEOS_REMOTE_LLM_URL) can serve, "
+                    "beyond LIFEOS_REMOTE_LLM_MODEL. Offered as choices on "
+                    "the board's cloud-assignee model picker; the #cloud "
+                    "assignment's execution spec carries whichever one was "
+                    "picked through to the request body's model field."
+    )
+    cc_resume_enabled: bool = Field(
+        default=False,
+        alias="LIFEOS_CC_RESUME_ENABLED",
+        description="When true, the /agents UI exposes a 'Resume' button on "
+                    "terminal-state Claude Code sessions that spawns a local "
+                    "terminal running the configured resume command. Opt-in "
+                    "because spawning GUI terminals from a systemd service "
+                    "depends on the operator's desktop environment."
+    )
+    cc_resume_cmd: str = Field(
+        default="wezterm cli spawn --cwd {cwd} -- {inner_command}",
+        alias="LIFEOS_CC_RESUME_CMD",
+        description="Launcher command for resuming a Claude Code session. "
+                    "Default uses `wezterm cli spawn` which opens a new tab "
+                    "AND runs the resume command in one shot, no clipboard "
+                    "paste needed. Wezterm prints the new pane id on stdout, "
+                    "which the /agents page stores so the new `Focus` action "
+                    "can call `wezterm cli activate-pane` to revisit the tab. "
+                    "Substitutions: `{session_id}`, `{cwd}`, `{inner_command}` "
+                    "(rendered LIFEOS_CC_RESUME_INNER_CMD), and URL-encoded "
+                    "`{session_id_url}` / `{cwd_url}`. Parsed with shlex.split "
+                    "— no shell metacharacters."
+    )
+    cc_resume_inner_cmd: str = Field(
+        default="claude --dangerously-skip-permissions --resume {session_id}",
+        alias="LIFEOS_CC_RESUME_INNER_CMD",
+        description="Command run *inside* the spawned terminal — the actual "
+                    "`claude --resume` invocation. The default template for "
+                    "LIFEOS_CC_RESUME_CMD substitutes this in via "
+                    "`{inner_command}` so wezterm launches the tab with the "
+                    "resume already running. Substitutions: `{session_id}`, "
+                    "`{cwd}`. Set to empty to skip the inner command (spawn "
+                    "an empty terminal)."
+    )
+    cc_resume_env_file: str = Field(
+        default="",
+        alias="LIFEOS_CC_RESUME_ENV_FILE",
+        description="Optional path to a `key=value` file pinning DISPLAY / "
+                    "XAUTHORITY / WAYLAND_DISPLAY / DBUS_SESSION_BUS_ADDRESS "
+                    "for the spawned terminal. Leave empty to inherit the "
+                    "systemd service's env (which usually has none of these)."
+    )
+    agent_vault_id: str = Field(
+        default="",
+        alias="LIFEOS_AGENT_VAULT_ID",
+        description="Managed Agents Vault id holding OAuth credentials for "
+                    "MCP servers declared in the agent preset (Gmail / Calendar "
+                    "/ Drive / Superhuman / custom MCPs). Created in the "
+                    "Anthropic console; see docs/guides/agent-worker-setup.md. "
+                    "Passed as the sole entry in `vault_ids` on session create."
+    )
+    agent_preset_id: str = Field(
+        default="",
+        alias="LIFEOS_AGENT_PRESET_ID",
+        description="Managed Agents Agent preset id (e.g. 'agent_…'). Created "
+                    "once in the Anthropic console; the preset holds the model, "
+                    "system prompt, MCP servers, and tools for every Claude-"
+                    "routed session. See docs/guides/agent-worker-setup.md for "
+                    "the YAML pattern."
+    )
+    agent_environment_id: str = Field(
+        default="",
+        alias="LIFEOS_AGENT_ENVIRONMENT_ID",
+        description="Managed Agents Environment id (e.g. 'env_…'). Created in "
+                    "the Anthropic console; controls where tool calls execute "
+                    "(cloud container by default, self-hosted sandbox in #111)."
+    )
+    # Deprecated: kept so existing .env files don't error on parse. Both fields
+    # were used by the pre-refactor driver to build per-session MCP / connector
+    # lists. The real Managed Agents API expects those to live in the agent
+    # preset (configured in the console), not in the session-create body.
+    agent_connectors: str = Field(
+        default="",
+        alias="LIFEOS_AGENT_CONNECTORS",
+        description="Deprecated. MCP servers and connectors now live in the "
+                    "agent preset (LIFEOS_AGENT_PRESET_ID), not in session "
+                    "creation. This field is parsed but unused; safe to remove "
+                    "from your .env."
+    )
+    agent_extra_mcp_servers: str = Field(
+        default="",
+        alias="LIFEOS_AGENT_EXTRA_MCP_SERVERS",
+        description="Deprecated. MCP servers now live in the agent preset "
+                    "(LIFEOS_AGENT_PRESET_ID), not in session creation. This "
+                    "field is parsed but unused; safe to remove from your .env."
+    )
+    mcp_http_url: str = Field(
+        default="",
+        alias="LIFEOS_MCP_HTTP_URL",
+        description="Public hostname for the LifeOS MCP HTTP transport "
+                    "(e.g. 'https://mcp.example.com/mcp'). Required for "
+                    "Managed Agents to reach LifeOS data."
+    )
+    # Inter-agent caps (Issue E). Spawn / lineage / concurrency limits.
+    agent_max_spawn_depth: int = Field(
+        default=3,
+        alias="LIFEOS_AGENT_MAX_SPAWN_DEPTH",
+        description="Max depth of the spawn tree (parent → child → grandchild)."
+    )
+    agent_max_descendants_per_root: int = Field(
+        default=50,
+        alias="LIFEOS_AGENT_MAX_DESCENDANTS_PER_ROOT",
+        description="Total descendants allowed under any single root session."
+    )
+    agent_max_concurrent_local: int = Field(
+        default=1,
+        alias="LIFEOS_AGENT_MAX_CONCURRENT_LOCAL",
+        description="Max concurrent local Gemma sessions (VRAM bound)."
+    )
+    agent_max_concurrent_managed: int = Field(
+        default=10,
+        alias="LIFEOS_AGENT_MAX_CONCURRENT_MANAGED",
+        description="Max concurrent Managed Agents sessions."
+    )
+    local_llm_autostart: bool = Field(
+        default=False,
+        alias="LIFEOS_LOCAL_LLM_AUTOSTART",
+        description="Enable systemd auto-start on boot and crash-restart for local LLM. "
+                    "When false, llama-server must be started manually."
+    )
+
+    # Local LLM Router — Ollama-named for legacy compatibility; consumed by
+    # the llama-server-backed summarizer / fact-validation paths. The env var aliases (OLLAMA_HOST / OLLAMA_MODEL /
+    # OLLAMA_TIMEOUT / OLLAMA_RETRY_TIMEOUT) are kept so existing operator
+    # .env files don't need to change; only ``ollama_timeout`` /
+    # ``ollama_retry_timeout`` are still read in code (as generic request
+    # timeouts), ``ollama_host`` / ``ollama_model`` are vestigial.
+    ollama_host: str = Field(default="http://localhost:11434", alias="OLLAMA_HOST")
+    ollama_model: str = Field(default="gemma4:26b", alias="OLLAMA_MODEL")
+    ollama_timeout: int = Field(default=45, alias="OLLAMA_TIMEOUT")
+    ollama_retry_timeout: int = Field(default=60, alias="OLLAMA_RETRY_TIMEOUT")  # Longer timeout for retries
+
+    # Cross-encoder re-ranking (P9.2)
+    # Query-aware reranking: protects BM25 exact matches for factual queries
+    # Override via LIFEOS_RERANKER_MODEL; set LIFEOS_RERANKER_ENABLED=false to disable
+    reranker_model: str = Field(
+        default="cross-encoder/ms-marco-MiniLM-L6-v2",
+        alias="LIFEOS_RERANKER_MODEL"
+    )
+    reranker_enabled: bool = Field(
+        default=True,
+        alias="LIFEOS_RERANKER_ENABLED"
+    )
+    reranker_candidates: int = 50
+    search_facet_boost: float = Field(
+        default=1.2,
+        alias="LIFEOS_SEARCH_FACET_BOOST",
+        description="Score multiplier for results matching facets requested with boost=True"
+    )
+
+    # Notifications
+    alert_email: str = Field(
+        default="",
+        alias="LIFEOS_ALERT_EMAIL",
+        description="Email address for sync failure alerts"
+    )
+
+    # Slack Integration
+    slack_client_id: str = Field(default="", alias="SLACK_CLIENT_ID")
+    slack_client_secret: str = Field(default="", alias="SLACK_CLIENT_SECRET")
+    slack_redirect_uri: str = Field(
+        default="http://localhost:8000/api/crm/slack/callback",
+        alias="SLACK_REDIRECT_URI"
+    )
+
+    # Work email domain for CRM category detection
+    work_email_domain: str = Field(
+        default="",
+        alias="LIFEOS_WORK_DOMAIN",
+        description="Your work email domain (e.g., yourcompany.com) for categorizing work contacts"
+    )
+    work_email_domain_2: str = Field(
+        default="",
+        alias="LIFEOS_WORK_DOMAIN_2",
+        description="Second work email domain (e.g., othercompany.com) for categorizing work contacts"
+    )
+    work_email_domains_extra: str = Field(
+        default="",
+        alias="LIFEOS_WORK_DOMAINS_EXTRA",
+        description="Comma-separated list of additional work email domains, "
+                    "beyond LIFEOS_WORK_DOMAIN and LIFEOS_WORK_DOMAIN_2, for "
+                    "categorizing work contacts (e.g., 'thirdcompany.com,"
+                    "fourthcompany.com')."
+    )
+    gmail_draft_send_cooldown_seconds: int = Field(
+        default=300,
+        alias="LIFEOS_GMAIL_DRAFT_SEND_COOLDOWN_SECONDS",
+        description="Cooling-off window, in seconds, during which LifeOS-created "
+                    "Gmail drafts without a different turn id cannot be sent."
+    )
+    gmail_draft_ledger_max_turn_tagged_rows: int = Field(
+        default=10000,
+        alias="LIFEOS_GMAIL_DRAFT_LEDGER_MAX_TURN_TAGGED_ROWS",
+        description="Cap on turn-tagged rows kept in the Gmail draft send-gate "
+                    "ledger. Turn-tagged rows must survive past the cooldown "
+                    "window (the same-turn-id guarantee applies regardless of "
+                    "elapsed time), so they are bounded by count with "
+                    "oldest-first eviction instead of by age."
+    )
+    contact_person_min_messages: int = Field(
+        default=5,
+        alias="LIFEOS_CONTACT_PERSON_MIN_MESSAGES",
+        description="Minimum iMessage count on a contact's phone or email "
+                    "handle before scripts/create_contact_persons.py will "
+                    "create a PersonEntity for an otherwise person-less "
+                    "Apple Contacts record (#700). The contact-record "
+                    "requirement already filters the address book down to "
+                    "real people; this just avoids one-off wrong-number "
+                    "artifacts."
+    )
+
+    # ==========================================================================
+    # WORK INTEGRATION TOGGLES
+    # ==========================================================================
+    # These control whether work account data is synced. All default to False
+    # for safety - work data will NOT be indexed unless explicitly enabled.
+    # This protects users who may not realize work data could be sent to
+    # Claude API during synthesis operations.
+    # ==========================================================================
+
+    sync_work_gmail: bool = Field(
+        default=False,
+        alias="LIFEOS_SYNC_WORK_GMAIL",
+        description="Enable syncing work Gmail account (requires work_email_domain)"
+    )
+    sync_work_calendar: bool = Field(
+        default=False,
+        alias="LIFEOS_SYNC_WORK_CALENDAR",
+        description="Enable syncing work Google Calendar (requires work_email_domain)"
+    )
+    sync_work2_gmail: bool = Field(
+        default=False,
+        alias="LIFEOS_SYNC_WORK2_GMAIL",
+        description="Enable syncing second work Gmail account (requires work_email_domain_2)"
+    )
+    sync_work2_calendar: bool = Field(
+        default=False,
+        alias="LIFEOS_SYNC_WORK2_CALENDAR",
+        description="Enable syncing second work Google Calendar (requires work_email_domain_2)"
+    )
+    sync_slack: bool = Field(
+        default=False,
+        alias="LIFEOS_SYNC_SLACK",
+        description="Enable syncing Slack workspace messages"
+    )
+
+    # Timezone (IANA format)
+    timezone: str = Field(
+        default="America/New_York",
+        alias="LIFEOS_TIMEZONE",
+        description="IANA timezone for schedules, reminders, and AI context"
+    )
+
+    # User name for fact extraction prompts
+    user_name: str = Field(
+        default="User",
+        alias="LIFEOS_USER_NAME",
+        description="Your name for fact extraction prompts"
+    )
+
+    # CRM Owner (the user's person ID for relationship tracking)
+    # WARNING: This ID is from people_entities.json and must remain stable.
+    # If you rebuild people_entities.json from scratch, this ID will become
+    # invalid and you'll need to find your new ID and update this value.
+    # See data/README.md for why you should NEVER rebuild from scratch.
+    my_person_id: str = Field(
+        default="",
+        alias="LIFEOS_MY_PERSON_ID",
+        description="Your PersonEntity ID for relationship tracking"
+    )
+
+    # Apple Photos Integration
+    photos_library_path: str = Field(
+        default="~/Pictures/Photos Library.photoslibrary",
+        alias="LIFEOS_PHOTOS_PATH",
+        description="Path to Photos Library"
+    )
+
+    @property
+    def work_email_domains(self) -> list[str]:
+        """All configured work email domains, first domain then second
+        domain then any additional domains from LIFEOS_WORK_DOMAINS_EXTRA."""
+        domains = [d for d in [self.work_email_domain, self.work_email_domain_2] if d]
+        domains.extend(
+            d.strip() for d in (self.work_email_domains_extra or "").split(",") if d.strip()
+        )
+        return domains
+
+    def is_sync_enabled(self, account: str, service: str) -> bool:
+        """Check if sync is enabled for account+service (gmail/calendar)."""
+        if account == "work":
+            return self.sync_work_gmail if service == "gmail" else self.sync_work_calendar
+        elif account == "work2":
+            return self.sync_work2_gmail if service == "gmail" else self.sync_work2_calendar
+        return True  # personal always enabled
+
+    # Personal relationship patterns for Granola meeting routing
+    # Regex patterns (pipe-separated) to match meeting titles for routing to Personal/Relationship
+    # Example: "Partner|Spouse|Wife|Husband" or specific names
+    personal_relationship_patterns: str = Field(
+        default="",
+        alias="LIFEOS_PERSONAL_RELATIONSHIP_PATTERNS",
+        description="Pipe-separated regex patterns for personal relationship meeting routing"
+    )
+
+    # Partner name for relationship features
+    partner_name: str = Field(
+        default="Partner",
+        alias="LIFEOS_PARTNER_NAME",
+        description="Partner's name for relationship insights"
+    )
+
+    # Therapist patterns for meeting classification (pipe-separated full names)
+    therapist_patterns: str = Field(
+        default="",
+        alias="LIFEOS_THERAPIST_PATTERNS",
+        description="Pipe-separated therapist names for meeting routing (e.g., 'Dr. Smith|Jane Doe')"
+    )
+
+    # Current work vault path (include trailing slash)
+    current_work_path: str = Field(
+        default="Work/",
+        alias="LIFEOS_CURRENT_WORK_PATH",
+        description="Vault path prefix for current work"
+    )
+
+    # Personal archive path (include trailing slash)
+    personal_archive_path: str = Field(
+        default="Personal/zArchive/",
+        alias="LIFEOS_PERSONAL_ARCHIVE_PATH",
+        description="Vault path prefix for archived personal items"
+    )
+
+    # Relationship folder name (for partner-specific content)
+    relationship_folder: str = Field(
+        default="Relationship",
+        alias="LIFEOS_RELATIONSHIP_FOLDER",
+        description="Folder name under Personal/ for relationship content"
+    )
+
+    # Telegram Bot
+    telegram_bot_token: str = Field(
+        default="",
+        alias="TELEGRAM_BOT_TOKEN",
+        description="Telegram bot token from @BotFather"
+    )
+    telegram_chat_id: str = Field(
+        default="",
+        alias="TELEGRAM_CHAT_ID",
+        description="Telegram chat ID for receiving messages"
+    )
+
+    # Fitness
+    fitness_sheet_id: str = Field(
+        default="",
+        alias="LIFEOS_FITNESS_SHEET_ID",
+        description="Google Sheet ID to mirror the workout log into (optional; mirror is off if unset)"
+    )
+    health_export_path: str = Field(
+        default="data/apple-imports/health.json",
+        alias="LIFEOS_HEALTH_EXPORT_PATH",
+        description="Path to the Apple Health export JSON written by the iOS Shortcut "
+                    "(e.g. a synced ~/Code/Sync/health/health.json). Imported nightly."
+    )
+    health_ingest_token: str = Field(
+        default="",
+        alias="LIFEOS_HEALTH_INGEST_TOKEN",
+        description="Bearer token for POST /api/fitness/health/ingest (the HealthBridge "
+                    "app's POST delivery mode). Empty disables the endpoint (503). "
+                    "Generate with `openssl rand -hex 32`."
+    )
+    apple_export_agent_label: str = Field(
+        default="the export agent",
+        alias="LIFEOS_APPLE_EXPORT_AGENT_LABEL",
+        description="Name for the Apple Data Agent machine used in staleness/failure "
+                    "alerts from scripts/apple_data_import.py (e.g. 'Mac Mini', "
+                    "'my MacBook'). Generic default since the export agent's hardware "
+                    "is installer-specific."
+    )
+
+    # Journal ring ingest — a wearable (e.g. the Pebble Index ring) posts
+    # transcribed fragments here from outside the tailnet.
+    journal_ingest_token: str = Field(
+        default="",
+        alias="LIFEOS_JOURNAL_INGEST_TOKEN",
+        description="Bearer token for POST /api/journal/ingest (transcription webhook "
+                    "for a capture device, e.g. the Pebble Index ring). Empty disables "
+                    "the endpoint (503). Generate with `openssl rand -hex 32`. Dedicated "
+                    "token, separate from LIFEOS_MCP_BEARER_TOKEN/LIFEOS_HEALTH_INGEST_TOKEN."
+    )
+
+    # Home automation — eero. Fallback session token for the eero
+    # vendor client: the gitignored state file data/home/eero_session.json is
+    # tried first (so a refreshed token survives a restart), this is the
+    # bootstrap/fallback. Empty disables every /api/home/eero/* endpoint (503).
+    eero_session_token: str = Field(
+        default="",
+        alias="LIFEOS_EERO_SESSION_TOKEN",
+        description="Fallback eero vendor session token, used when "
+                    "data/home/eero_session.json is absent. Obtain one with "
+                    "`scripts/eero_login.py --login <email-or-phone>` then "
+                    "`--code <code>`, which writes the state file directly — "
+                    "setting this env var is only needed to seed a session "
+                    "without running the login script. Empty disables the "
+                    "endpoints (503)."
+    )
+
+    # Pebble writes finalized, framed capture evidence into this producer-owned
+    # archive.  Filing is opt-in until an operator has verified dry-run output;
+    # no network credential or cloud LLM fallback is involved.
+    pebble_capture_enabled: bool = Field(default=False, alias="LIFEOS_PEBBLE_CAPTURE_ENABLED")
+    pebble_capture_apply: bool = Field(default=False, alias="LIFEOS_PEBBLE_CAPTURE_APPLY")
+    pebble_capture_dir: str = Field(default="LifeOS/Log/Pebble", alias="LIFEOS_PEBBLE_CAPTURE_DIR")
+    pebble_capture_scan_seconds: int = Field(default=60, ge=10, alias="LIFEOS_PEBBLE_CAPTURE_SCAN_SECONDS")
+    pebble_classifier: str = Field(
+        default="llm", alias="LIFEOS_PEBBLE_CLASSIFIER",
+        description="Which classifier files a Pebble capture: 'llm' (default) "
+                    "-- the configured remote provider, else the local "
+                    "llama-server -- or 'jev', TypeSafe's typed-judgment API "
+                    "(requires TYPESAFE_API_KEY; falls back to 'llm' with a "
+                    "warning if the key is absent)."
+    )
+
+    # Monarch Money
+    monarch_email: str = Field(
+        default="",
+        alias="MONARCH_EMAIL",
+        description="Monarch Money account email"
+    )
+    monarch_password: str = Field(
+        default="",
+        alias="MONARCH_PASSWORD",
+        description="Monarch Money account password"
+    )
+    monarch_vault_dir: str = Field(
+        default="Personal/Finance/Monarch",
+        alias="LIFEOS_MONARCH_VAULT_DIR",
+        description="Vault-relative directory where the Monarch Money monthly "
+                    "summary (YYYY-MM.md) lands. Path is joined under "
+                    "LIFEOS_VAULT_PATH, same convention as LIFEOS_AGENT_OUTPUT_DIR."
+    )
+
+    # Investments (Schwab pipeline snapshot). A separate export pipeline
+    # (not part of this repo) writes summary.json/portfolio.json here; the API
+    # route and the search_finances "investments" tool both read from it.
+    # Defaults to the maintainer's existing Syncthing-synced folder so an
+    # unconfigured clone sees no data (clean "not synced" message) rather than
+    # an error, same convention as code_dir/monarch_vault_dir above.
+    investments_sync_dir: str = Field(
+        default="~/Code/Sync/investments",
+        alias="LIFEOS_INVESTMENTS_SYNC_DIR",
+        description="Directory summary.json/portfolio.json are read from for "
+                    "the investments API route and the search_finances "
+                    "'investments' chat tool action. Expanduser'd at read time."
+    )
+    investments_dir: str = Field(
+        default="~/Code/investments",
+        alias="LIFEOS_INVESTMENTS_DIR",
+        description="Checkout of nbramia/investments on this host; "
+                    "/api/investments/today and /movers run its day_digest.py "
+                    "and movers.py with its venv. Expanduser'd at read time."
+    )
+
+    # Backup directory
+    backup_path: str = Field(
+        default="./data/backups",
+        alias="LIFEOS_BACKUP_PATH",
+        description="Directory for database backups (use fast storage like NVMe)"
+    )
+
+    backup_keep: int = Field(
+        default=2,
+        alias="LIFEOS_BACKUP_KEEP",
+        description="Nightly snapshots retained per database. Older ones are "
+                    "pruned only after a fully successful sync whose newest "
+                    "snapshot passes an integrity check, so a run of failures "
+                    "cannot rotate away the last good copy."
+    )
+
+    # Claude Code orchestration
+    claude_binary: str = Field(
+        default="claude",
+        alias="LIFEOS_CLAUDE_BINARY",
+        description="Path to claude CLI binary (or just 'claude' if on PATH)"
+    )
+    codex_binary: str = Field(
+        default="codex",
+        alias="LIFEOS_CODEX_BINARY",
+        description="Path to codex CLI binary (or just 'codex' if on PATH)"
+    )
+    claude_timeout_seconds: int = Field(
+        default=3600,
+        alias="LIFEOS_CLAUDE_TIMEOUT",
+        description="Safety-net timeout for Claude Code sessions (seconds). Heartbeats keep user informed; this is a backstop."
+    )
+    claude_max_turns: int = Field(
+        default=50,
+        alias="LIFEOS_CLAUDE_MAX_TURNS",
+        description="Max agentic turns per Claude Code session. Prevents runaway retry loops."
+    )
+    claude_max_cost_usd: float = Field(
+        default=2.0,
+        alias="LIFEOS_CLAUDE_MAX_COST",
+        description="Max cost in USD per Claude Code session. Session cancelled if exceeded."
+    )
+    @property
+    def telegram_enabled(self) -> bool:
+        """Check if Telegram bot is configured."""
+        return bool(self.telegram_bot_token and self.telegram_chat_id)
+
+    @property
+    def telegram_primary_listener_enabled(self) -> bool:
+        """Whether to POLL the primary bot, as opposed to only sending as it.
+
+        Sending (sendMessage) and receiving (getUpdates) are separable, but
+        Telegram allows only ONE getUpdates consumer per bot token. When the
+        primary token belongs to a bot another process already polls — e.g. a
+        Hermes gateway that owns the Telegram surface — LifeOS must send as that
+        bot without polling it, or the two clients 409 each other.
+
+        Set TELEGRAM_PRIMARY_LISTENER_ENABLED=false in that case. The scheduler
+        still starts and still delivers; only the inbound listener is skipped.
+        """
+        import os
+        raw = os.getenv("TELEGRAM_PRIMARY_LISTENER_ENABLED", "true").strip().lower()
+        return raw not in ("false", "0", "no", "off")
+
+    @property
+    def telegram_primary_bot(self) -> "TelegramBotConfig":
+        """The default Telegram bot, driven by TELEGRAM_BOT_TOKEN/CHAT_ID.
+
+        Named "primary" so its update-offset file stays the legacy
+        ``data/telegram_state.json`` and existing behavior is unchanged.
+        """
+        persona, voice, model = _load_primary_persona()
+        return TelegramBotConfig(
+            name="primary",
+            token=self.telegram_bot_token,
+            chat_id=self.telegram_chat_id,
+            persona=persona,
+            voice=voice,
+            model=model,
+            # Always "lifeos" — the primary bot never targets Hermes,
+            # regardless of the dataclass default meant for specialized bots.
+            backend="lifeos",
+        )
+
+    @property
+    def telegram_bots(self) -> list["TelegramBotConfig"]:
+        """Specialized Telegram bots that can actually run — token env set.
+
+        Thin wrapper over :meth:`_load_registry_bots`; see it for the registry
+        format. Callers that start Telegram listeners want this one, since a
+        listener without a token is meaningless.
+        """
+        return self._load_registry_bots()
+
+    def _load_registry_records(self, require_token: bool = False) -> list["_PersonaRegistryRecord"]:
+        """Load registry definitions and optional Telegram runtime metadata.
+
+        The registry file remains the single editable authority and the local
+        override still replaces the tracked template. ``require_token`` is
+        used only to build the Telegram runtime projection; HTTP and voice
+        callers consume the same records without that readiness gate.
+        """
+        source = _telegram_bots_source()
+        if source is None:
+            return []
+        try:
+            entries = json.loads(source.read_text())
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning(f"Could not read {source}: {e}")
+            return []
+        if not isinstance(entries, list):
+            logger.warning(f"{source} must contain a JSON list, ignoring")
+            return []
+
+        # pydantic-settings loads .env into the model but does NOT export to
+        # os.environ, so resolve token/chat-id env vars from the .env file too
+        # (real environment wins over .env on conflict).
+        env_file = self.model_config.get("env_file", ".env")
+        env: dict = {**dotenv_values(env_file), **os.environ}
+
+        records: list[_PersonaRegistryRecord] = []
+        for entry in entries:
+            name = (entry.get("name") or "").strip().lower()
+            if not name or not _BOT_NAME_RE.match(name):
+                logger.warning(f"Skipping Telegram bot with invalid name: {entry.get('name')!r}")
+                continue
+            if name in ("primary",):
+                logger.warning(f"Skipping duplicate/reserved Telegram bot name: {name!r}")
+                continue
+            token_env = entry.get("token_env", "")
+            token = (env.get(token_env) or "").strip()
+            chat_id = (env.get(entry.get("chat_id_env", "")) or "").strip() or self.telegram_chat_id
+            persona, voice, model = "", (), ""
+            persona_file = entry.get("persona_file")
+            if persona_file:
+                try:
+                    persona, voice, model = _parse_persona(Path(persona_file).read_text(), name)
+                except OSError as e:
+                    logger.warning(f"Telegram bot '{name}': could not read persona file {persona_file}: {e}")
+            label = (entry.get("label") or "").strip()
+            backend = (entry.get("backend") or "hermes").strip().lower()
+            if backend not in ("hermes", "lifeos"):
+                logger.warning(
+                    f"Telegram bot '{name}': invalid backend {backend!r}, "
+                    "defaulting to 'hermes'"
+                )
+                backend = "hermes"
+            records.append(_PersonaRegistryRecord(
+                definition=PersonaDefinition(
+                    id=name,
+                    label=label,
+                    persona=persona,
+                    orchestrates=bool(entry.get("orchestrates", False)),
+                    voice=voice,
+                    model=model,
+                    persona_file=persona_file or "",
+                ),
+                token=token,
+                token_env=token_env,
+                chat_id=chat_id,
+                backend=backend,
+            ))
+
+        # Select one registry row before applying the Telegram credential gate.
+        # The first valid row remains authoritative, preserving the registry's
+        # existing order semantics while ensuring credential-free persona
+        # projections and token-gated listeners cannot resolve conflicting
+        # duplicate ids differently.
+        selected: list[_PersonaRegistryRecord] = []
+        seen: set[str] = set()
+        for record in records:
+            name = record.definition.id
+            if name in seen:
+                logger.warning(f"Skipping duplicate/reserved Telegram bot name: {name!r}")
+                continue
+            seen.add(name)
+            selected.append(record)
+
+        if not require_token:
+            return selected
+        usable: list[_PersonaRegistryRecord] = []
+        for record in selected:
+            if not record.token:
+                logger.info(
+                    f"Telegram bot '{record.definition.id}' skipped: env var "
+                    f"{record.token_env!r} is unset"
+                )
+                continue
+            usable.append(record)
+        return usable
+
+    def _load_registry_bots(self) -> list["TelegramBotConfig"]:
+        """Project usable registry records into Telegram bot configs."""
+        return [
+            TelegramBotConfig(
+                name=record.definition.id,
+                token=record.token,
+                chat_id=record.chat_id,
+                persona=record.definition.persona,
+                label=record.definition.label,
+                orchestrates=record.definition.orchestrates,
+                backend=record.backend,
+                voice=record.definition.voice,
+                model=record.definition.model,
+                persona_file=record.definition.persona_file,
+            )
+            for record in self._load_registry_records(require_token=True)
+        ]
+
+    @property
+    def persona_definitions(self) -> list["PersonaDefinition"]:
+        """Credential-free persona identities from the primary and registry.
+
+        A missing Telegram token does not remove a definition; it only keeps
+        the corresponding runtime bot out of :attr:`telegram_bots`.
+        """
+        primary, voice, model = _load_primary_persona()
+        definitions = [PersonaDefinition(
+            id="primary",
+            label="Primary",
+            persona=primary,
+            voice=voice,
+            model=model,
+            persona_file=str(_PRIMARY_PERSONA_FILE),
+        )]
+        definitions.extend(
+            record.definition for record in self._load_registry_records(require_token=False)
+        )
+        return definitions
+
+    def list_http_personas(self) -> list["PersonaInfo"]:
+        """Chat personas visible to HTTP clients (web, voice/whisper-relay).
+
+        Returns the primary persona plus every specialized persona in the
+        registry, whether or not it has a Telegram bot token. These surfaces do
+        not use Telegram, so a token is irrelevant to them; gating on one meant
+        a persona was invisible in the browser until you created a bot for it. No secrets are exposed. The primary persona and any
+        orchestrating bot (``orchestrates: true``, e.g. the doctor self-repair
+        bot) advertise ``handoff``/``agent`` capabilities; pure-chat specialized
+        bots advertise none. Adding a registry entry + its token env var surfaces
+        a new persona on the next restart with no code change.
+
+        ``orchestrates`` is sourced from ``persona_orchestrates()`` — the same
+        check real routing (chat.py, hermes_proxy.py) uses — rather than
+        derived from ``capabilities``, which happen to be identical for
+        ``primary`` and an orchestrating bot like ``doctor``.
+        """
+        personas = []
+        for definition in self.persona_definitions:
+            personas.append(PersonaInfo(
+                id=definition.id,
+                label=definition.label or definition.id.capitalize(),
+                capabilities=(
+                    list(ORCHESTRATOR_PERSONA_CAPABILITIES)
+                    if definition.id == "primary" or definition.orchestrates else []
+                ),
+                orchestrates=definition.orchestrates,
+            ))
+        return personas
+
+    def resolve_persona(self, persona_id: str, surface: "str | None" = None) -> "str | None":
+        """Resolve a persona id to its system-prompt preamble for HTTP clients.
+
+        Same registry source as Telegram, so ``persona_id="fitness"`` yields the
+        exact preamble the fitness Telegram bot uses. ``"primary"`` resolves to
+        an empty preamble (the default, no persona). Returns ``None`` for an
+        unknown id so the caller can reject it with HTTP 400.
+
+        ``surface`` selects a surface-specific variant of the body when one
+        exists — e.g. ``surface="hermes"`` for a persona whose execution model
+        differs on the Hermes harness (MCP tools, no shell) from Telegram/web
+        (a headless Claude Code session). See ``_surface_variant_body``.
+        Omitted (the default, ``None``), every caller — including every one
+        that predates this parameter — gets exactly today's body; a persona
+        with no variant for the requested surface also gets exactly today's
+        body, so this is additive until a variant file exists.
+        """
+        for definition in self.persona_definitions:
+            if definition.id == persona_id:
+                return _surface_variant_body(
+                    definition.persona_file,
+                    definition.persona,
+                    surface,
+                    persona_id,
+                )
+        return None
+
+    def persona_voice(self, persona_id: str) -> "tuple[str, ...]":
+        """Spoken-turn rules for a persona id; empty tuple if none or unknown.
+
+        Appended to the system prompt on voice turns (the `modality` flag on
+        /api/ask/stream). Same registry source as resolve_persona.
+        """
+        for definition in self.persona_definitions:
+            if definition.id == persona_id:
+                return definition.voice
+        return ()
+
+    def personal_context(self, persona_id: str) -> str:
+        """A resolved people block for a persona, from existing config.
+
+        Scoped to the therapist (the surface built around the user's relationships
+        and therapy). Names come from LIFEOS_PARTNER_NAME / LIFEOS_THERAPIST_PATTERNS
+        — never hardcoded in a persona file, and resolved only at runtime so the
+        committed repo stays clean. Empty for other personas and for a fresh clone
+        with no config set.
+        """
+        if persona_id != "therapist":
+            return ""
+        lines = []
+        partner = (self.partner_name or "").strip()
+        if partner and partner.lower() != "partner":
+            lines.append(f"- Partner: {partner}")
+        therapists = [t.strip() for t in re.split(r"[|,]", self.therapist_patterns or "") if t.strip()]
+        if therapists:
+            lines.append(f"- Therapists (individual + couples): {', '.join(therapists)}")
+        if not lines:
+            return ""
+        return (
+            "## Your people (resolved from config)\n\n"
+            + "\n".join(lines)
+            + "\n\nThese are the actual people behind this surface — search their "
+            "sessions and messages directly rather than asking who they are."
+        )
+
+    def persona_orchestrates(self, persona_id: str) -> bool:
+        """True if the persona drives a Claude Code session instead of inline chat.
+
+        Orchestrating bots (e.g. doctor) spawn a worker rather than answering
+        inline. The primary persona is NOT an orchestrator (it uses the inline
+        loop + claude_intent handoff for code tasks).
+        """
+        return any(
+            definition.id == persona_id and definition.orchestrates
+            for definition in self.persona_definitions
+        )
+
+    @property
+    def photos_db_path(self) -> str:
+        """Get path to Photos.sqlite database.
+
+        Expands ``~`` so the tilde-prefixed default resolves — without this the
+        default configuration could never work, even on a Mac with a stock
+        library, because ``Path("~/...").exists()`` is always False.
+        """
+        from pathlib import Path
+        library = str(Path(self.photos_library_path).expanduser())
+        return f"{library}/database/Photos.sqlite"
+
+    @property
+    def photos_enabled(self) -> bool:
+        """Check if Photos database is available."""
+        from pathlib import Path
+        if not self.photos_library_path:
+            return False
+        return Path(self.photos_db_path).exists()
+
+
+settings = Settings()

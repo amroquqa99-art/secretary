@@ -1,0 +1,33 @@
+#!/bin/bash
+#
+# LifeOS Pre-commit Hook
+#
+# Runs ruff lint check on staged Python files. Fast (<1s).
+# Tests are deferred to the pre-push hook.
+#
+# Installation:
+#   cp scripts/pre-commit .git/hooks/pre-commit
+#   chmod +x .git/hooks/pre-commit
+#
+
+set -e
+
+# Get staged Python files
+STAGED=$(git diff --cached --name-only --diff-filter=ACM -- '*.py')
+
+if [ -z "$STAGED" ]; then
+    exit 0
+fi
+
+# Activate virtual environment
+if [ -f "$HOME/.venvs/lifeos/bin/activate" ]; then
+    source "$HOME/.venvs/lifeos/bin/activate"
+fi
+
+if ruff check $STAGED --quiet 2>/dev/null; then
+    echo "ruff: ok"
+    exit 0
+else
+    echo "ruff: lint errors found (run 'ruff check --fix' to auto-fix)"
+    exit 1
+fi

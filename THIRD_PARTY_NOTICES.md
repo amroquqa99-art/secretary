@@ -1,16 +1,36 @@
-# Local inference dependencies in 0.7.0
+# Third-Party Notices
 
-llama.cpp / ggml, ggml-org contributors, MIT License.
-Source: https://github.com/ggml-org/llama.cpp
-Pinned revision: `50569eb87df530daff11afda229ceb9ab8e6cae8`.
-Source archive SHA-256: `10af4d51ee5c29566e1f2899752d12ea41004554ceff7a91ca931b0ace48bc93`.
-The MIT copyright notice and license are bundled as `app/src/main/assets/licenses/LLAMA-CPP-MIT.txt`.
-Only the CPU runtime is built. No llama server, HTTP client, GPU backend or model weights are bundled.
+LifeOS itself is licensed under the GNU General Public License v3.0 — see [LICENSE](LICENSE).
 
-Qwen models, Qwen team, Apache License 2.0 according to their official model cards.
-Public pinned artifacts and the evaluated model choice are recorded in [LOCAL_MODELS.md](LOCAL_MODELS.md).
-The weights are downloaded only at the user's request or imported as an owned copy. They are excluded from the APK, Git and personal-data backups.
-The Apache license is bundled as `app/src/main/assets/licenses/APACHE-2.0.txt`.
+This file lists third-party material redistributed as part of this repository, along with its
+origin and license. Redistributing that material carries its own attribution obligations, which
+this file exists to satisfy.
 
-LiteRT-LM was used in 0.6.0 and is no longer an Android dependency in 0.7.0. Existing owned `.litertlm` weights remain available for explicit removal; the new engine does not load them.
-Other Android/Compose, Kotlin and Gson dependencies retain their own licenses.
+---
+
+## `config/nicknames.csv` — English given-name / nickname dataset
+
+| | |
+|---|---|
+| **Upstream** | https://github.com/carltonnorthern/nicknames |
+| **Upstream file** | `names.csv` |
+| **License** | Apache License 2.0 — full text at [licenses/Apache-2.0.txt](licenses/Apache-2.0.txt) |
+| **Copyright** | The `nicknames` project contributors. The dataset originated with Old Dominion University's Web Science and Digital Libraries Research Group and is maintained by [@carltonnorthern](https://github.com/carltonnorthern). |
+| **Used by** | [`config/nickname_lookup.py`](config/nickname_lookup.py) — bidirectional formal-name ↔ nickname lookup during entity resolution |
+
+**Modifications:** the file was renamed from `names.csv` to `nicknames.csv`. The contents are a
+vendored snapshot of an earlier upstream revision — no rows have been added, removed, or edited
+by this project, and the `name1,relationship,name2` schema is unchanged. As of the last sync check
+the snapshot trails upstream by 136 rows, all of them upstream additions.
+
+Apache-2.0 and GPL-3.0 are compatible in this direction: Apache-2.0 material may be included in a
+GPL-3.0 work. The combined work is distributed under GPL-3.0, while this component remains under
+Apache-2.0 as recorded above.
+
+---
+
+## Adding to this file
+
+If you vendor third-party code or data into the repository, add a section here recording the
+upstream URL, license, copyright holder, where it is used, and any modifications you made. If the
+license is one not already present, add its full text under `licenses/`.

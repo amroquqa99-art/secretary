@@ -1,0 +1,538 @@
+# Scripts Reference
+
+> **Status:** Complete
+> **Last Updated:** 2026-09-18
+> **Audience:** Operators
+
+Reference for the operator-facing scripts under `scripts/`, with usage examples. One-off CRM entity-repair scripts (`merge_people.py`, `split_person.py`, `fix_*`, etc.), git hooks, and Claude Code worktree/session-diagnostic helpers aren't covered here — they're self-documenting via `--help` or their own docstring.
+
+---
+
+## Server Management
+
+### server.sh
+
+Manage the LifeOS API server.
+
+```bash
+./scripts/server.sh start      # Start server (background)
+./scripts/server.sh stop       # Stop server
+./scripts/server.sh restart    # Restart after deploying (never for isolated test runs)
+./scripts/server.sh status     # Check if running
+./scripts/server.sh wait       # Wait for server to become healthy
+./scripts/server.sh preflight  # Check prerequisites before first start
+./scripts/server.sh foreground # Start server in foreground (for systemd)
+./scripts/server.sh verify-runtime-evidence \
+  --expected-revision <full-commit-sha> \
+  --restart-evidence ~/.cache/lifeos/runtime-identities/restart-lifeos-api.json
+```
+
+`verify-runtime-evidence` emits JSON and exits zero only when the requested
+full revision is present in startup-bound runtime identities under the local
+user cache, the machine-produced restart record succeeded, scoped health is
+observed, and the recorded prior running revision resolves to a usable
+rollback reference. Add `--services lifeos-api,lifeos-agent-worker` when a
+change includes the worker; the worker identity must include a live startup
+identity and heartbeat, so a healthy API cannot stand in for a stale or
+unavailable worker. The verifier supports API-only, worker-only, and combined
+records. Unknown, dirty, malformed, stale, or mismatched identities and
+missing evidence are reported as a non-zero result. `verify-deployed [sha]`
+checks checkout HEAD only and is not a running-process proof.
+
+**Important**: Always use this script. Never run `uvicorn` directly.
+
+---
+
+### chromadb.sh
+
+Manage the ChromaDB vector database server.
+
+```bash
+./scripts/chromadb.sh start    # Start ChromaDB
+./scripts/chromadb.sh stop     # Stop ChromaDB
+./scripts/chromadb.sh restart  # Restart
+./scripts/chromadb.sh status   # Check status
+```
+
+ChromaDB runs on port 8001.
+
+---
+
+## Deployment
+
+### deploy.sh
+
+Test, restart, commit, and push in one command.
+
+```bash
+./scripts/deploy.sh "Your commit message"
+./scripts/deploy.sh --skip-tests "Your commit message"  # Skip tests
+./scripts/deploy.sh --no-push "Your commit message"     # Commit but don't push
+```
+
+Workflow:
+1. Runs `./scripts/test.sh smoke` (unless `--skip-tests`)
+2. Restarts server
+3. Creates git commit
+4. Pushes to remote (unless `--no-push`)
+
+---
+
+## Testing
+
+### test.sh
+
+Run test suites.
+
+```bash
+./scripts/test.sh          # Unit tests only (~30s)
+./scripts/test.sh smoke    # Unit + critical browser tests
+./scripts/test.sh all      # Full test suite (slower)
+```
+
+### remote-test.sh
+
+For a machine with no local venv (e.g. a MacBook that isn't the server): rsyncs your uncommitted working tree to an isolated branch-keyed directory on a remote test-runner host and runs the same `test.sh auto` scope there.
+
+```bash
+LIFEOS_REMOTE_HOST=<ssh-target> ./scripts/remote-test.sh
+```
+
+Set `LIFEOS_REMOTE_HOST` once in your shell profile — there is no default.
+
+### Candidate CI policy audit
+
+`scripts/candidate_ci_setup.py` audits whether GitHub can bind a required
+candidate check to the trusted workflow rather than merely its display name.
+It never enables the spoofable classic status-check path.
+
+See [Candidate Verification CI](candidate-verification-ci.md) for the hosted
+runner boundary and the operator rollout procedure.
+
+### Dedicated test-runner capacity
+
+Development test runners share one canonical per-account capacity state at
+`~/.cache/lifeos/development-capacity`; neither a worktree nor a synthetic
+`HOME` creates another production budget. Normal callers read its configured
+total and conservative normal per-run maximum (initially total `4`, per-run
+`2`). Configure it only during a host-wide quiescent maintenance window:
+
+```bash
+python scripts/test_capacity.py configure --total-workers 8 --max-run-workers 2
+```
+
+The command takes the canonical construction/acquisition lock, tries every
+current slot without waiting, and refuses if any lease is active. It writes the
+replacement configuration atomically only after that proof; restoring `4` is
+the same operation:
+
+```bash
+python scripts/test_capacity.py configure --total-workers 4 --max-run-workers 2
+```
+
+For a reviewed dedicated invocation, the runner's explicit per-run override
+may be larger than the normal cap but never larger than the configured total:
+
+```bash
+python scripts/verify_candidate.py local --source . --evidence-root /safe/evidence \
+  --lanes fast-unit,browser-free --workers 8 --capacity-max-run-workers 8 \
+  --parallel-browser-free
+```
+
+The verifier's stdout is one authoritative JSON receipt with an explicit
+`result` (`success` or `failure`) and an `evidence_key` linking it to the
+lane-attributable receipt under `--evidence-root`; pytest output is retained
+privately during execution and never prefixes that document.
+
+This is a reservation control, not proof that eight workers are safe. Retain
+the CPU-only environment safeguards, source/evidence identity, detached owner,
+and whole-process cleanup; do not run a large capacity benchmark until its
+resource evidence and review are approved. Two genuinely concurrent jobs with
+eight workers each require a separately configured total of `16`; a total of
+`8` serializes them and must not be reported as concurrent throughput.
+
+Every runner process must use the current capacity implementation: a process
+that does not fence acquisition with `initialize.lock` can retain slot paths
+that are unsafe for a shrink. Finish or stop every runner, update every active
+worktree to this implementation, and restart those runner processes before
+changing a shared host; do not shrink while any process with obsolete slot
+paths could acquire. If that transition cannot be proved, leave the existing
+total in place. The restoration command above requires the same quiescence and
+upgrade preconditions.
+
+---
+
+## Sync Scripts
+
+### run_all_syncs.py
+
+Orchestrate all data sync operations. On Linux the nightly run is driven by the `lifeos-sync.timer` systemd timer (installed by `setup-systemd.sh`) — not a raw crontab. Check its schedule with `systemctl list-timers lifeos-sync.timer`. On macOS the equivalent is the `com.lifeos.crm-sync` launchd agent. The commands below run it manually.
+
+```bash
+# Check sync status
+~/.venvs/lifeos/bin/python scripts/run_all_syncs.py --status
+
+# Dry run (show what would run)
+~/.venvs/lifeos/bin/python scripts/run_all_syncs.py --dry-run
+
+# Execute full sync
+~/.venvs/lifeos/bin/python scripts/run_all_syncs.py --execute --force
+
+# Run specific source only
+~/.venvs/lifeos/bin/python scripts/run_all_syncs.py --source gmail --force
+```
+
+**Phases**:
+1. Data Collection (Gmail, Calendar, Contacts, etc.)
+2. Entity Processing (link Slack/iMessage to people)
+3. Relationship Building (discover connections)
+4. Vector Store Indexing (reindex vault)
+5. Content Sync (Google Docs/Sheets to vault)
+6. Entity Cleanup (auto-hide obvious non-human entities)
+7. Consistency Verification (orphan checks, stats reconciliation)
+
+---
+
+### first_backfill.py
+
+One-time deep backfill for a fresh install — run this once after initial
+setup. The nightly job above deliberately narrows Gmail/Calendar to a
+30-day window; this instead runs those sources (and everything else in
+Phases 1-4, in the same order) at their own full-history default, then
+prints a coverage report (count + earliest/latest date per source).
+
+```bash
+# Preview what would run
+~/.venvs/lifeos/bin/python scripts/first_backfill.py --dry-run
+
+# Run the backfill
+~/.venvs/lifeos/bin/python scripts/first_backfill.py --execute
+```
+
+Safe to re-run — see [data-and-sync.md](../specs/technical/data-and-sync.md#first-backfill-entry-point) for details.
+
+---
+
+### Individual Sync Scripts
+
+All sync scripts follow the pattern:
+- Dry run by default (shows what would change)
+- Use `--execute` to apply changes
+
+#### Data Collection
+
+| Script | Purpose |
+|--------|---------|
+| `sync_gmail_calendar_interactions.py` | Sync Gmail and Calendar |
+| `sync_linkedin.py` | Import LinkedIn connections |
+| `sync_contacts_csv.py` | Import Apple Contacts (CSV) |
+| `sync_apple_contacts.py` | Sync Apple Contacts via direct API |
+| `sync_phone_calls.py` | Sync phone call history |
+| `sync_imessage_interactions.py` | Sync iMessage |
+| `sync_slack.py` | Sync Slack users and DMs |
+| `sync_monarch_money.py` | Sync Monarch Money financial data |
+
+Example:
+```bash
+~/.venvs/lifeos/bin/python scripts/sync_gmail_calendar_interactions.py --execute
+```
+
+#### Entity Processing
+
+| Script | Purpose |
+|--------|---------|
+| `link_slack_entities.py` | Link Slack users to people by email |
+| `link_imessage_entities.py` | Link iMessage handles by phone |
+| `link_source_entities.py` | Retroactive linking for unlinked entities |
+| `sync_photos.py` | Sync Photos face recognition |
+
+#### Relationship Building
+
+| Script | Purpose |
+|--------|---------|
+| `sync_relationship_discovery.py` | Discover relationships from interactions |
+| `sync_strengths.py` | Recalculate relationship strengths |
+| `sync_person_stats.py` | Verify/repair interaction counts |
+| `push_birthdays_to_contacts.py` | Push birthdays to Apple Contacts |
+
+#### Vector Store
+
+| Script | Purpose |
+|--------|---------|
+| `sync_vault_reindex.py` | Reindex vault to ChromaDB + BM25 |
+| `sync_vault_tag.py` | Tag changed vault notes (`--execute`, or `--dry-run` to count only; skipped when tagging is unconfigured) |
+| `sync_crm_to_vectorstore.py` | Index CRM people for search |
+
+#### Content Sync
+
+| Script | Purpose |
+|--------|---------|
+| `sync_google_docs.py` | Sync Google Docs to vault |
+| `sync_google_sheets.py` | Sync Google Sheets to vault |
+
+#### Post-Sync Cleanup
+
+| Script | Purpose |
+|--------|---------|
+| `sync_entity_cleanup.py` | Auto-hide obvious non-human entities (noreply@, newsletters) |
+
+---
+
+## Retrieval Eval
+
+`scripts/retrieval_eval/` measures whether search ranks the right vault files near the top. The labeled set lives in `data/retrieval_eval/pairs.jsonl` (git-ignored; it holds real queries and file names).
+
+| Script | Purpose |
+|--------|---------|
+| `mine_pairs.py` | Reads `data/conversations.db` (`--db` to override) and writes `{query, relevant_files, source}` pairs: `mined` for turns whose routing lists `search_vault` and whose persisted `sources` record a `read_vault_file` call, `cited` for vault files the answer cited. `--manual FILE` appends operator-written pairs from YAML or JSONL (`--manual-only` skips mining). Records with the same source, query and relevant files collapse into one carrying `count` (the number of turns that produced it); the summary line reports `deduped=<records removed>`. Prints counts only. |
+| `score.py` | `--arm hybrid\|bm25\|vector --k 10` prints recall@k, recall@40 and MRR over the pairs; `--exclude-source mined\|cited\|manual` (repeatable) drops a signal; `--weighted` weights each record by its `count` (default: each record counts once); `--verbose` lists the missed queries. `hybrid` calls `/api/search` on `LIFEOS_SERVER_URL`; `bm25` runs `BM25Index.search` on `--bm25-db` (point it at a copy, the index creates tables on open); `vector` runs `VectorStore.search` in-process and loads the embedding model, so set `HIP_VISIBLE_DEVICES=""`. |
+
+The display `sources` column stores each call as `tool(json-args)` cut to 80 characters; the miner resolves a cut-off path or file name by unique prefix match against the `.md` files under `--vault` (default `settings.vault_path`) and skips zero or ambiguous matches. Cited pairs are biased toward whatever the live retriever returned, so exclude them when comparing retrieval arms.
+
+---
+
+## Utility Scripts
+
+| Script | Purpose |
+|--------|---------|
+| `backup.sh` | Backup data directory |
+| `setup_identity.py` | Guided first-run identity setup: search+pick yourself, your partner, and family in the vault; set work email domain(s); writes `LIFEOS_MY_PERSON_ID`/`LIFEOS_PARTNER_NAME`/`LIFEOS_WORK_DOMAIN*` to `.env` and merges `config/family_members.json`/`config/relationship_overrides.json`. Run once, after the first sync/index — requires the API server up. |
+| `monarch_reauth.py` | Non-interactive Monarch Money MFA re-auth (the interactive `interactive_login` flow needs a real TTY, which agent shells don't have) — see [operations.md](operations.md#monarch-money-financial-data). |
+| `chromadb-watchdog.sh` | ChromaDB health check and auto-restart |
+| `gpu-watchdog.sh` | Alerts via Telegram when GPU VRAM usage crosses a threshold, to catch impending OOM lockups before an embedding-heavy sync triggers one. Linux only (AMDGPU sysfs). Installed as `lifeos-gpu-watchdog.timer` by `setup-systemd.sh`. |
+| `server-watchdog.sh` | Detects and restarts a stuck/duplicated API server (duplicate uvicorn processes, unresponsive after long syncs). Installed as `lifeos-server-watchdog.timer` by `setup-systemd.sh`; on macOS, run from a cron entry via the `LifeOS.app` FDA wrapper. |
+| `network-watchdog.sh` | WiFi link health check and gentle self-heal (`nmcli device connect` re-activate only — deliberately never bounces the radio, reloads the driver, or restarts NetworkManager, since those can deadlock some WiFi drivers). Also self-heals a Tailscale address loss: when `tailscale` is installed and `tailscale status --json` reports `BackendState Running` but `tailscale0` has no IPv4 address, restarts `tailscaled` (rate-limited) and alerts with the outcome — a no-op on a host without Tailscale. Opt-in via `LIFEOS_NETWORK_WATCHDOG_ENABLED`; installed as `lifeos-network-watchdog.timer` by `setup-systemd.sh`. |
+| `infra-watchdog.sh` | Checks declared tailnet routes (re-applies missing ones), the optional Pebble receiver health URL, and, when declared, that Obsidian is running. Alerts via Telegram with a per-kind cooldown. Installed as the user unit `lifeos-infra-watchdog.timer` by `setup-systemd.sh` — see [operations.md](operations.md#host-routes-and-dependencies). |
+| `auto-deploy.sh` | Poll `origin/main`; on a fast-forward advance, pull and restart the code services that changed. Pull-based, guarded (main branch + clean tree + `--ff-only`), opt-in via `LIFEOS_AUTODEPLOY_ENABLED`. Run by `lifeos-autodeploy.timer`. |
+| `auto-update-macos.sh` | The macOS analog of `auto-deploy.sh` for the launchd-managed API service. Same opt-in flag and guards; not installed as a timer by this repo — an operator adds their own cron/launchd entry. See [Auto-Deploy on macOS](operations.md#auto-deploy-on-macos-self-hosted-redeploy) in operations.md. |
+| `cleanup-worktrees.sh` | Idempotent git-worktree pruning plus targeted removal of a stale worktree/branch; safe to call pre-flight before `git worktree add`. |
+| `migrate_reminders_to_scheduler.py` | One-shot, idempotent migration of the legacy `~/.lifeos/reminders.json` store into the Scheduler's `Inbox.md` source of truth. Non-destructive (keeps the JSON as backup). |
+| `install_codex_skills.py` | Convert portable LifeOS skills from `.claude/skills/` into Codex's `SKILL.md` format into `~/.codex/skills/`. Re-run after editing source skills. |
+| `register_persona_bot.py` | Safely register a new persona Telegram bot: appends its token/chat-id env vars to `.env` (append-only — a symlinked `.env` stays a symlink) and adds it to `config/telegram_bots.local.json` (seeded from the template on first use). Does not register the bot with @BotFather or restart the service — see [personas.md](personas.md#create-your-own-persona). |
+| `create-lifeos-app.sh` | Create the `LifeOS.app` Full Disk Access wrapper bundle in `/Applications` (macOS only), the FDA container cron/launchd route through for protected databases. |
+| `lifeos-agent-hook.sh` | Claude Code / Codex session-lifecycle hook — posts session_start/user_prompt_submit/stop/session_end to `POST /api/agents/cli-sessions/events` from any machine, so `/agents` shows sessions from every machine, not just this one. Installed by `install-agent-hooks.sh`; see [agents-go-to.md § 4](agents-go-to.md#4-cross-machine-session-registration). |
+| `install-agent-hooks.sh` | Idempotently installs `lifeos-agent-hook.sh` into `~/.claude/settings.json` and `~/.codex/hooks.json`. Run once per machine; safe to re-run. |
+| `jev_eval/e6_vault_tags.py` | Measures Jev vault-tagging quality on one folder (`--folder`, `--limit`, `--runs`, `--gold`, `--out`): agreement with the notes' own human `type:`/`tags:` mapped onto the taxonomy, per-facet accuracy against a local gold file (`data/vault_tag_gold.jsonl`, one JSON object per line: `file_path` plus any of `doc_type`, `domain`, `topic`, `project`), calibration per 0.1 confidence bucket, and the run-to-run flip rate. Prints aggregate numbers only and writes `data/jev_eval/e6_results.json`. Sends that folder's notes to TypeSafe. |
+| `jev_eval/silver_labels.py` | Reads the tag store and the vault (`--vault`, `--db`), changing neither, and prints aggregate agreement only: stored document type versus the mapped frontmatter `type:`, and for each mapped human tag the share of tagged notes whose stored topics include the mapped topic. |
+| `taxonomy_bootstrap.py` | Proposes vault taxonomy topics: samples `--sample N` notes (default 200) stratified by top-level folder, collects their frontmatter tags and folder names, and asks the specialist LLM backend (Anthropic, else local, else remote) for `parent/child` topics in the shape of `config/vault_taxonomy.yaml`. Writes `data/taxonomy_proposal.yaml` only, never `config/`; the operator edits it into `config/vault_taxonomy.local.yaml`. Note titles, tags, and short excerpts go to the configured backend. `--dry-run` prints sample sizes and a prompt token estimate without calling the LLM. |
+| `search_attribution_report.py` | Read-only report over the perf-trace database (`--since <date>`, optional `--db`): how many vault searches ran, the mean/median share of final results the keyword arm reaches, the share of searches with zero keyword or zero vector candidates, the keyword match-mode mix, and the `top_k` distribution. Query text is printed only with `--show-queries`. See [observability.md](../specs/technical/observability.md#search-attribution). |
+| `preflight.sh` | Pre-flight checks (called by server.sh) |
+| `run_sync_wrapper.sh` | NVMe wake + pre-flight for nightly sync |
+| `run_sync_with_fda.sh` | FDA wrapper for phone/iMessage sync (macOS) |
+| `run_fda_syncs.py` | Python FDA sync orchestrator (macOS) |
+| `apple_data_export.py` | Export Apple data (iMessage, Contacts, Photos) on macOS |
+| `apple_data_import.py` | Import Apple data exports on the server |
+| `apple_data_agent.sh` | Apple Data Agent orchestrator (runs on macOS, rsyncs to server) |
+
+---
+
+## Service Management
+
+### service.sh
+
+Manage system services (systemd on Linux, launchd on macOS).
+
+```bash
+./scripts/service.sh install    # Install and start the service (auto-start on boot)
+./scripts/service.sh uninstall  # Stop and remove the service
+./scripts/service.sh start      # Start the service
+./scripts/service.sh stop       # Stop the service
+./scripts/service.sh restart    # Restart the service
+./scripts/service.sh status     # Check service status and health
+./scripts/service.sh logs       # Tail the service logs
+```
+
+---
+
+### setup-systemd.sh
+
+Configure systemd services on Linux. Reads toggles from `.env`, substitutes templates from `config/systemd/`, then enables and starts the units. Re-run after changing any autostart toggle in `.env`.
+
+```bash
+sudo ./scripts/setup-systemd.sh
+```
+
+Installs and enables:
+
+- **Services** — `lifeos-api`, `lifeos-chromadb`, `lifeos-llm` (local LLM; enabled only when `LIFEOS_LOCAL_LLM_AUTOSTART=true`), `lifeos-mcp-http` (enabled only when `LIFEOS_MCP_BEARER_TOKEN` is set), `lifeos-agent-worker` (enabled only when `LIFEOS_AGENT_WORKER_AUTOSTART=true`).
+- **Timers** — `lifeos-watchdog`, `lifeos-server-watchdog`, `lifeos-gpu-watchdog`, `lifeos-network-watchdog`, `lifeos-sync` (nightly unified sync), and `lifeos-autodeploy` (enabled only when `LIFEOS_AUTODEPLOY_ENABLED=true`).
+- **Supporting config** — a logrotate rule (`/etc/logrotate.d/lifeos`), a passwordless-`systemctl` sudoers rule (`/etc/sudoers.d/lifeos`) so `server.sh` and the sync scripts can manage units without a password, and an 8 GB swap file as an OOM safety net (created only if no swap is already active).
+
+The logrotate rule covers `logs/server.log`, `logs/agent-worker.log`, and the other files under `logs/*.log`. It rotates them daily, retains seven compressed rotations, skips missing or empty logs, and uses `copytruncate` so systemd services continue writing to the active paths without a restart or reload. The installed host copy is generated from `config/logrotate-lifeos.conf` only when `sudo ./scripts/setup-systemd.sh` runs; re-run that command to apply template updates to `/etc/logrotate.d/lifeos`.
+
+---
+
+### setup-launchd.sh
+
+Configure launchd services from templates (macOS only). Interactive: prompts for the vault path (or accepts it as an optional argument, or falls back to `LIFEOS_VAULT_PATH` in `.env` under `--yes`), generates plist files from `config/launchd/` templates, and installs them to `~/Library/LaunchAgents/`. ChromaDB is intentionally skipped — use a cron watchdog for it (see [launchd-setup.md](launchd-setup.md)).
+
+Installs, conditionally, the same two services `setup-systemd.sh` gates on Linux — **agent-worker** (only when `LIFEOS_AGENT_WORKER_AUTOSTART=true`) and **MCP HTTP** (only when `LIFEOS_MCP_BEARER_TOKEN` is set) — using the same env vars, so one `.env` controls both platforms identically. Neither is generated-and-skipped like ChromaDB; with its flag unset, no plist for it is installed at all. The GPU and network watchdogs have no macOS equivalent (different hardware/driver entirely) — the run prints them as explicitly skipped, not silence, at the end.
+
+Re-running never silently replaces a differently-configured, already-installed plist: if the generated content differs from what's on disk, the existing file is backed up to `config/launchd/backups/` before being overwritten, with a `WARNING` line naming what happened.
+
+```bash
+./scripts/setup-launchd.sh                 # prompts for vault path
+./scripts/setup-launchd.sh ~/Notes --yes   # pass vault path, skip confirmation
+```
+
+---
+
+### setup-tailscale.sh
+
+Expose LifeOS on the tailnet HTTPS front (port 443) via `tailscale serve`, so `/chat` voice works (the mic needs a secure context). Reverse-proxies to the local API; whisper-relay stays on localhost. Also applies every route declared in `config/tailscale-routes.local` and verifies each is live, exiting non-zero if one is missing; it never resets routes it does not declare — see [operations.md](operations.md#host-routes-and-dependencies). Reads `LIFEOS_PORT` / `TAILNET_HTTPS_URL` from the environment.
+
+```bash
+./scripts/setup-tailscale.sh
+```
+
+---
+
+### install-systemd-tailscale.sh
+
+Generate a `--user` systemd unit (`lifeos-tailscale.service`) that runs `setup-tailscale.sh` once the API is healthy, so the Tailscale Serve proxy survives reboot.
+
+```bash
+./scripts/install-systemd-tailscale.sh
+systemctl --user enable --now lifeos-tailscale.service
+```
+
+---
+
+## Authentication
+
+### google_auth.py
+
+Authenticate with Google OAuth.
+
+```bash
+# Personal account
+~/.venvs/lifeos/bin/python scripts/google_auth.py --account personal
+
+# Work account
+~/.venvs/lifeos/bin/python scripts/google_auth.py --account work
+```
+
+Opens browser for Google sign-in, saves token to configured path.
+
+### eero_login.py
+
+Two-step, non-interactive eero login (see [home-eero.md](home-eero.md)).
+
+```bash
+# Step 1: request a verification code
+python scripts/eero_login.py --login you@example.com
+
+# Step 2: verify the code once it arrives by SMS/email
+python scripts/eero_login.py --code 123456
+```
+
+Stores the session in `data/home/eero_session.json` (mode 0600); never prints the token.
+
+---
+
+## Maintenance
+
+### Manual API Triggers
+
+These operations can also be triggered via API:
+
+```bash
+# Reindex vault (background)
+curl -X POST http://localhost:8000/api/admin/reindex
+
+# Reindex vault (blocking)
+curl -X POST http://localhost:8000/api/admin/reindex/sync
+
+# Trigger calendar sync
+curl -X POST http://localhost:8000/api/admin/calendar/sync
+
+# Trigger relationship discovery
+curl -X POST http://localhost:8000/api/crm/relationships/discover
+
+# Update relationship strengths
+curl -X POST http://localhost:8000/api/crm/strengths/update
+```
+
+---
+
+## Script Patterns
+
+### Common Flags
+
+| Flag | Description |
+|------|-------------|
+| `--execute` | Apply changes (default is dry run) |
+| `--force` | Skip "already ran today" checks |
+| `--dry-run` | Show what would happen without changes |
+| `--source X` | Run only specific source |
+
+### Environment
+
+Scripts expect:
+- `~/.venvs/lifeos` on the server
+- `.env` file with configuration
+- ChromaDB running for vector operations
+- Server running for API-based operations
+
+### Logs
+
+Sync logs go to:
+- stdout/stderr during execution
+- `logs/crm-sync.log` when run via systemd/launchd
+- `~/Notes/LifeOS/sync_errors.md` for error summaries
+
+---
+
+## Examples
+
+### Daily Workflow
+
+```bash
+# Morning: check status
+./scripts/server.sh status
+curl http://localhost:8000/health/full | jq
+
+# After code changes
+./scripts/server.sh restart
+./scripts/test.sh
+
+# Ready to commit
+./scripts/deploy.sh "Add new feature"
+```
+
+### Debug a Sync Issue
+
+```bash
+# Check what ran
+~/.venvs/lifeos/bin/python scripts/run_all_syncs.py --status
+
+# Run specific source with debug output
+~/.venvs/lifeos/bin/python scripts/sync_gmail_calendar_interactions.py --execute 2>&1 | tee debug.log
+
+# Check for errors
+cat ~/Notes/LifeOS/sync_errors.md
+```
+
+### Force Full Reindex
+
+```bash
+# Stop server
+./scripts/server.sh stop
+
+# Clear and rebuild (optional, destructive)
+rm -rf data/chromadb/lifeos_*
+rm data/chromadb/bm25_index.db
+
+# Start server
+./scripts/server.sh start
+
+# Trigger full reindex
+curl -X POST http://localhost:8000/api/admin/reindex/sync
+```
+
+## Related Documents
+
+- [Launchd Setup](launchd-setup.md) -- Automated service management (macOS)
+- [Troubleshooting](troubleshooting.md) -- Common issues and solutions
+- [Personas](personas.md) -- `register_persona_bot.py`'s "Create your own persona" workflow
+- [Operations](operations.md) -- Auto-Deploy (Linux and macOS) drift detection, sync lock, and restart-sequence detail

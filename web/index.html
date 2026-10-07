@@ -1,0 +1,5023 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="Chat">
+    <meta name="theme-color" content="#16213e">
+    <title>LifeOS</title>
+    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+    <link rel="apple-touch-icon" href="/static/icons/apple-touch-icon.png">
+    <link rel="manifest" href="/manifests/chat.webmanifest">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <script type="module" src="/static/chat/main.js"></script>
+    <style>
+        :root {
+            --bg-primary: #1a1a2e;
+            --bg-secondary: #16213e;
+            --bg-tertiary: #0f3460;
+            --text-primary: #eaeaea;
+            --text-secondary: #a0a0a0;
+            --text-muted: #6a6a8a;
+            --accent: #e94560;
+            --accent-hover: #ff6b6b;
+            --user-bubble: #0f3460;
+            --assistant-bubble: #1a1a2e;
+            --border: #2a2a4e;
+            --success: #4caf50;
+            --warning: #ff9800;
+            --error: #f44336;
+            --sidebar-width: 280px;
+            --header-height: 56px;
+            --input-height: 72px;
+            --safe-top: env(safe-area-inset-top, 0px);
+            --safe-bottom: env(safe-area-inset-bottom, 0px);
+            --safe-left: env(safe-area-inset-left, 0px);
+            --safe-right: env(safe-area-inset-right, 0px);
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            touch-action: manipulation;  /* Disable iOS double-tap delay globally */
+        }
+
+        * {
+            scrollbar-width: thin;
+            scrollbar-color: var(--border) transparent;
+        }
+
+        *::-webkit-scrollbar {
+            width: 10px;
+            height: 10px;
+        }
+
+        *::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        *::-webkit-scrollbar-thumb {
+            background-color: var(--border);
+            border-radius: 6px;
+            border: 2px solid transparent;
+            background-clip: padding-box;
+        }
+
+        *::-webkit-scrollbar-thumb:hover {
+            background-color: var(--text-muted);
+        }
+
+        html, body {
+            height: 100vh;   /* fallback for browsers without dvh */
+            height: 100dvh;  /* track the mobile browser's dynamic chrome (address bar / keyboard) so the composer stays reachable */
+            overflow: hidden;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            display: flex;
+            padding-top: var(--safe-top);
+        }
+
+        /* Sidebar */
+        .sidebar {
+            width: var(--sidebar-width);
+            height: 100%;
+            background: var(--bg-secondary);
+            border-right: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            flex-shrink: 0;
+            transition: transform 0.3s ease;
+        }
+
+        .sidebar-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 1rem;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .sidebar-header h1 {
+            font-size: 1.25rem;
+            font-weight: 600;
+        }
+
+        .new-chat-btn {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 36px;
+            height: 36px;
+            background: var(--accent);
+            border: none;
+            border-radius: 8px;
+            color: white;
+            font-size: 1.25rem;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .new-chat-btn:hover {
+            background: var(--accent-hover);
+        }
+
+        .conversations-list {
+            flex: 1;
+            overflow-y: auto;
+            padding: 0.5rem;
+        }
+
+        .conversation-item {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            padding: 0.75rem;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: background 0.2s;
+            min-height: 48px;
+        }
+
+        .conversation-item:hover {
+            background: var(--bg-tertiary);
+        }
+
+        .conversation-item.active {
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+        }
+
+        .conversation-icon {
+            width: 32px;
+            height: 32px;
+            background: var(--bg-primary);
+            border-radius: 6px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.875rem;
+            flex-shrink: 0;
+        }
+
+        .conversation-info {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .conversation-title {
+            font-size: 0.875rem;
+            font-weight: 500;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .conversation-date {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+        }
+
+        .conversation-delete {
+            opacity: 0;
+            width: 28px;
+            height: 28px;
+            background: transparent;
+            border: none;
+            border-radius: 4px;
+            color: var(--text-secondary);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s;
+        }
+
+        .conversation-item:hover .conversation-delete {
+            opacity: 1;
+        }
+
+        .conversation-delete:hover {
+            background: var(--error);
+            color: white;
+        }
+
+        /* Main content */
+        .main {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            min-width: 0;
+            height: 100%;
+        }
+
+        /* Header */
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 0 1rem;
+            height: var(--header-height);
+            background: var(--bg-secondary);
+            border-bottom: 1px solid var(--border);
+            flex-shrink: 0;
+        }
+
+        .header-left {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        .header-brand {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            text-decoration: none;
+            color: var(--text-primary);
+            font-weight: 600;
+            font-size: 1rem;
+            padding: 0.375rem 0.5rem;
+            border-radius: 6px;
+            transition: background 0.2s;
+        }
+
+        .header-brand:hover {
+            background: var(--bg-tertiary);
+        }
+
+        .header-nav {
+            display: flex;
+            align-items: center;
+            gap: 0.25rem;
+        }
+
+        .nav-link {
+            display: flex;
+            align-items: center;
+            gap: 0.375rem;
+            padding: 0.375rem 0.75rem;
+            border-radius: 6px;
+            text-decoration: none;
+            font-size: 0.85rem;
+            font-weight: 500;
+            color: var(--text-secondary);
+            transition: all 0.2s;
+        }
+
+        .nav-link:hover {
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+        }
+
+        .nav-link.active {
+            background: var(--accent);
+            color: white;
+        }
+
+        .menu-btn {
+            display: none;
+            width: 40px;
+            height: 40px;
+            background: transparent;
+            border: none;
+            border-radius: 8px;
+            color: var(--text-primary);
+            font-size: 1.25rem;
+            cursor: pointer;
+        }
+
+        .menu-btn:hover {
+            background: var(--bg-tertiary);
+        }
+
+        .chat-title {
+            font-size: 1rem;
+            font-weight: 500;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            max-width: 300px;
+        }
+
+        .header-right {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+
+        .cost-display {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            background: var(--bg-primary);
+            padding: 0.375rem 0.75rem;
+            border-radius: 12px;
+            cursor: pointer;
+            transition: all 0.2s;
+            border: 1px solid transparent;
+        }
+
+        .cost-display:hover {
+            background: var(--bg-tertiary);
+            border-color: var(--border);
+        }
+
+        .cost-display .amount {
+            color: var(--text-secondary);
+            font-weight: 500;
+        }
+
+        .status {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-size: 0.875rem;
+            color: var(--text-secondary);
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--success);
+        }
+
+        .status-dot.loading {
+            background: var(--warning);
+            animation: pulse 1s infinite;
+        }
+
+        .status-dot.error {
+            background: var(--error);
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        /* Messages area */
+        .messages-container {
+            flex: 1;
+            overflow: hidden;
+            position: relative;
+        }
+
+        .messages {
+            height: 100%;
+            overflow-y: auto;
+            padding: 1rem;
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+            scroll-behavior: smooth;
+        }
+
+        .message {
+            max-width: min(85%, 700px);
+            padding: 1rem;
+            border-radius: 12px;
+            line-height: 1.6;
+            position: relative;
+        }
+
+        .message.user {
+            align-self: flex-end;
+            background: var(--user-bubble);
+            border: 1px solid var(--border);
+        }
+
+        .message.assistant {
+            align-self: flex-start;
+            background: var(--assistant-bubble);
+            border: 1px solid var(--border);
+        }
+
+        /* Answer affordance for an orchestrating-persona session awaiting a
+           [CLARIFY]/[GOAL]. Appended inside #messages, styled like an
+           assistant bubble but accented so it reads as an action, not a reply. */
+        .pending-question {
+            align-self: flex-start;
+            max-width: min(85%, 700px);
+            padding: 1rem;
+            border-radius: 12px;
+            background: var(--assistant-bubble);
+            border: 1px solid var(--accent);
+            display: flex;
+            flex-direction: column;
+            gap: 0.625rem;
+        }
+
+        .pending-question .pq-heading {
+            font-weight: 600;
+            color: var(--accent);
+        }
+
+        .pending-question .pq-question {
+            white-space: pre-wrap;
+            word-break: break-word;
+            line-height: 1.5;
+        }
+
+        .pending-question .pq-row {
+            display: flex;
+            gap: 0.5rem;
+            align-items: stretch;
+        }
+
+        .pending-question .pq-input {
+            flex: 1;
+            padding: 0.5rem 0.75rem;
+            background: var(--bg-primary);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            color: var(--text-primary);
+            font-size: 0.95rem;
+            font-family: inherit;
+        }
+
+        .pending-question .pq-input:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+
+        .pending-question .pq-send {
+            background: var(--accent);
+            border: none;
+            border-radius: 10px;
+            color: white;
+            font-size: 0.95rem;
+            padding: 0 1rem;
+            cursor: pointer;
+            transition: background 0.2s;
+            flex-shrink: 0;
+        }
+
+        .pending-question .pq-send:hover:not(:disabled) {
+            background: var(--accent-hover);
+        }
+
+        .pending-question .pq-send:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .pending-question .pq-hint {
+            font-size: 0.8rem;
+            color: var(--text-muted);
+        }
+
+        .pending-question .pq-status {
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            min-height: 1em;
+        }
+
+        .pending-question .pq-status:empty {
+            display: none;
+        }
+
+        .message-content {
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
+        .message-content p {
+            margin-bottom: 0.5rem;
+        }
+
+        .message-content p:last-child {
+            margin-bottom: 0;
+        }
+
+        .message-content code {
+            background: var(--bg-tertiary);
+            padding: 0.125rem 0.375rem;
+            border-radius: 4px;
+            font-family: 'SF Mono', Monaco, 'Courier New', monospace;
+            font-size: 0.875em;
+        }
+
+        .attachment-indicator {
+            display: inline-block;
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            margin-top: 0.5rem;
+        }
+
+        /* Routing sources display */
+        .routing-sources {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.375rem;
+            margin-bottom: 0.5rem;
+            font-size: 0.75rem;
+        }
+
+        .routing-source {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.25rem;
+            padding: 0.125rem 0.5rem;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 999px;
+            color: var(--text-secondary);
+        }
+
+        .routing-source.vault { border-color: #4caf50; color: #4caf50; }
+        .routing-source.calendar { border-color: #2196f3; color: #2196f3; }
+        .routing-source.gmail { border-color: #f44336; color: #f44336; }
+        .routing-source.drive { border-color: #ff9800; color: #ff9800; }
+        .routing-source.attachment { border-color: #9c27b0; color: #9c27b0; }
+        .routing-source.people { border-color: #00bcd4; color: #00bcd4; }
+
+        /* "Runs on LifeOS" toolbar badge: shown whenever the selected
+           persona orchestrates on the LifeOS backend specifically (spawns a
+           background Claude Code session). Hermes drives an
+           orchestrating persona itself (lifeos_agent_spawn) rather than having
+           its turn diverted to LifeOS, so the badge only shows
+           on lifeos. Agent has no persona pass-through at all. */
+        .orchestrates-badge:not([hidden]) {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.25rem;
+            padding: 0.125rem 0.5rem;
+            font-size: 0.72rem;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 999px;
+            color: var(--text-secondary);
+            white-space: nowrap;
+        }
+
+        .message-actions {
+            position: absolute;
+            top: 0.5rem;
+            right: 0.5rem;
+            display: flex;
+            gap: 0.25rem;
+            opacity: 0;
+            transition: opacity 0.2s;
+        }
+
+        .message:hover .message-actions {
+            opacity: 1;
+        }
+
+        .action-btn {
+            width: 28px;
+            height: 28px;
+            background: var(--bg-tertiary);
+            border: none;
+            border-radius: 4px;
+            color: var(--text-secondary);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.75rem;
+            transition: all 0.2s;
+        }
+
+        .action-btn:hover {
+            background: var(--accent);
+            color: white;
+        }
+
+        .action-btn.copied {
+            background: var(--success);
+            color: white;
+        }
+
+        .message-meta {
+            display: flex;
+            flex-direction: column;
+            align-items: flex-start;
+            gap: 0.5rem;
+            margin-top: 0.75rem;
+            padding-top: 0.75rem;
+            border-top: 1px solid var(--border);
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+        }
+
+        .sources {
+            display: flex;
+            flex-direction: column;
+            align-items: flex-start;
+            gap: 0.5rem;
+        }
+
+        .source-chips {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+        }
+
+        .source-link {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.25rem;
+            padding: 0.375rem 0.625rem;
+            background: var(--bg-tertiary);
+            border-radius: 6px;
+            font-size: 0.75rem;
+            color: var(--accent);
+            text-decoration: none;
+            transition: all 0.2s;
+            min-height: 32px;
+        }
+
+        .source-link:hover {
+            background: var(--border);
+            color: var(--accent-hover);
+        }
+
+        /* Collapsible sources — collapsed by default, chips hidden until the
+           user clicks the compact "📄 N sources" toggle. */
+        .sources.collapsed .source-chips {
+            display: none;
+        }
+
+        .sources-toggle {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.25rem;
+            padding: 0.125rem 0;
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            cursor: pointer;
+            transition: color 0.2s;
+            background: none;
+            border: none;
+        }
+
+        .sources-toggle:hover {
+            color: var(--text-secondary);
+        }
+
+        .sources-caret {
+            font-size: 0.625rem;
+        }
+
+        /* Remember button */
+        .remember-btn {
+            padding: 0.375rem 0.75rem;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--text-secondary);
+            font-size: 0.75rem;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: flex;
+            align-items: center;
+            gap: 0.375rem;
+        }
+
+        .remember-btn:hover {
+            background: var(--accent);
+            border-color: var(--accent);
+            color: white;
+        }
+
+        /* Persona picker. Restyled to match the backend/mode pill
+           selectors below — same height, font, background, and colors
+           — via grouped selectors that share the pill rules rather than
+           duplicating their values, even though the picker itself is a
+           single <select> with no separate container element. */
+        .persona-picker,
+        .backend-toggle,
+        .mode-toggle-group {
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+        }
+
+        .persona-picker,
+        .backend-option,
+        .mode-toggle-option {
+            font-size: 0.72rem;
+            padding: 0.3rem 0.55rem;
+            color: var(--text-secondary);
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+
+        .persona-picker {
+            max-width: 160px;
+        }
+
+        .persona-picker:hover,
+        .persona-picker:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+
+        /* LifeOS|Agent|Hermes text-backend selector (a three-way toggle);
+           shown only when at least one of Agent/Hermes is configured
+           server-side (body.agent-available / body.hermes-configured). Each
+           non-lifeos option additionally hides itself unless ITS backend is
+           configured, so a machine with only one configured still gets a
+           clean two-way toggle rather than a dead third button.
+
+           Hermes visibility gates on -configured, not -available:
+           a configured-but-unreachable Hermes must stay visible (marked
+           unavailable via body.hermes-down below), not vanish
+           indistinguishably from "never configured". Agent has no such
+           split yet, so it still gates on -available.
+
+           .mode-toggle-group shares this same pill shape for the Text|Voice
+           input-mode selector — unlike the backend toggle it has no
+           availability gating, so it sets its own `display` instead of
+           joining the conditional rule below. */
+        .backend-toggle,
+        .mode-toggle-group {
+            align-items: center;
+            overflow: hidden;
+        }
+
+        .backend-toggle {
+            display: none;
+        }
+
+        .mode-toggle-group {
+            display: inline-flex;
+        }
+
+        body.agent-available .backend-toggle,
+        body.hermes-configured .backend-toggle {
+            display: inline-flex;
+        }
+
+        .backend-option,
+        .mode-toggle-option {
+            background: none;
+            border: none;
+        }
+
+        .backend-option.active,
+        .mode-toggle-option.active {
+            background: var(--accent);
+            color: white;
+        }
+
+        #backendAgent {
+            display: none;
+        }
+
+        body.agent-available #backendAgent {
+            display: inline-block;
+        }
+
+        #backendHermes {
+            display: none;
+        }
+
+        body.hermes-configured #backendHermes {
+            display: inline-block;
+        }
+
+        /* Configured but unreachable: visible, not silently hidden,
+           but visually marked as down and not clickable (backend.js's click
+           handler also refuses the switch — this is belt-and-suspenders). */
+        body.hermes-down #backendHermes {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        body.hermes-down #backendHermes::after {
+            content: " (unavailable)";
+        }
+
+        /* Agent mode has no personas — hide the picker (and, since the model
+           picker shares this class, the model picker too). */
+        body.agent-mode .persona-picker {
+            display: none;
+        }
+
+        /* Hermes mode keeps the persona picker visible but hides the per-turn
+           model picker — model selection there is the harness's concern. */
+        body.hermes-mode #modelPicker {
+            display: none;
+        }
+
+        /* Modal */
+        .modal-overlay {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.7);
+            z-index: 1000;
+            align-items: center;
+            justify-content: center;
+            padding: 1rem;
+        }
+
+        .modal-overlay.visible {
+            display: flex;
+        }
+
+        .modal {
+            background: var(--bg-secondary);
+            border-radius: 12px;
+            border: 1px solid var(--border);
+            width: 100%;
+            max-width: 500px;
+            max-height: 90vh;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 1rem 1.25rem;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .modal-header h3 {
+            font-size: 1rem;
+            font-weight: 600;
+        }
+
+        .modal-close {
+            width: 32px;
+            height: 32px;
+            background: transparent;
+            border: none;
+            color: var(--text-secondary);
+            cursor: pointer;
+            font-size: 1.25rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 4px;
+        }
+
+        .modal-close:hover {
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+        }
+
+        .modal-body {
+            padding: 1.25rem;
+            flex: 1;
+            overflow-y: auto;
+        }
+
+        .modal-body p {
+            color: var(--text-secondary);
+            font-size: 0.875rem;
+            margin-bottom: 1rem;
+            line-height: 1.5;
+        }
+
+        .modal-body textarea {
+            width: 100%;
+            min-height: 120px;
+            padding: 0.75rem;
+            background: var(--bg-primary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            color: var(--text-primary);
+            font-size: 0.875rem;
+            font-family: inherit;
+            resize: vertical;
+            line-height: 1.5;
+        }
+
+        .modal-body textarea:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+
+        .modal-body textarea::placeholder {
+            color: var(--text-muted);
+        }
+
+        .modal-footer {
+            display: flex;
+            justify-content: flex-end;
+            gap: 0.75rem;
+            padding: 1rem 1.25rem;
+            border-top: 1px solid var(--border);
+        }
+
+        .modal-btn {
+            padding: 0.5rem 1rem;
+            border-radius: 6px;
+            font-size: 0.875rem;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .modal-btn-cancel {
+            background: transparent;
+            border: 1px solid var(--border);
+            color: var(--text-secondary);
+        }
+
+        .modal-btn-cancel:hover {
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+        }
+
+        .modal-btn-save {
+            background: var(--accent);
+            border: none;
+            color: white;
+        }
+
+        .modal-btn-save:hover {
+            background: var(--accent-hover);
+        }
+
+        .modal-btn-save:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .modal-status {
+            padding: 0.75rem;
+            border-radius: 6px;
+            margin-top: 1rem;
+            font-size: 0.875rem;
+        }
+
+        .modal-status.success {
+            background: rgba(76, 175, 80, 0.1);
+            border: 1px solid var(--success);
+            color: var(--success);
+        }
+
+        .modal-status.error {
+            background: rgba(244, 67, 54, 0.1);
+            border: 1px solid var(--error);
+            color: var(--error);
+        }
+
+        /* Usage modal specific styles */
+        .usage-modal {
+            max-width: 700px;
+        }
+
+        .usage-stats-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 1rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .usage-stat-card {
+            background: var(--bg-primary);
+            border-radius: 8px;
+            padding: 1rem;
+            text-align: center;
+            border: 1px solid var(--border);
+        }
+
+        .usage-stat-label {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            margin-bottom: 0.5rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .usage-stat-value {
+            font-size: 1.25rem;
+            font-weight: 600;
+            color: var(--accent);
+        }
+
+        .usage-stat-requests {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            margin-top: 0.25rem;
+        }
+
+        .usage-stat-card.session-card {
+            border-color: var(--accent);
+            background: var(--bg-secondary);
+        }
+
+        .usage-chart-container {
+            background: var(--bg-primary);
+            border-radius: 8px;
+            padding: 1rem;
+            border: 1px solid var(--border);
+            height: 300px;
+        }
+
+        @media (max-width: 768px) {
+            .usage-stats-grid {
+                grid-template-columns: repeat(2, 1fr);
+            }
+
+            .usage-stat-card.session-card {
+                grid-column: span 2;
+            }
+
+            .usage-modal {
+                max-width: 100%;
+            }
+
+            .usage-stat-value {
+                font-size: 1rem;
+            }
+        }
+
+        /* Scroll to bottom */
+        .scroll-bottom {
+            position: absolute;
+            bottom: 1rem;
+            right: 1rem;
+            width: 40px;
+            height: 40px;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 50%;
+            color: var(--text-primary);
+            cursor: pointer;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            font-size: 1rem;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+            transition: all 0.2s;
+            z-index: 10;
+        }
+
+        .scroll-bottom.visible {
+            display: flex;
+        }
+
+        .scroll-bottom:hover {
+            background: var(--bg-tertiary);
+            transform: scale(1.1);
+        }
+
+        /* Input area */
+        .input-area {
+            padding: 1rem;
+            padding-bottom: calc(1rem + var(--safe-bottom));
+            flex-shrink: 0;
+        }
+
+        .input-container {
+            display: flex;
+            align-items: flex-end;
+            gap: 0.75rem;
+            max-width: 800px;
+            margin: 0 auto;
+        }
+
+        /* Wrapper around the run-as-agent controls (routing select + spawn).
+           Transparent on desktop so they sit inline in the composer row; on
+           mobile it becomes its own row above the input. */
+        .composer-tools {
+            display: contents;
+        }
+
+        /* Top-of-chat selector toolbar */
+        .chat-toolbar {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+            padding: 0.4rem 1rem;
+            border-bottom: 1px solid var(--border);
+            background: var(--bg-secondary);
+            flex-shrink: 0;
+        }
+
+        /* The model picker rides along on voice turns too — voice.js sends the
+           pick as `model_override` on /api/voice/turn/stream, which whisper-relay
+           relays to /api/ask/stream (whisper-relay#24) — so it stays visible in
+           voice mode. It is still hidden on the Agent backend via
+           `body.agent-mode .persona-picker` (that backend ignores model picks)
+           and on Hermes via `body.hermes-mode #modelPicker` — Hermes
+           keeps the persona picker visible but owns its own model selection. */
+
+        .voice-dock {
+            display: none;
+            position: relative;
+            flex-direction: column;
+            align-items: center;
+            gap: 0.5rem;
+            max-width: 800px;
+            margin: 0 auto;
+        }
+
+        .voice-dock-row {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.75rem;
+            width: 100%;
+        }
+
+        .voice-dock-toggles {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 1rem;
+            /* a little extra breathing room below the record button */
+            margin-top: 0.6rem;
+        }
+
+        .dock-toggle {
+            display: flex;
+            align-items: center;
+            gap: 0.25rem;
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            cursor: pointer;
+            user-select: none;
+        }
+
+        .dock-toggle input {
+            accent-color: var(--accent);
+            cursor: pointer;
+        }
+
+        /* Live-mic indicator on the Listening label. Hidden unless
+           voice.js adds `.live`, which it does only while the wake tap is
+           actually holding an unsuspended capture — so the dot disappears
+           during playback/recording and whenever Listening is off, rather
+           than tracking the checkbox. Reuses the `pulse` keyframes the
+           header status dot already uses. */
+        .listen-dot {
+            display: none;
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: var(--success);
+        }
+
+        .listen-dot.live {
+            display: inline-block;
+            animation: pulse 1.4s ease-in-out infinite;
+        }
+
+        /* Replayable voice responses (tap to replay) */
+        .message.replayable {
+            cursor: pointer;
+        }
+
+        .message.replayable:hover {
+            border-color: var(--accent);
+        }
+
+        /* Circular camera-shutter talk button */
+        .voice-talk-btn.shutter {
+            width: 76px;
+            height: 76px;
+            min-height: 76px;
+            max-width: none;
+            flex: 0 0 auto;
+            padding: 0;
+            border-radius: 50%;
+            background: var(--bg-tertiary);
+            border: 3px solid var(--border);
+            cursor: pointer;
+            transition: all 0.15s;
+            user-select: none;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .voice-talk-btn.shutter:hover {
+            border-color: var(--accent);
+        }
+
+        .shutter-core {
+            width: 54px;
+            height: 54px;
+            border-radius: 50%;
+            background: #fff;
+            transition: all 0.15s ease;
+        }
+
+        .voice-talk-btn.shutter.recording {
+            border-color: var(--error);
+            animation: shutter-pulse 1.4s ease-in-out infinite;
+        }
+
+        .voice-talk-btn.shutter.recording .shutter-core {
+            background: var(--error);
+        }
+
+        /* The whole button pulses (scale + an expanding red glow ring) while
+           recording. --error is #f44336 → rgb(244, 67, 54). */
+        @keyframes shutter-pulse {
+            0%, 100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(244, 67, 54, 0.5); }
+            50% { transform: scale(1.06); box-shadow: 0 0 0 12px rgba(244, 67, 54, 0); }
+        }
+
+        .voice-cancel-btn {
+            display: none;
+            width: 48px;
+            height: 48px;
+            background: none;
+            border: 1px solid var(--border);
+            border-radius: 50%;
+            color: var(--text-secondary);
+            cursor: pointer;
+            font-size: 1rem;
+        }
+
+        .voice-cancel-btn.visible {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        /* Network-resilience status row for a voice turn -- a subtle
+           "retrying" note, or a definitive "failed" state with Retry/dismiss.
+           A sibling of `.message.user`/`.message.assistant`, appended right
+           after the turn's bubble, deliberately NOT nested inside one (see
+           `turnStatusEl`'s comment in voice.js for why: `.message`'s own
+           text content is asserted verbatim by pre-existing tests). */
+        .voice-turn-status {
+            align-self: flex-end;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            max-width: min(85%, 700px);
+            padding: 0 0.25rem;
+            font-size: 0.8rem;
+            color: var(--text-muted);
+        }
+
+        .voice-turn-status.failed {
+            color: var(--text-secondary);
+        }
+
+        .voice-turn-retry-btn,
+        .voice-turn-dismiss-btn {
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            background: none;
+            font-size: 0.8rem;
+            padding: 0.2rem 0.6rem;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .voice-turn-retry-btn {
+            background: var(--accent);
+            border-color: var(--accent);
+            color: white;
+        }
+
+        .voice-turn-retry-btn:hover {
+            background: var(--accent-hover);
+        }
+
+        .voice-turn-dismiss-btn {
+            color: var(--text-muted);
+            padding: 0.2rem 0.5rem;
+        }
+
+        .voice-turn-dismiss-btn:hover {
+            color: var(--text-secondary);
+        }
+
+        /* Mode swap: voice mode hides the text composer, shows the dock. */
+        body.voice-mode .input-container,
+        body.voice-mode .attachments-preview {
+            display: none;
+        }
+
+        body.voice-mode .voice-dock {
+            display: flex;
+        }
+
+        .input-wrapper {
+            flex: 1;
+            position: relative;
+        }
+
+        .input-field {
+            display: block;  /* Fix baseline alignment gap */
+            width: 100%;
+            padding: 0.6875rem 1rem;  /* Adjusted to match 48px button height */
+            background: var(--bg-primary);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            color: var(--text-primary);
+            font-size: 1rem;
+            font-family: inherit;
+            resize: none;
+            min-height: 48px;
+            max-height: 200px;
+            line-height: 1.5;
+            transition: border-color 0.2s;
+        }
+
+        .input-field:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+
+        .input-field::placeholder {
+            color: var(--text-muted);
+        }
+
+        .send-btn {
+            width: 48px;
+            height: 48px;
+            background: var(--accent);
+            border: none;
+            border-radius: 12px;
+            color: white;
+            font-size: 1.25rem;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s;
+            flex-shrink: 0;
+        }
+
+        .send-btn:hover:not(:disabled) {
+            background: var(--accent-hover);
+            transform: scale(1.05);
+        }
+
+        .send-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        /* Stop button: swapped in for send-btn while a turn is in
+           flight. Shares send-btn's box so the composer layout doesn't
+           shift; a distinct color signals it's a different action. */
+        .stop-btn {
+            width: 48px;
+            height: 48px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            color: var(--text-primary);
+            font-size: 1.1rem;
+            cursor: pointer;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s;
+            flex-shrink: 0;
+        }
+
+        .stop-btn.visible {
+            display: flex;
+        }
+
+        .stop-btn:hover {
+            background: var(--bg-secondary);
+        }
+
+        /* Attach button — iMessage-style round "+" to the left of the box */
+        .attach-btn {
+            width: 44px;
+            height: 44px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 50%;
+            color: var(--text-secondary);
+            font-size: 1.6rem;
+            line-height: 1;
+            padding: 0;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s;
+            flex-shrink: 0;
+        }
+
+        .attach-btn:hover {
+            background: var(--accent);
+            border-color: var(--accent);
+            color: white;
+        }
+
+        /* Hidden file input */
+        .file-input {
+            display: none;
+        }
+
+        /* Attachment preview area */
+        .attachments-preview {
+            display: none;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+            padding: 0.75rem;
+            background: var(--bg-primary);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            margin-bottom: 0.75rem;
+            max-width: 800px;
+            margin-left: auto;
+            margin-right: auto;
+        }
+
+        .attachments-preview.visible {
+            display: flex;
+        }
+
+        .attachment-item {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.5rem 0.75rem;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            max-width: 200px;
+        }
+
+        .attachment-thumb {
+            width: 40px;
+            height: 40px;
+            border-radius: 4px;
+            object-fit: cover;
+            background: var(--bg-primary);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.25rem;
+            flex-shrink: 0;
+        }
+
+        .attachment-thumb img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            border-radius: 4px;
+        }
+
+        .attachment-info {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .attachment-name {
+            font-size: 0.75rem;
+            font-weight: 500;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            color: var(--text-primary);
+        }
+
+        .attachment-size {
+            font-size: 0.65rem;
+            color: var(--text-muted);
+        }
+
+        .attachment-remove {
+            width: 20px;
+            height: 20px;
+            background: transparent;
+            border: none;
+            border-radius: 4px;
+            color: var(--text-secondary);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.875rem;
+            transition: all 0.2s;
+            flex-shrink: 0;
+        }
+
+        .attachment-remove:hover {
+            background: var(--error);
+            color: white;
+        }
+
+        /* Drag-over state for input area */
+        .input-area.drag-over {
+            background: rgba(233, 69, 96, 0.1);
+        }
+
+        .input-area.drag-over .input-field {
+            border-color: var(--accent);
+            border-style: dashed;
+        }
+
+        /* Attachment error toast */
+        .attachment-error {
+            position: fixed;
+            bottom: 100px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: var(--error);
+            color: white;
+            padding: 0.75rem 1.5rem;
+            border-radius: 8px;
+            font-size: 0.875rem;
+            z-index: 1000;
+            animation: fadeInOut 3s ease forwards;
+        }
+
+        @keyframes fadeInOut {
+            0% { opacity: 0; transform: translateX(-50%) translateY(10px); }
+            10% { opacity: 1; transform: translateX(-50%) translateY(0); }
+            90% { opacity: 1; transform: translateX(-50%) translateY(0); }
+            100% { opacity: 0; transform: translateX(-50%) translateY(-10px); }
+        }
+
+        /* Typing indicator */
+        .typing {
+            display: flex;
+            gap: 4px;
+            padding: 0.5rem 0;
+        }
+
+        .typing span {
+            width: 8px;
+            height: 8px;
+            background: var(--text-secondary);
+            border-radius: 50%;
+            animation: typing 1.4s infinite;
+        }
+
+        .typing span:nth-child(2) { animation-delay: 0.2s; }
+        .typing span:nth-child(3) { animation-delay: 0.4s; }
+
+        @keyframes typing {
+            0%, 100% { transform: translateY(0); opacity: 0.5; }
+            50% { transform: translateY(-4px); opacity: 1; }
+        }
+
+        /* Welcome message */
+        .welcome {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+            padding: 2rem;
+            height: 100%;
+        }
+
+        .welcome-icon {
+            font-size: 3rem;
+            margin-bottom: 1rem;
+        }
+
+        .welcome h2 {
+            font-size: 1.5rem;
+            margin-bottom: 0.5rem;
+            color: var(--text-primary);
+        }
+
+        .welcome p {
+            color: var(--text-secondary);
+            margin-bottom: 1.5rem;
+            max-width: 400px;
+        }
+
+        .suggestions {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: center;
+            gap: 0.75rem;
+            max-width: 500px;
+        }
+
+        .suggestion {
+            padding: 0.75rem 1.25rem;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 24px;
+            font-size: 0.875rem;
+            color: var(--text-primary);
+            cursor: pointer;
+            transition: all 0.2s;
+            min-height: 44px;
+            display: flex;
+            align-items: center;
+        }
+
+        .suggestion:hover {
+            border-color: var(--accent);
+            color: var(--accent);
+            transform: translateY(-2px);
+        }
+
+        /* Overlay for mobile sidebar */
+        .overlay {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.5);
+            z-index: 99;
+        }
+
+        .overlay.visible {
+            display: block;
+        }
+
+        /* Mobile responsive */
+        @media (max-width: 768px) {
+            .sidebar {
+                position: fixed;
+                top: 0;
+                left: 0;
+                bottom: 0;
+                z-index: 100;
+                transform: translateX(-100%);
+                /* Fixed positioning escapes body's padding-top:
+                   without its own insets, the drawer (and the + new-thread button
+                   in .sidebar-header) renders under the status bar / Dynamic
+                   Island and is unreachable to touch. safe-left covers the
+                   landscape case on notched iPhones where the notch sits on the
+                   physical left edge. */
+                padding-top: var(--safe-top);
+                padding-left: var(--safe-left);
+                padding-bottom: var(--safe-bottom);
+            }
+
+            .sidebar.open {
+                transform: translateX(0);
+            }
+
+            .menu-btn {
+                display: flex;
+            }
+
+            .chat-title {
+                max-width: 150px;
+            }
+
+            .cost-display {
+                padding: 0.375rem 0.5rem;
+                min-width: 32px;
+                height: 32px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+            }
+
+            .cost-display .label,
+            .cost-display .amount {
+                display: none;
+            }
+
+            .cost-display::before {
+                content: '$';
+                font-weight: 600;
+                font-size: 0.875rem;
+            }
+
+            .header {
+                padding: 0 0.75rem;
+            }
+
+            /* Compact topbar: icon-only nav + remember, snug action row
+               so the persona picker, title, and actions fit a phone width. */
+            .header-nav .nav-label,
+            .remember-btn .btn-label {
+                display: none;
+            }
+
+            .nav-link {
+                padding: 0.375rem 0.5rem;
+            }
+
+            .header-left {
+                gap: 0.5rem;
+                min-width: 0;
+            }
+
+            .header-right {
+                gap: 0.5rem;
+                min-width: 0;
+            }
+
+            .persona-picker {
+                max-width: 108px;
+            }
+
+            .remember-btn {
+                padding: 0.375rem 0.5rem;
+            }
+
+            .messages {
+                padding: 0.75rem;
+            }
+
+            .message {
+                max-width: 95%;
+                padding: 0.875rem;
+            }
+
+            .message-actions {
+                opacity: 1;
+                position: static;
+                margin-top: 0.5rem;
+            }
+
+            .input-area {
+                padding: 0.75rem;
+                padding-bottom: calc(0.75rem + var(--safe-bottom));
+            }
+
+            .input-container {
+                gap: 0.5rem;
+            }
+
+            .input-field {
+                padding: 0.75rem;
+                font-size: 16px; /* Prevent iOS zoom */
+            }
+
+            .welcome {
+                padding: 1.5rem;
+            }
+
+            .welcome h2 {
+                font-size: 1.25rem;
+            }
+
+            .suggestions {
+                gap: 0.5rem;
+            }
+
+            .suggestion {
+                padding: 0.625rem 1rem;
+                font-size: 0.8125rem;
+            }
+        }
+
+        /* Small mobile */
+        @media (max-width: 380px) {
+            .status-text {
+                display: none;
+            }
+
+            .chat-title {
+                max-width: 120px;
+                font-size: 0.875rem;
+            }
+        }
+
+        /* Empty state */
+        .empty-conversations {
+            padding: 2rem 1rem;
+            text-align: center;
+            color: var(--text-muted);
+            font-size: 0.875rem;
+        }
+
+        /* Conversation search */
+        .conversation-search {
+            padding: 0.5rem;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .conversation-search-input {
+            width: 100%;
+            padding: 0.5rem 0.75rem;
+            background: var(--bg-primary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--text-primary);
+            font-size: 0.8125rem;
+            font-family: inherit;
+        }
+
+        .conversation-search-input:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+
+        .conversation-search-input::placeholder {
+            color: var(--text-muted);
+        }
+
+        /* CRM Page Styles */
+        :root {
+            --crm-accent: #00bcd4;
+            --crm-sidebar-width: 320px;
+            --crm-right-panel-width: 360px;
+        }
+
+        .page {
+            display: none;
+            width: 100%;
+            height: 100%;
+        }
+
+        .page.active {
+            display: flex;
+        }
+
+        /* CRM Layout */
+        .crm-container {
+            display: flex;
+            width: 100%;
+            height: 100%;
+            background: var(--bg-primary);
+        }
+
+        .crm-sidebar {
+            width: var(--crm-sidebar-width);
+            background: var(--bg-secondary);
+            border-right: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            flex-shrink: 0;
+        }
+
+        .crm-header {
+            padding: 1rem;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+        }
+
+        .crm-header-top {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .crm-header h2 {
+            font-size: 1.25rem;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+
+        .crm-stats-badge {
+            background: var(--crm-accent);
+            color: white;
+            padding: 0.25rem 0.5rem;
+            border-radius: 12px;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+
+        .crm-search {
+            position: relative;
+        }
+
+        .crm-search-input {
+            width: 100%;
+            padding: 0.625rem 0.75rem 0.625rem 2rem;
+            background: var(--bg-primary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            color: var(--text-primary);
+            font-size: 0.875rem;
+            font-family: inherit;
+        }
+
+        .crm-search-input:focus {
+            outline: none;
+            border-color: var(--crm-accent);
+        }
+
+        .crm-search-input::placeholder {
+            color: var(--text-muted);
+        }
+
+        .crm-search-icon {
+            position: absolute;
+            left: 0.625rem;
+            top: 50%;
+            transform: translateY(-50%);
+            color: var(--text-muted);
+            pointer-events: none;
+        }
+
+        .crm-filters {
+            padding: 0.75rem;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .crm-people-list {
+            flex: 1;
+            overflow-y: auto;
+        }
+
+        .crm-main {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            background: var(--bg-primary);
+            overflow: hidden;
+        }
+
+        .crm-detail-header {
+            padding: 1rem 1.5rem;
+            border-bottom: 1px solid var(--border);
+            background: var(--bg-secondary);
+        }
+
+        .crm-detail-content {
+            flex: 1;
+            overflow-y: auto;
+            padding: 1.5rem;
+        }
+
+        .crm-right-panel {
+            width: var(--crm-right-panel-width);
+            background: var(--bg-secondary);
+            border-left: 1px solid var(--border);
+            display: none;
+            flex-direction: column;
+            flex-shrink: 0;
+        }
+
+        .crm-right-panel.visible {
+            display: flex;
+        }
+
+        .crm-panel-header {
+            padding: 1rem;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .crm-panel-content {
+            flex: 1;
+            overflow-y: auto;
+            padding: 1rem;
+        }
+
+        /* CRM Responsive */
+        @media (max-width: 1024px) {
+            .crm-right-panel {
+                position: absolute;
+                right: 0;
+                top: 0;
+                height: 100%;
+                z-index: 100;
+                box-shadow: -2px 0 8px rgba(0, 0, 0, 0.2);
+            }
+        }
+
+        @media (max-width: 768px) {
+            .crm-sidebar {
+                position: absolute;
+                left: 0;
+                top: 0;
+                height: 100%;
+                z-index: 99;
+                transform: translateX(-100%);
+                transition: transform 0.3s ease;
+                box-shadow: 2px 0 8px rgba(0, 0, 0, 0.2);
+            }
+
+            .crm-sidebar.visible {
+                transform: translateX(0);
+            }
+
+            .crm-main {
+                width: 100%;
+            }
+        }
+
+        /* CRM Empty State */
+        .crm-empty-state {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            text-align: center;
+            color: var(--text-muted);
+            padding: 2rem;
+        }
+
+        .crm-empty-icon {
+            font-size: 4rem;
+            margin-bottom: 1rem;
+            opacity: 0.5;
+        }
+
+        .crm-empty-state h3 {
+            font-size: 1.25rem;
+            color: var(--text-secondary);
+            margin-bottom: 0.5rem;
+        }
+
+        .crm-empty-state p {
+            font-size: 0.875rem;
+        }
+
+        /* CRM Timeline */
+        .crm-timeline {
+            margin-top: 1.5rem;
+        }
+
+        .crm-timeline-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 1rem;
+        }
+
+        .crm-timeline-header h3 {
+            font-size: 0.875rem;
+            color: var(--text-muted);
+            margin: 0;
+        }
+
+        .crm-timeline-meta {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+        }
+
+        .crm-timeline-filters {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+            margin-bottom: 1rem;
+        }
+
+        .crm-timeline-filter-btn {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            color: var(--text-secondary);
+            padding: 0.375rem 0.75rem;
+            border-radius: 1rem;
+            font-size: 0.75rem;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .crm-timeline-filter-btn:hover {
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+        }
+
+        .crm-timeline-filter-btn.active {
+            background: var(--crm-accent);
+            border-color: var(--crm-accent);
+            color: white;
+        }
+
+        .crm-timeline-load-more {
+            width: 100%;
+            padding: 0.75rem;
+            margin-top: 0.5rem;
+            background: var(--bg-secondary);
+            border: 1px dashed var(--border);
+            color: var(--text-secondary);
+            font-size: 0.8125rem;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .crm-timeline-load-more:hover {
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+            border-color: var(--crm-accent);
+        }
+
+        .crm-timeline-day {
+            margin-bottom: 1rem;
+            background: var(--bg-secondary);
+            border-radius: 8px;
+            overflow: hidden;
+        }
+
+        .crm-timeline-date {
+            padding: 0.75rem 1rem;
+            font-size: 0.8125rem;
+            font-weight: 500;
+            color: var(--text-primary);
+            background: var(--bg-tertiary);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .crm-timeline-date-count {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            font-weight: normal;
+        }
+
+        .crm-timeline-groups {
+            padding: 0.5rem;
+        }
+
+        .crm-timeline-group {
+            border-radius: 6px;
+        }
+
+        .crm-timeline-group-header {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            padding: 0.625rem 0.75rem;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .crm-timeline-group-header:hover {
+            background: var(--bg-primary);
+        }
+
+        .crm-timeline-group-badge {
+            font-size: 1.25rem;
+            width: 2rem;
+            text-align: center;
+        }
+
+        .crm-timeline-group-info {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .crm-timeline-group-title {
+            font-size: 0.8125rem;
+            color: var(--text-primary);
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .crm-timeline-group-count {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            background: var(--bg-primary);
+            padding: 0.125rem 0.5rem;
+            border-radius: 999px;
+        }
+
+        .crm-timeline-group-preview {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            margin-top: 0.25rem;
+        }
+
+        .crm-timeline-group-expand {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            transition: transform 0.2s;
+        }
+
+        .crm-timeline-group.expanded .crm-timeline-group-expand {
+            transform: rotate(180deg);
+        }
+
+        .crm-timeline-items {
+            display: none;
+            padding: 0.5rem 0.75rem 0.75rem 3rem;
+        }
+
+        .crm-timeline-group.expanded .crm-timeline-items {
+            display: block;
+        }
+
+        .crm-timeline-item {
+            display: flex;
+            align-items: flex-start;
+            gap: 0.5rem;
+            padding: 0.5rem 0;
+            border-top: 1px solid var(--border);
+            font-size: 0.8125rem;
+        }
+
+        .crm-timeline-item:first-child {
+            border-top: none;
+        }
+
+        .crm-timeline-item-title {
+            color: var(--text-primary);
+            flex: 1;
+        }
+
+        .crm-timeline-item-title a {
+            color: var(--crm-accent);
+            text-decoration: none;
+        }
+
+        .crm-timeline-item-title a:hover {
+            text-decoration: underline;
+        }
+
+        .crm-timeline-item-snippet {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            margin-top: 0.25rem;
+        }
+
+        .crm-timeline-loading {
+            text-align: center;
+            padding: 2rem;
+            color: var(--text-muted);
+            font-size: 0.875rem;
+        }
+
+        /* CRM Skeleton Loading States */
+        .crm-skeleton {
+            background: linear-gradient(90deg, var(--bg-secondary) 25%, var(--bg-tertiary) 50%, var(--bg-secondary) 75%);
+            background-size: 200% 100%;
+            animation: crm-skeleton-loading 1.5s infinite;
+            border-radius: 4px;
+        }
+
+        @keyframes crm-skeleton-loading {
+            0% { background-position: 200% 0; }
+            100% { background-position: -200% 0; }
+        }
+
+        .crm-skeleton-text {
+            height: 1rem;
+            margin-bottom: 0.5rem;
+        }
+
+        .crm-skeleton-text.short {
+            width: 40%;
+        }
+
+        .crm-skeleton-text.medium {
+            width: 70%;
+        }
+
+        .crm-skeleton-stat {
+            height: 3.5rem;
+            border-radius: 8px;
+        }
+
+        .crm-skeleton-section {
+            margin-bottom: 1.5rem;
+        }
+
+        .crm-section-loading {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            padding: 1rem;
+            background: var(--bg-secondary);
+            border-radius: 8px;
+            color: var(--text-muted);
+            font-size: 0.875rem;
+        }
+
+        .crm-section-loading .spinner {
+            width: 1rem;
+            height: 1rem;
+            border: 2px solid var(--border);
+            border-top-color: var(--crm-accent);
+            border-radius: 50%;
+            animation: crm-spin 0.8s linear infinite;
+        }
+
+        @keyframes crm-spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .crm-section-loading.slow {
+            color: var(--warning, #f59e0b);
+        }
+
+        .crm-section-error {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 0.75rem;
+            padding: 1.5rem;
+            background: var(--bg-secondary);
+            border-radius: 8px;
+            color: var(--text-muted);
+            font-size: 0.875rem;
+            text-align: center;
+        }
+
+        .crm-section-error .error-icon {
+            font-size: 1.5rem;
+            opacity: 0.5;
+        }
+
+        .crm-retry-btn {
+            padding: 0.5rem 1rem;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--text-primary);
+            font-size: 0.8125rem;
+            font-family: inherit;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .crm-retry-btn:hover {
+            background: var(--crm-accent);
+            border-color: var(--crm-accent);
+            color: white;
+        }
+
+        /* CRM Filter Controls */
+        .crm-filter-row {
+            display: flex;
+            gap: 0.5rem;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+
+        .crm-sort-select {
+            padding: 0.5rem 0.75rem;
+            background: var(--bg-primary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--text-primary);
+            font-size: 0.8125rem;
+            font-family: inherit;
+            cursor: pointer;
+            flex: 1;
+            min-width: 120px;
+        }
+
+        .crm-sort-select:focus {
+            outline: none;
+            border-color: var(--crm-accent);
+        }
+
+        .crm-filter-toggle {
+            display: flex;
+            align-items: center;
+            gap: 0.375rem;
+            padding: 0.5rem 0.75rem;
+            background: var(--bg-primary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--text-secondary);
+            font-size: 0.8125rem;
+            cursor: pointer;
+            transition: all 0.2s;
+            white-space: nowrap;
+        }
+
+        .crm-filter-toggle:hover {
+            border-color: var(--crm-accent);
+            color: var(--text-primary);
+        }
+
+        .crm-filter-toggle.active {
+            background: var(--crm-accent);
+            border-color: var(--crm-accent);
+            color: white;
+        }
+
+        .crm-filter-toggle input {
+            display: none;
+        }
+
+        /* CRM Person Card */
+        .crm-person-card {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            padding: 0.75rem;
+            border-bottom: 1px solid var(--border);
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .crm-person-card:hover {
+            background: var(--bg-tertiary);
+        }
+
+        .crm-person-card.active {
+            background: var(--bg-tertiary);
+            border-left: 3px solid var(--crm-accent);
+        }
+
+        .crm-person-avatar {
+            width: 40px;
+            height: 40px;
+            background: var(--bg-primary);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1rem;
+            color: var(--crm-accent);
+            flex-shrink: 0;
+        }
+
+        .crm-person-info {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .crm-person-name {
+            font-size: 0.875rem;
+            font-weight: 500;
+            color: var(--text-primary);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .crm-person-meta {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .crm-person-stats {
+            display: flex;
+            gap: 0.5rem;
+            font-size: 0.6875rem;
+            color: var(--text-muted);
+        }
+
+        .crm-person-stat {
+            display: flex;
+            align-items: center;
+            gap: 0.125rem;
+        }
+
+        /* Review Queue Button */
+        .crm-review-btn {
+            display: flex;
+            align-items: center;
+            gap: 0.375rem;
+            padding: 0.5rem 0.75rem;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--text-secondary);
+            font-size: 0.8125rem;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .crm-review-btn:hover {
+            border-color: var(--crm-accent);
+            color: var(--text-primary);
+        }
+
+        .crm-review-badge {
+            background: var(--warning);
+            color: white;
+            padding: 0.125rem 0.375rem;
+            border-radius: 10px;
+            font-size: 0.6875rem;
+            font-weight: 600;
+            min-width: 18px;
+            text-align: center;
+        }
+
+        .crm-review-badge.empty {
+            display: none;
+        }
+
+        /* Review Queue Modal */
+        .review-modal {
+            max-width: 550px;
+        }
+
+        .review-progress {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0.5rem 0;
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            border-bottom: 1px solid var(--border);
+            margin-bottom: 1rem;
+        }
+
+        .review-progress-bar {
+            flex: 1;
+            height: 4px;
+            background: var(--bg-primary);
+            border-radius: 2px;
+            margin: 0 1rem;
+            overflow: hidden;
+        }
+
+        .review-progress-fill {
+            height: 100%;
+            background: var(--crm-accent);
+            transition: width 0.3s ease;
+        }
+
+        .review-item {
+            background: var(--bg-primary);
+            border-radius: 8px;
+            padding: 1rem;
+            margin-bottom: 1rem;
+        }
+
+        .review-source-info {
+            margin-bottom: 1rem;
+        }
+
+        .review-source-label {
+            font-size: 0.6875rem;
+            text-transform: uppercase;
+            color: var(--text-muted);
+            margin-bottom: 0.25rem;
+        }
+
+        .review-source-name {
+            font-size: 1rem;
+            font-weight: 500;
+            color: var(--text-primary);
+            margin-bottom: 0.25rem;
+        }
+
+        .review-source-details {
+            font-size: 0.8125rem;
+            color: var(--text-secondary);
+        }
+
+        .review-source-type {
+            display: inline-block;
+            padding: 0.125rem 0.5rem;
+            background: var(--bg-tertiary);
+            border-radius: 4px;
+            font-size: 0.6875rem;
+            color: var(--text-muted);
+            margin-top: 0.5rem;
+        }
+
+        .review-arrow {
+            text-align: center;
+            padding: 0.5rem 0;
+            color: var(--text-muted);
+            font-size: 1.25rem;
+        }
+
+        .review-match {
+            background: var(--bg-tertiary);
+            border-radius: 8px;
+            padding: 1rem;
+            border: 1px solid var(--border);
+        }
+
+        .review-match-label {
+            font-size: 0.6875rem;
+            text-transform: uppercase;
+            color: var(--text-muted);
+            margin-bottom: 0.25rem;
+        }
+
+        .review-match-name {
+            font-size: 1rem;
+            font-weight: 500;
+            color: var(--crm-accent);
+        }
+
+        .review-confidence {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            margin-top: 0.5rem;
+        }
+
+        .review-confidence-bar {
+            flex: 1;
+            height: 6px;
+            background: var(--bg-primary);
+            border-radius: 3px;
+            overflow: hidden;
+        }
+
+        .review-confidence-fill {
+            height: 100%;
+            border-radius: 3px;
+            transition: width 0.3s ease;
+        }
+
+        .review-confidence-fill.low {
+            background: var(--error);
+        }
+
+        .review-confidence-fill.medium {
+            background: var(--warning);
+        }
+
+        .review-confidence-fill.high {
+            background: var(--success);
+        }
+
+        .review-confidence-text {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            min-width: 40px;
+        }
+
+        .review-actions {
+            display: flex;
+            gap: 0.75rem;
+            margin-top: 1rem;
+        }
+
+        .review-btn {
+            flex: 1;
+            padding: 0.75rem;
+            border-radius: 6px;
+            font-size: 0.875rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.375rem;
+        }
+
+        .review-btn-confirm {
+            background: var(--success);
+            border: none;
+            color: white;
+        }
+
+        .review-btn-confirm:hover {
+            filter: brightness(1.1);
+        }
+
+        .review-btn-reject {
+            background: transparent;
+            border: 1px solid var(--error);
+            color: var(--error);
+        }
+
+        .review-btn-reject:hover {
+            background: var(--error);
+            color: white;
+        }
+
+        .review-empty {
+            text-align: center;
+            padding: 2rem;
+            color: var(--text-muted);
+        }
+
+        .review-empty-icon {
+            font-size: 3rem;
+            margin-bottom: 1rem;
+            opacity: 0.5;
+        }
+
+        /* CRM Loading State */
+        .crm-loading {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 2rem;
+            color: var(--text-muted);
+        }
+
+        /* CRM Tabs */
+        .crm-tabs {
+            display: flex;
+            gap: 0;
+            border-bottom: 1px solid var(--border);
+            background: var(--bg-secondary);
+        }
+
+        .crm-tab {
+            padding: 0.75rem 1.25rem;
+            background: transparent;
+            border: none;
+            border-bottom: 2px solid transparent;
+            color: var(--text-secondary);
+            font-size: 0.875rem;
+            font-family: inherit;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .crm-tab:hover {
+            color: var(--text-primary);
+            background: var(--bg-tertiary);
+        }
+
+        .crm-tab.active {
+            color: var(--crm-accent);
+            border-bottom-color: var(--crm-accent);
+        }
+
+        /* Network Graph Container */
+        .network-container {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .network-controls {
+            display: flex;
+            gap: 1rem;
+            padding: 1rem;
+            background: var(--bg-secondary);
+            border-bottom: 1px solid var(--border);
+            flex-wrap: wrap;
+            align-items: center;
+        }
+
+        .network-control-group {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .network-control-label {
+            font-size: 0.8125rem;
+            color: var(--text-secondary);
+        }
+
+        .network-slider {
+            width: 120px;
+            height: 4px;
+            background: var(--bg-tertiary);
+            border-radius: 2px;
+            -webkit-appearance: none;
+            appearance: none;
+        }
+
+        .network-slider::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 14px;
+            height: 14px;
+            border-radius: 50%;
+            background: var(--crm-accent);
+            cursor: pointer;
+        }
+
+        .network-slider::-moz-range-thumb {
+            width: 14px;
+            height: 14px;
+            border-radius: 50%;
+            background: var(--crm-accent);
+            cursor: pointer;
+            border: none;
+        }
+
+        .network-checkbox-group {
+            display: flex;
+            gap: 0.75rem;
+        }
+
+        .network-checkbox {
+            display: flex;
+            align-items: center;
+            gap: 0.375rem;
+            font-size: 0.8125rem;
+            color: var(--text-secondary);
+            cursor: pointer;
+        }
+
+        .network-checkbox input {
+            width: 14px;
+            height: 14px;
+            accent-color: var(--crm-accent);
+        }
+
+        .network-reset-btn {
+            padding: 0.5rem 1rem;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--text-primary);
+            font-size: 0.8125rem;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .network-reset-btn:hover {
+            border-color: var(--crm-accent);
+            background: var(--bg-primary);
+        }
+
+        .network-graph {
+            flex: 1;
+            position: relative;
+            overflow: hidden;
+            background: var(--bg-primary);
+        }
+
+        .network-graph svg {
+            width: 100%;
+            height: 100%;
+        }
+
+        .network-node {
+            cursor: pointer;
+        }
+
+        .network-node:hover circle {
+            stroke: white;
+            stroke-width: 2px;
+        }
+
+        .network-node.selected circle {
+            stroke: var(--crm-accent);
+            stroke-width: 3px;
+        }
+
+        .network-node.degree-0 circle {
+            stroke: var(--crm-accent);
+            stroke-width: 3px;
+        }
+
+        .network-node.degree-2 circle {
+            opacity: 0.6;
+        }
+
+        .network-node-label {
+            font-size: 10px;
+            fill: var(--text-primary);
+            text-anchor: middle;
+            pointer-events: none;
+            text-shadow: 0 1px 2px rgba(0,0,0,0.5);
+        }
+
+        .network-link {
+            stroke: var(--border);
+            stroke-opacity: 0.6;
+        }
+
+        .network-tooltip {
+            position: absolute;
+            padding: 0.5rem 0.75rem;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            font-size: 0.8125rem;
+            color: var(--text-primary);
+            pointer-events: none;
+            z-index: 100;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+        }
+
+        .network-empty {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            color: var(--text-muted);
+            text-align: center;
+            padding: 2rem;
+        }
+
+        .network-empty-icon {
+            font-size: 3rem;
+            margin-bottom: 1rem;
+            opacity: 0.5;
+        }
+
+        /* Agent threads panel */
+        .agents-panel { border-top: 1px solid var(--border, #2a2a2a); margin-top: auto; }
+        .agents-panel-header {
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 0.6rem 1rem; font-size: 0.8rem; font-weight: 600;
+            text-transform: uppercase; letter-spacing: 0.04em; opacity: 0.7;
+        }
+        .agents-refresh { background: none; border: none; color: inherit; cursor: pointer; font-size: 1rem; opacity: 0.7; }
+        .agents-refresh:hover { opacity: 1; }
+        .agents-threads-list { max-height: 38vh; overflow-y: auto; padding: 0 0.5rem 0.5rem; }
+        .agent-thread { padding: 0.5rem 0.6rem; border-radius: 8px; margin-bottom: 0.35rem; background: rgba(255,255,255,0.03); }
+        .agent-thread.clickable { cursor: pointer; }
+        .agent-thread.clickable:hover { background: rgba(255,255,255,0.07); }
+        .agent-thread.active { background: rgba(45,95,163,0.25); outline: 1px solid #2d5fa3; }
+        .agent-thread-top { display: flex; align-items: center; gap: 0.4rem; }
+        .agent-thread-label { flex: 1; font-size: 0.82rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .agent-route { font-size: 0.62rem; padding: 0.1rem 0.4rem; border-radius: 999px; white-space: nowrap; }
+        .agent-route.cloud { background: #2a2140; color: #c4a7ff; }
+        .agent-route.local { background: #1f3a33; color: #7fe0c4; }
+        .agent-route.remote { background: #1a2f45; color: #7fb8e0; }
+        .agent-badge { font-size: 0.64rem; padding: 0.1rem 0.4rem; border-radius: 999px; text-transform: uppercase; letter-spacing: 0.03em; }
+        .agent-badge.running { background: #1e3a5f; color: #7fb4ff; }
+        .agent-badge.completed { background: #1e4620; color: #7ad17f; }
+        .agent-badge.failed, .agent-badge.budget_exceeded { background: #4a1e1e; color: #ff9d9d; }
+        .agent-badge.blocked, .agent-badge.yielded { background: #4a3a1e; color: #ffd27f; }
+        /* Agent thread view in the main chat body */
+        .agent-thread-banner { font-size: 0.85rem; padding: 0.6rem 0.8rem; margin-bottom: 0.8rem; border-radius: 8px; background: rgba(45,95,163,0.15); border: 1px solid rgba(45,95,163,0.4); }
+        .agent-thread-exit { margin-left: 0.5rem; font-size: 0.74rem; padding: 0.15rem 0.5rem; border-radius: 6px; border: none; cursor: pointer; background: #2d5fa3; color: #fff; }
+        .agent-thread-empty { opacity: 0.6; font-size: 0.85rem; padding: 0.5rem 0.2rem; }
+        .thread-load-earlier { display: block; width: 100%; margin: 0 0 0.8rem; font-size: 0.8rem; padding: 0.45rem 0.6rem; border-radius: 8px; cursor: pointer; border: 1px solid rgba(45,95,163,0.4); background: rgba(45,95,163,0.12); color: inherit; }
+        .thread-load-earlier:hover { background: rgba(45,95,163,0.22); }
+        .agent-tool-details { margin: -0.4rem 0 0.8rem 0.5rem; }
+        .agent-tool-details details { font-size: 0.76rem; margin-bottom: 0.2rem; }
+        .agent-tool-details summary { cursor: pointer; opacity: 0.75; }
+        .agent-tool-details pre { font-size: 0.72rem; background: rgba(0,0,0,0.25); padding: 0.4rem 0.5rem; border-radius: 6px; overflow-x: auto; white-space: pre-wrap; }
+        .agent-spawn-btn { background: none; border: none; cursor: pointer; font-size: 1.15rem; opacity: 0.75; }
+        .agent-spawn-btn:hover { opacity: 1; }
+    </style>
+</head>
+<body>
+    <!-- Mobile overlay -->
+    <div class="overlay" id="overlay" onclick="closeSidebar()"></div>
+
+    <!-- Sidebar -->
+    <aside class="sidebar" id="sidebar">
+        <div class="sidebar-header">
+            <h1>LifeOS</h1>
+            <button class="new-chat-btn" onclick="newChat()" title="New chat">+</button>
+        </div>
+        <div class="conversation-search">
+            <input type="text" class="conversation-search-input" id="conversationSearch" placeholder="Search conversations..." oninput="filterConversations()">
+        </div>
+        <div class="conversations-list" id="conversationsList">
+            <div class="empty-conversations">No conversations yet</div>
+        </div>
+        <!-- Agent threads: in-flight + completed agent sessions, replyable -->
+        <div class="agents-panel" id="agentsPanel">
+            <div class="agents-panel-header">
+                <span>Agent threads</span>
+                <button class="agents-refresh" onclick="loadAgentThreads()" title="Refresh">⟳</button>
+            </div>
+            <div class="agents-threads-list" id="agentsThreadsList">
+                <div class="empty-conversations">No agent threads</div>
+            </div>
+        </div>
+    </aside>
+
+    <!-- Chat Page -->
+    <div id="chatPage" class="page active">
+        <div class="main">
+        <header class="header">
+            <div class="header-left">
+                <button class="menu-btn" id="menuBtn" onclick="toggleSidebar()">☰</button>
+                <nav class="header-nav">
+                    <a href="/chat" class="nav-link active" title="Chat">💬 <span class="nav-label">Chat</span></a>
+                    <a href="/crm" class="nav-link" title="CRM">👥 <span class="nav-label">CRM</span></a>
+                    <a href="/agents" class="nav-link" title="Agents">🛠️ <span class="nav-label">Agents</span></a>
+                </nav>
+            </div>
+            <div class="header-right">
+                <span class="chat-title" id="chatTitle" hidden></span>
+                <button class="remember-btn" onclick="openRememberModal()" title="Remember something">
+                    <span>💭</span> <span class="btn-label">Remember</span>
+                </button>
+                <div class="cost-display" id="costDisplay" onclick="openUsageModal()" title="Click to view usage stats">
+                    <span class="label">Session:</span> <span class="amount" id="sessionCost">$0.00</span>
+                </div>
+                <div class="status">
+                    <span class="status-dot" id="statusDot"></span>
+                    <span class="status-text" id="statusText">Ready</span>
+                </div>
+            </div>
+        </header>
+
+        <!-- Top-of-chat selector toolbar: persona + routing + backend + mode -->
+        <div class="chat-toolbar">
+            <select class="persona-picker" id="personaPicker" onchange="onPersonaChange()" title="Choose persona" aria-label="Persona"></select>
+            <span class="orchestrates-badge" id="orchestratesBadge" hidden title="This persona runs on LifeOS as a background Claude Code session">⚙️ Runs on LifeOS</span>
+            <select id="modelPicker" class="persona-picker" onchange="onModelChange()" title="Model for this chat" aria-label="Chat model">
+                <option value="auto">🤖 Auto</option>
+                <option value="sonnet">Sonnet</option>
+                <option value="opus">Opus</option>
+                <option value="gemma">Gemma (local)</option>
+                <option value="remote" id="modelOptionRemote" hidden>Remote</option>
+                <option value="claude_code">💻 Claude Code</option>
+            </select>
+            <div class="backend-toggle" role="group" aria-label="Text backend">
+                <button class="backend-option active" id="backendLifeos" type="button" title="LifeOS backend">LifeOS</button>
+                <button class="backend-option" id="backendAgent" type="button" title="Agent backend">Agent</button>
+                <button class="backend-option" id="backendHermes" type="button" title="Hermes backend">Hermes</button>
+            </div>
+            <!-- Text|Voice input-mode selector: replaces the old mic/keyboard
+                 icon toggle with a pill matching .backend-toggle above. -->
+            <div class="mode-toggle-group" role="group" aria-label="Input mode">
+                <button class="mode-toggle-option active" id="modeTextBtn" type="button" title="Text input">Text</button>
+                <button class="mode-toggle-option" id="modeVoiceBtn" type="button" title="Voice input">Voice</button>
+            </div>
+        </div>
+
+        <div class="messages-container">
+            <main class="messages" id="messages">
+                <div class="welcome">
+                    <div class="welcome-icon">🧠</div>
+                    <h2>Welcome to LifeOS</h2>
+                    <p>Your personal knowledge assistant. Ask about your notes, calendar, emails, or anything in your vault.</p>
+                    <div class="suggestions">
+                        <button class="suggestion" onclick="askQuestion('What\'s on my calendar tomorrow?')">📅 Calendar tomorrow</button>
+                        <button class="suggestion" onclick="askQuestion('What are my open action items?')">✅ Open action items</button>
+                        <button class="suggestion" onclick="askQuestion('Summarize my recent meeting notes')">📝 Recent meetings</button>
+                    </div>
+                </div>
+            </main>
+            <button class="scroll-bottom" id="scrollBottom" onclick="scrollToBottom()">↓</button>
+        </div>
+
+        <footer class="input-area" id="inputArea">
+            <!-- Attachment preview area -->
+            <div class="attachments-preview" id="attachmentsPreview"></div>
+
+            <div class="input-container">
+                <input type="file" id="fileInput" class="file-input" multiple
+                       accept="image/png,image/jpeg,image/jpg,image/gif,image/webp,application/pdf,text/plain,text/markdown,text/csv,application/json">
+                <button class="attach-btn" id="attachBtn" onclick="openFilePicker()" title="Attach files" aria-label="Attach files">+</button>
+                <div class="input-wrapper">
+                    <textarea
+                        class="input-field"
+                        id="inputField"
+                        placeholder="Ask a question..."
+                        rows="1"
+                        autofocus
+                    ></textarea>
+                </div>
+                <button class="send-btn" id="sendBtn" onclick="sendMessage()" title="Send message">➤</button>
+                <!-- Stop: shown in place of Send while a turn is in flight.
+                     Cancels the turn server-side rather than just walking away from
+                     the stream -- the turn otherwise keeps running to completion. -->
+                <button class="stop-btn" id="stopBtn" onclick="stopTurn()" title="Stop">⏹</button>
+            </div>
+            <!-- Voice dock: tap-to-talk + dock toggles; shown in voice mode -->
+            <div class="voice-dock" id="voiceDock">
+                <div class="voice-dock-row">
+                    <button class="voice-talk-btn shutter" id="voiceTalkBtn" title="Tap to talk" aria-label="Tap to talk"><span class="shutter-core"></span></button>
+                    <button class="voice-cancel-btn" id="voiceCancelBtn" title="Cancel turn">✕</button>
+                </div>
+                <div class="voice-dock-toggles">
+                    <label class="dock-toggle"><input type="checkbox" id="voiceMute"> Mute</label>
+                    <label class="dock-toggle"><input type="checkbox" id="voiceFast" checked> 2×</label>
+                    <label class="dock-toggle"><input type="checkbox" id="voiceAuto" checked> Auto</label>
+                    <!-- The dot only renders while the wake tap actually holds a
+                         live mic — see .listen-dot / updateListenIndicator(). -->
+                    <label class="dock-toggle"><input type="checkbox" id="voiceListen" checked> Listening<span class="listen-dot" id="voiceListenDot" role="status" aria-label="Microphone is live"></span></label>
+                </div>
+            </div>
+        </footer>
+        </div>
+    </div>
+
+    <!-- CRM Page -->
+    <div id="crmPage" class="page">
+        <div class="crm-container">
+            <!-- Left Sidebar: Filters + People List -->
+            <div class="crm-sidebar" id="crmSidebar">
+                <div class="crm-header">
+                    <div class="crm-header-top">
+                        <div style="display: flex; align-items: center; gap: 0.5rem;">
+                            <a href="#/" onclick="navigateToPage('chat'); return false;" style="color: var(--crm-accent); text-decoration: none; font-size: 1.25rem;" title="Back to chat">←</a>
+                            <h2>People</h2>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 0.5rem;">
+                            <button class="crm-review-btn" id="crmReviewBtn" onclick="openReviewQueueModal()" title="Review low-confidence matches">
+                                Review
+                                <span class="crm-review-badge" id="crmReviewBadge">0</span>
+                            </button>
+                            <span class="crm-stats-badge" id="crmStatsBadge">0</span>
+                        </div>
+                    </div>
+                    <div class="crm-search">
+                        <span class="crm-search-icon">🔍</span>
+                        <input
+                            type="text"
+                            class="crm-search-input"
+                            id="crmSearchInput"
+                            placeholder="Search people..."
+                            oninput="handleCrmSearch()"
+                        >
+                    </div>
+                </div>
+                <div class="crm-filters" id="crmFilters">
+                    <div class="crm-filter-row">
+                        <select class="crm-sort-select" id="crmSortSelect" onchange="handleCrmSortChange()">
+                            <option value="strength" selected>Strongest</option>
+                            <option value="interactions">Most Active</option>
+                            <option value="name">Name A-Z</option>
+                            <option value="last_seen">Recent</option>
+                        </select>
+                        <label class="crm-filter-toggle" id="crmShowAllToggle">
+                            <input type="checkbox" id="crmShowAllCheckbox" onchange="handleCrmShowAllChange()">
+                            <span>Show all</span>
+                        </label>
+                    </div>
+                </div>
+                <div class="crm-people-list" id="crmPeopleList">
+                    <div class="crm-loading">Loading people...</div>
+                </div>
+            </div>
+
+            <!-- Center Panel: Person Detail or Dashboard -->
+            <div class="crm-main" id="crmMain">
+                <!-- Tabs -->
+                <div class="crm-tabs">
+                    <button class="crm-tab active" data-tab="people" onclick="switchCrmTab('people')">People</button>
+                    <button class="crm-tab" data-tab="network" onclick="switchCrmTab('network')">Network</button>
+                </div>
+
+                <!-- People Tab Content -->
+                <div class="crm-tab-content" id="crmPeopleTab" style="flex: 1; display: flex; flex-direction: column;">
+                    <div class="crm-empty-state">
+                        <div class="crm-empty-icon">👥</div>
+                        <h3>Welcome to People CRM</h3>
+                        <p>Select a person from the list to view their details</p>
+                    </div>
+                </div>
+
+                <!-- Network Tab Content -->
+                <div class="crm-tab-content network-container" id="crmNetworkTab" style="display: none;">
+                    <div class="network-controls">
+                        <div class="network-control-group">
+                            <span class="network-control-label">Min Strength:</span>
+                            <input type="range" class="network-slider" id="networkStrengthSlider"
+                                   min="0" max="100" value="0" oninput="updateNetworkFilters()">
+                            <span id="networkStrengthValue">0%</span>
+                        </div>
+                        <div class="network-control-group">
+                            <span class="network-control-label">Categories:</span>
+                            <div class="network-checkbox-group">
+                                <label class="network-checkbox">
+                                    <input type="checkbox" id="networkCatWork" checked onchange="updateNetworkFilters()">
+                                    Work
+                                </label>
+                                <label class="network-checkbox">
+                                    <input type="checkbox" id="networkCatPersonal" checked onchange="updateNetworkFilters()">
+                                    Personal
+                                </label>
+                                <label class="network-checkbox">
+                                    <input type="checkbox" id="networkCatFamily" checked onchange="updateNetworkFilters()">
+                                    Family
+                                </label>
+                                <label class="network-checkbox">
+                                    <input type="checkbox" id="networkCatUnknown" checked onchange="updateNetworkFilters()">
+                                    Unknown
+                                </label>
+                            </div>
+                        </div>
+                        <button class="network-reset-btn" onclick="resetNetworkView()">Reset View</button>
+                    </div>
+                    <div class="network-graph" id="networkGraph">
+                        <!-- D3.js SVG will be inserted here -->
+                    </div>
+                </div>
+            </div>
+
+            <!-- Right Panel: Contextual Panels (hidden by default) -->
+            <div class="crm-right-panel" id="crmRightPanel">
+                <div class="crm-panel-header">
+                    <h3>Context Panel</h3>
+                </div>
+                <div class="crm-panel-content" id="crmPanelContent">
+                    <!-- Contextual content will be added dynamically -->
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Remember Modal -->
+    <div class="modal-overlay" id="rememberModal">
+        <div class="modal">
+            <div class="modal-header">
+                <h3>Remember Something</h3>
+                <button class="modal-close" onclick="closeRememberModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p>Tell me something you want me to remember. Write naturally - I'll format it properly.</p>
+                <textarea
+                    id="memoryInput"
+                    placeholder="e.g., Remember that anytime I ask about Sarah you should also check the alternative spelling Sara..."
+                ></textarea>
+                <div id="memoryStatus"></div>
+            </div>
+            <div class="modal-footer">
+                <button class="modal-btn modal-btn-cancel" onclick="closeRememberModal()">Cancel</button>
+                <button class="modal-btn modal-btn-save" id="saveMemoryBtn" onclick="saveMemory()">Save Memory</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Review Queue Modal -->
+    <div class="modal-overlay" id="reviewQueueModal">
+        <div class="modal review-modal">
+            <div class="modal-header">
+                <h3>Review Queue</h3>
+                <button class="modal-close" onclick="closeReviewQueueModal()">&times;</button>
+            </div>
+            <div class="modal-body" id="reviewQueueBody">
+                <div class="crm-loading">Loading review queue...</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Usage Stats Modal -->
+    <div class="modal-overlay" id="usageModal">
+        <div class="modal usage-modal">
+            <div class="modal-header">
+                <h3>Usage Statistics</h3>
+                <button class="modal-close" onclick="closeUsageModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="usage-stats-grid">
+                    <div class="usage-stat-card session-card">
+                        <div class="usage-stat-label">This Session</div>
+                        <div class="usage-stat-value" id="usageSession">$0.00</div>
+                    </div>
+                    <div class="usage-stat-card">
+                        <div class="usage-stat-label">24 Hours</div>
+                        <div class="usage-stat-value" id="usage24h">$0.00</div>
+                        <div class="usage-stat-requests" id="requests24h">0 requests</div>
+                    </div>
+                    <div class="usage-stat-card">
+                        <div class="usage-stat-label">7 Days</div>
+                        <div class="usage-stat-value" id="usage7d">$0.00</div>
+                        <div class="usage-stat-requests" id="requests7d">0 requests</div>
+                    </div>
+                    <div class="usage-stat-card">
+                        <div class="usage-stat-label">30 Days</div>
+                        <div class="usage-stat-value" id="usage30d">$0.00</div>
+                        <div class="usage-stat-requests" id="requests30d">0 requests</div>
+                    </div>
+                    <div class="usage-stat-card">
+                        <div class="usage-stat-label">All Time</div>
+                        <div class="usage-stat-value" id="usageAllTime">$0.00</div>
+                        <div class="usage-stat-requests" id="requestsAllTime">0 requests</div>
+                    </div>
+                </div>
+                <div class="usage-chart-container">
+                    <canvas id="usageChart"></canvas>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="modal-btn modal-btn-cancel" onclick="closeUsageModal()">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // DOM elements still referenced by this shell script. The chat modules
+        // (web/chat/) receive their own element map via initChat() below.
+        const messagesEl = document.getElementById('messages');
+        const inputField = document.getElementById('inputField');
+        const scrollBottomBtn = document.getElementById('scrollBottom');
+        const chatTitle = document.getElementById('chatTitle');
+
+        // Shared chat state lives in web/chat/session.js; this shell reaches it
+        // through the window.lifeChat bridge (assigned in DOMContentLoaded).
+        let chatState;
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', () => {
+            chatState = window.lifeChat.state;
+            // Boot the extracted chat modules, passing the DOM elements, API
+            // endpoints, and the agent-thread reply hook this shell owns.
+            window.lifeChat.initChat({
+                elements: {
+                    messagesEl, inputField, chatTitle,
+                    sendBtn: document.getElementById('sendBtn'),
+                    stopBtn: document.getElementById('stopBtn'),
+                    statusDot: document.getElementById('statusDot'),
+                    statusText: document.getElementById('statusText'),
+                    conversationsList: document.getElementById('conversationsList'),
+                    sessionCostEl: document.getElementById('sessionCost'),
+                    sidebar: document.getElementById('sidebar'),
+                    overlay: document.getElementById('overlay'),
+                    inputArea: document.getElementById('inputArea'),
+                    attachmentsPreview: document.getElementById('attachmentsPreview'),
+                    fileInput: document.getElementById('fileInput'),
+                    personaPicker: document.getElementById('personaPicker'),
+                    orchestratesBadge: document.getElementById('orchestratesBadge'),
+                    modelPicker: document.getElementById('modelPicker'),
+                    voiceTalkBtn: document.getElementById('voiceTalkBtn'),
+                    voiceCancelBtn: document.getElementById('voiceCancelBtn'),
+                    voiceMute: document.getElementById('voiceMute'),
+                    voiceFast: document.getElementById('voiceFast'),
+                    voiceAuto: document.getElementById('voiceAuto'),
+                    voiceListen: document.getElementById('voiceListen'),
+                    voiceListenDot: document.getElementById('voiceListenDot'),
+                    modeTextBtn: document.getElementById('modeTextBtn'),
+                    modeVoiceBtn: document.getElementById('modeVoiceBtn'),
+                    backendLifeos: document.getElementById('backendLifeos'),
+                    backendAgent: document.getElementById('backendAgent'),
+                    backendHermes: document.getElementById('backendHermes'),
+                },
+                endpoints: {
+                    conversations: '/api/conversations',
+                    ask: '/api/ask/stream',
+                    handoff: '/api/chat/handoff',
+                    personas: '/api/personas',
+                    voice: '/api/voice',
+                    agentAsk: '/api/agent/ask/stream',
+                    agentStatus: '/api/agent/status',
+                    hermesAsk: '/api/hermes/ask/stream',
+                    hermesStatus: '/api/hermes/status',
+                    chatConfig: '/api/chat/config',
+                },
+                hooks: { onAgentThreadReply: sendThreadReply },
+            });
+            setupScrollListener();
+            loadAgentThreads();
+            // Light polling for live-ish status; the /api/agents/stream SSE
+            // already drives the dedicated /agents page.
+            setInterval(loadAgentThreads, 5000);
+        });
+
+        // --- Agent threads panel ---
+        async function loadAgentThreads() {
+            const list = document.getElementById('agentsThreadsList');
+            if (!list) return;
+            try {
+                const resp = await fetch('/api/agents/threads?limit=25');
+                if (!resp.ok) return;
+                const data = await resp.json();
+                renderAgentThreads(data.threads || []);
+            } catch (e) { /* worker/API offline — leave the panel as-is */ }
+        }
+
+        // Local (Gemma) vs cloud (Claude/Managed Agents) indicator for an agent
+        // thread, derived from its routing. `model_label` (Sonnet/Opus/…) is the
+        // tooltip. Returns '' for unknown routing.
+        function routeBadgeHtml(routing, modelLabel) {
+            const r = (routing || '').toString();
+            const tip = escapeHtml((modelLabel || (r === 'claude' ? 'Cloud' : 'Local')).toString());
+            if (r === 'claude') return '<span class="agent-route cloud" title="' + tip + '">☁ cloud</span>';
+            if (r === 'local') return '<span class="agent-route local" title="' + tip + '">🖥 local</span>';
+            // `#cloud` tasks route here, not to Anthropic — the
+            // configured remote OpenAI-compatible provider (e.g. DeepSeek via
+            // Fireworks). Distinct badge so it isn't confused with the
+            // Anthropic-API "cloud" badge above.
+            if (r === 'remote') return '<span class="agent-route remote" title="' + tip + '">🌐 remote</span>';
+            return '';
+        }
+
+        function renderAgentThreads(threads) {
+            const list = document.getElementById('agentsThreadsList');
+            if (!list) return;
+            if (!threads.length) {
+                list.innerHTML = '<div class="empty-conversations">No agent threads</div>';
+                return;
+            }
+            list.innerHTML = '';
+            threads.forEach(t => {
+                const label = escapeHtml((t.label || t.task_id || t.session_id || 'agent').toString());
+                // escapeHtml leaves double-quotes intact; escape them for the
+                // title="…" attribute context to prevent attribute breakout.
+                const labelAttr = label.replace(/"/g, '&quot;');
+                const status = (t.status || '').toString();
+                const sid = t.session_id;
+                const isActive = chatState.currentAgentThread && chatState.currentAgentThread.sessionId === sid;
+                const div = document.createElement('div');
+                div.className = 'agent-thread clickable' + (isActive ? ' active' : '');
+                div.title = 'Open this thread';
+                div.onclick = () => openAgentThread(sid);
+                div.innerHTML =
+                    '<div class="agent-thread-top">' +
+                        '<span class="agent-thread-label" title="' + labelAttr + '">' + label + '</span>' +
+                        routeBadgeHtml(t.routing, t.model_label) +
+                        '<span class="agent-badge ' + escapeHtml(status) + '">' + (escapeHtml(status) || '?') + '</span>' +
+                    '</div>';
+                list.appendChild(div);
+            });
+        }
+
+        // Open an agent thread in the main chat body: load its conversation and
+        // put the composer into "continue this thread" mode (#236 thread view).
+        async function openAgentThread(sessionId) {
+            let data;
+            try {
+                const resp = await fetch('/api/agents/threads/' + encodeURIComponent(sessionId));
+                if (!resp.ok) { alert('Could not load thread: ' + resp.status); return; }
+                data = await resp.json();
+            } catch (e) { alert('Could not load thread: ' + e); return; }
+
+            const thread = data.thread || {};
+            const conversation = data.conversation || [];
+            chatState.currentConversationId = null;  // leave any normal-chat conversation
+            chatState.currentAgentThread = {
+                sessionId,
+                resumable: !!thread.resumable,
+                label: (thread.label || sessionId).toString(),
+                status: (thread.status || '').toString(),
+                routing: (thread.routing || '').toString(),
+                modelLabel: (thread.model_label || '').toString(),
+                convCount: conversation.length,
+            };
+            chatTitle.textContent = '🧵 ' + chatState.currentAgentThread.label;
+            renderThreadConversation(conversation);
+            updateThreadComposer();
+            loadAgentThreads();   // refresh the panel's active highlight
+            closeSidebar();
+            scrollToBottom();
+        }
+
+        // Cap how many turns the thread view builds up-front. Sessions with
+        // hundreds of turns (each potentially emitting large tool inputs) would
+        // otherwise produce a massive DOM in one synchronous pass and freeze the
+        // renderer (#270). Older turns stay reachable via the "load earlier"
+        // control.
+        const THREAD_INITIAL_TURNS = 30;
+        let threadRender = null;  // { conversation, earliestShown, loadBtn }
+
+        // preserveFrom: when re-rendering an already-open thread (e.g. a poll
+        // update appended new turns), keep at least as much history visible as
+        // the user had expanded, so "load earlier" scrollback isn't collapsed.
+        function renderThreadConversation(conversation, preserveFrom = null) {
+            messagesEl.innerHTML = '';
+            threadRender = null;
+            const t = chatState.currentAgentThread || {};
+            const banner = document.createElement('div');
+            banner.className = 'agent-thread-banner';
+            const cont = t.resumable
+                ? 'Replies below continue this thread.'
+                : 'This thread is ' + escapeHtml(t.status || '') + ' — read-only until it finishes.';
+            banner.innerHTML =
+                '🧵 Agent thread ' + routeBadgeHtml(t.routing, t.modelLabel) +
+                ' · <strong>' + escapeHtml(t.label || '') + '</strong> — ' + cont +
+                ' <button class="agent-thread-exit" onclick="exitAgentThread()">Exit to chat</button>';
+            messagesEl.appendChild(banner);
+
+            if (!conversation.length) {
+                const empty = document.createElement('div');
+                empty.className = 'agent-thread-empty';
+                empty.textContent = 'No conversation recorded yet for this thread.';
+                messagesEl.appendChild(empty);
+                return;
+            }
+
+            let start = Math.max(0, conversation.length - THREAD_INITIAL_TURNS);
+            if (preserveFrom != null) {
+                start = Math.min(start, Math.max(0, Math.min(preserveFrom, conversation.length)));
+            }
+            threadRender = { conversation, earliestShown: start, loadBtn: null };
+            if (start > 0) {
+                const btn = document.createElement('button');
+                btn.className = 'thread-load-earlier';
+                btn.onclick = loadEarlierThreadTurns;
+                messagesEl.appendChild(btn);
+                threadRender.loadBtn = btn;
+            }
+            // Build the visible tail into a fragment so the whole batch lands in
+            // one reflow (and without per-turn smooth-scroll thrash).
+            messagesEl.appendChild(renderThreadTurns(conversation, start, conversation.length));
+            updateLoadEarlierLabel();
+        }
+
+        // Render conversation[from, to) into a detached fragment.
+        function renderThreadTurns(conversation, from, to) {
+            const frag = document.createDocumentFragment();
+            for (let i = from; i < to; i++) {
+                const turn = conversation[i];
+                const role = turn.role === 'user' ? 'user' : 'assistant';
+                const body = (turn.text || '').trim()
+                    || ((turn.tools && turn.tools.length) ? '_(ran tools — see below)_' : '');
+                addMessage(body, role, [], null, frag);
+                if (role === 'assistant' && turn.tools && turn.tools.length) {
+                    appendToolDetails(turn.tools, frag);
+                }
+            }
+            return frag;
+        }
+
+        function updateLoadEarlierLabel() {
+            const st = threadRender;
+            if (!st || !st.loadBtn) return;
+            const remaining = st.earliestShown;
+            if (remaining <= 0) { st.loadBtn.remove(); st.loadBtn = null; return; }
+            const chunk = Math.min(THREAD_INITIAL_TURNS, remaining);
+            st.loadBtn.textContent =
+                '⬆ Load ' + chunk + ' earlier message' + (chunk === 1 ? '' : 's') +
+                ' (' + remaining + ' hidden)';
+        }
+
+        function loadEarlierThreadTurns() {
+            const st = threadRender;
+            if (!st || !st.loadBtn) return;
+            const newStart = Math.max(0, st.earliestShown - THREAD_INITIAL_TURNS);
+            const frag = renderThreadTurns(st.conversation, newStart, st.earliestShown);
+            st.loadBtn.after(frag);  // insert the older turns right below the button
+            st.earliestShown = newStart;
+            updateLoadEarlierLabel();
+        }
+
+        function appendToolDetails(tools, target) {
+            const container = target || messagesEl;
+            const wrap = document.createElement('div');
+            wrap.className = 'agent-tool-details';
+            tools.forEach(tl => {
+                const det = document.createElement('details');
+                const sum = document.createElement('summary');
+                sum.textContent = '🔧 ' + (tl.name || 'tool');
+                det.appendChild(sum);
+                // Serialize the tool input lazily, only on first expand. Building
+                // a <pre> for every tool call up-front is what hangs large
+                // threads (#270); collapsed details stay cheap.
+                det.addEventListener('toggle', () => {
+                    if (!det.open || det.dataset.built) return;
+                    det.dataset.built = '1';
+                    const pre = document.createElement('pre');
+                    let inputStr;
+                    try { inputStr = JSON.stringify(tl.input, null, 2); }
+                    catch (e) { inputStr = String(tl.input); }
+                    pre.textContent = inputStr;
+                    det.appendChild(pre);
+                });
+                wrap.appendChild(det);
+            });
+            container.appendChild(wrap);
+        }
+
+        function updateThreadComposer() {
+            if (!chatState.currentAgentThread) { inputField.placeholder = 'Ask a question...'; return; }
+            inputField.placeholder = chatState.currentAgentThread.resumable
+                ? 'Reply to continue this agent thread…'
+                : 'Thread is ' + chatState.currentAgentThread.status + ' — press + for a new chat';
+        }
+
+        function exitAgentThread() {
+            newChat();
+        }
+
+        async function sendThreadReply(text) {
+            const t = chatState.currentAgentThread;
+            if (!t) return;
+            if (!t.resumable) {
+                alert('This thread is ' + t.status + ' and can’t be replied to yet. Press + for a new chat.');
+                return;
+            }
+            inputField.value = '';
+            inputField.style.height = 'auto';
+            const sid = t.sessionId;
+            try {
+                const resp = await fetch('/api/agents/threads/' + encodeURIComponent(sid) + '/reply', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ text }),
+                });
+                if (!resp.ok) {
+                    const e = await resp.json().catch(() => ({}));
+                    alert('Reply failed: ' + (e.detail || resp.status));
+                    return;
+                }
+            } catch (e) { alert('Reply failed: ' + e); return; }
+            // Show the reply immediately + a status line; the worker resumes the
+            // session asynchronously, so poll the thread for the agent's output.
+            addMessage(text, 'user');
+            addMessage('_↻ resuming agent…_', 'assistant');
+            scrollToBottom();
+            pollThreadForUpdate(sid);
+        }
+
+        function pollThreadForUpdate(sessionId) {
+            let tries = 0;
+            const iv = setInterval(async () => {
+                tries++;
+                if (!chatState.currentAgentThread || chatState.currentAgentThread.sessionId !== sessionId || tries > 60) {
+                    clearInterval(iv);
+                    return;
+                }
+                try {
+                    const resp = await fetch('/api/agents/threads/' + encodeURIComponent(sessionId));
+                    if (!resp.ok) return;
+                    const data = await resp.json();
+                    const conv = data.conversation || [];
+                    const thread = data.thread || {};
+                    // New turns have landed (worker appended the reply + the
+                    // agent's response) — re-render and stop once it's finished.
+                    if (conv.length > chatState.currentAgentThread.convCount) {
+                        chatState.currentAgentThread.convCount = conv.length;
+                        chatState.currentAgentThread.resumable = !!thread.resumable;
+                        chatState.currentAgentThread.status = (thread.status || '').toString();
+                        // Keep any history the user expanded via "load earlier".
+                        const keepFrom = threadRender ? threadRender.earliestShown : null;
+                        renderThreadConversation(conv, keepFrom);
+                        updateThreadComposer();
+                        scrollToBottom();
+                        if (thread.resumable) { clearInterval(iv); loadAgentThreads(); }
+                    }
+                } catch (e) { /* transient — keep polling */ }
+            }, 3000);
+        }
+
+        // Scroll handling
+        function setupScrollListener() {
+            messagesEl.addEventListener('scroll', () => {
+                const isNearBottom = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 100;
+                scrollBottomBtn.classList.toggle('visible', !isNearBottom);
+            });
+        }
+
+        function scrollToBottom() {
+            messagesEl.scrollTo({
+                top: messagesEl.scrollHeight,
+                behavior: 'smooth'
+            });
+        }
+
+        // Remember modal functions
+        function openRememberModal() {
+            document.getElementById('rememberModal').classList.add('visible');
+            document.getElementById('memoryInput').focus();
+            document.getElementById('memoryStatus').innerHTML = '';
+        }
+
+        function closeRememberModal() {
+            document.getElementById('rememberModal').classList.remove('visible');
+            document.getElementById('memoryInput').value = '';
+            document.getElementById('memoryStatus').innerHTML = '';
+        }
+
+        async function saveMemory() {
+            const input = document.getElementById('memoryInput');
+            const statusEl = document.getElementById('memoryStatus');
+            const saveBtn = document.getElementById('saveMemoryBtn');
+
+            const content = input.value.trim();
+            if (!content) {
+                statusEl.innerHTML = '<div class="modal-status error">Please enter something to remember.</div>';
+                return;
+            }
+
+            saveBtn.disabled = true;
+            saveBtn.textContent = 'Saving...';
+            statusEl.innerHTML = '';
+
+            try {
+                const response = await fetch('/api/memories', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ content: content, synthesize: true })
+                });
+
+                if (response.ok) {
+                    const data = await response.json();
+                    statusEl.innerHTML = `
+                        <div class="modal-status success">
+                            Memory saved! Category: ${data.category}
+                        </div>
+                    `;
+                    saveBtn.textContent = 'Saved!';
+                    // Close modal after 1.5 seconds
+                    setTimeout(() => {
+                        closeRememberModal();
+                        saveBtn.textContent = 'Save Memory';
+                        saveBtn.disabled = false;
+                    }, 1500);
+                } else {
+                    const errorData = await response.json().catch(() => ({}));
+                    throw new Error(errorData.detail || 'Failed to save memory');
+                }
+            } catch (error) {
+                console.error('Memory save error:', error);
+                statusEl.innerHTML = `<div class="modal-status error">Error: ${escapeHtml(error.message)}</div>`;
+                saveBtn.textContent = 'Save Memory';
+                saveBtn.disabled = false;
+            }
+        }
+
+        // Keyboard shortcuts
+        document.addEventListener('keydown', (e) => {
+            const isMac = navigator.platform.toUpperCase().indexOf('MAC') >= 0;
+            const modKey = isMac ? e.metaKey : e.ctrlKey;
+
+            // Check if any modal is open
+            const rememberModalOpen = document.getElementById('rememberModal').classList.contains('visible');
+            const usageModalOpen = document.getElementById('usageModal').classList.contains('visible');
+            const anyModalOpen = rememberModalOpen || usageModalOpen;
+
+            // Escape - close any open modal
+            if (e.key === 'Escape') {
+                if (rememberModalOpen) closeRememberModal();
+                if (usageModalOpen) closeUsageModal();
+                return;
+            }
+
+            // Enter - save memory when Remember modal is open
+            if (e.key === 'Enter' && !e.shiftKey && rememberModalOpen) {
+                e.preventDefault();
+                saveMemory();
+                return;
+            }
+
+
+            // Don't handle other shortcuts if a modal is open
+            if (anyModalOpen) return;
+
+            // Cmd/Ctrl+K - new conversation
+            if (modKey && e.key.toLowerCase() === 'k') {
+                e.preventDefault();
+                newChat();
+                return;
+            }
+
+            // Cmd/Ctrl+A - open attachment file picker (only when not in text input)
+            if (modKey && e.key.toLowerCase() === 'a') {
+                // Allow default select-all behavior in text inputs
+                const activeEl = document.activeElement;
+                const isTextInput = activeEl && (
+                    activeEl.tagName === 'INPUT' ||
+                    activeEl.tagName === 'TEXTAREA' ||
+                    activeEl.isContentEditable
+                );
+
+                if (!isTextInput) {
+                    e.preventDefault();
+                    openFilePicker();
+                }
+                return;
+            }
+        });
+
+        // Usage modal functions
+        let usageChart = null;
+
+        async function openUsageModal() {
+            document.getElementById('usageModal').classList.add('visible');
+            // Show current session cost in modal. Mirrors the header display's
+            // #602 lower-bound marker: once any turn this session had no
+            // reported cost, the figure is a floor, not a total.
+            const unpricedPrefix = chatState.sessionCostUnpriced > 0 ? '~' : '';
+            document.getElementById('usageSession').textContent = unpricedPrefix + '$' + chatState.sessionCost.toFixed(3);
+            await loadUsageStats();
+        }
+
+        function closeUsageModal() {
+            document.getElementById('usageModal').classList.remove('visible');
+            if (usageChart) {
+                usageChart.destroy();
+                usageChart = null;
+            }
+        }
+
+        async function loadUsageStats() {
+            try {
+                const response = await fetch('/api/admin/usage');
+                if (!response.ok) throw new Error('Failed to fetch usage stats');
+
+                const data = await response.json();
+
+                // Update stat cards
+                document.getElementById('usage24h').textContent = '$' + data.last_24h.total_cost.toFixed(2);
+                document.getElementById('requests24h').textContent = data.last_24h.request_count + ' requests';
+
+                document.getElementById('usage7d').textContent = '$' + data.last_7d.total_cost.toFixed(2);
+                document.getElementById('requests7d').textContent = data.last_7d.request_count + ' requests';
+
+                document.getElementById('usage30d').textContent = '$' + data.last_30d.total_cost.toFixed(2);
+                document.getElementById('requests30d').textContent = data.last_30d.request_count + ' requests';
+
+                document.getElementById('usageAllTime').textContent = '$' + data.all_time.total_cost.toFixed(2);
+                document.getElementById('requestsAllTime').textContent = data.all_time.request_count + ' requests';
+
+                // Render chart
+                renderUsageChart(data.daily_breakdown);
+            } catch (error) {
+                console.error('Error loading usage stats:', error);
+            }
+        }
+
+        function renderUsageChart(dailyData) {
+            const ctx = document.getElementById('usageChart').getContext('2d');
+
+            // Generate date range starting from Jan 1 of current year
+            const startDate = new Date(new Date().getFullYear(), 0, 1);
+            const today = new Date();
+            const labels = [];
+            const costMap = {};
+
+            // Create map of existing data
+            dailyData.forEach(d => {
+                costMap[d.date] = d.cost;
+            });
+
+            // Generate all dates from start to today
+            const currentDate = new Date(startDate);
+            while (currentDate <= today) {
+                const dateStr = currentDate.toISOString().split('T')[0];
+                labels.push(dateStr);
+                currentDate.setDate(currentDate.getDate() + 1);
+            }
+
+            // Get costs for each date (0 if no data)
+            const costs = labels.map(date => costMap[date] || 0);
+
+            // Format labels for display (M/D format)
+            const displayLabels = labels.map(date => {
+                const d = new Date(date + 'T00:00:00');
+                return (d.getMonth() + 1) + '/' + d.getDate();
+            });
+
+            // Destroy existing chart if any
+            if (usageChart) {
+                usageChart.destroy();
+            }
+
+            usageChart = new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: displayLabels,
+                    datasets: [{
+                        label: 'Daily Cost ($)',
+                        data: costs,
+                        backgroundColor: 'rgba(233, 69, 96, 0.7)',
+                        borderColor: 'rgba(233, 69, 96, 1)',
+                        borderWidth: 1,
+                        borderRadius: 4,
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            display: false
+                        },
+                        tooltip: {
+                            callbacks: {
+                                label: function(context) {
+                                    return '$' + context.parsed.y.toFixed(3);
+                                },
+                                title: function(context) {
+                                    const idx = context[0].dataIndex;
+                                    return labels[idx];
+                                }
+                            }
+                        }
+                    },
+                    scales: {
+                        x: {
+                            grid: {
+                                color: 'rgba(42, 42, 78, 0.5)'
+                            },
+                            ticks: {
+                                color: '#a0a0a0',
+                                maxRotation: 45,
+                                minRotation: 45,
+                                autoSkip: true,
+                                maxTicksLimit: 15
+                            }
+                        },
+                        y: {
+                            beginAtZero: true,
+                            grid: {
+                                color: 'rgba(42, 42, 78, 0.5)'
+                            },
+                            ticks: {
+                                color: '#a0a0a0',
+                                callback: function(value) {
+                                    return '$' + value.toFixed(2);
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        // Utilities
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        // Page routing
+        function navigateToPage(page) {
+            // Hide all pages
+            document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+
+            // Show the requested page
+            if (page === 'crm') {
+                document.getElementById('crmPage').classList.add('active');
+                window.location.hash = '/crm';
+                // Initialize CRM when navigating to it
+                if (typeof initCrm === 'function') {
+                    initCrm();
+                }
+            } else {
+                document.getElementById('chatPage').classList.add('active');
+                window.location.hash = '/';
+            }
+        }
+
+        function handleRouting() {
+            const hash = window.location.hash;
+
+            if (hash === '#/crm') {
+                navigateToPage('crm');
+            } else {
+                navigateToPage('chat');
+            }
+        }
+
+        // Handle hash changes
+        window.addEventListener('hashchange', handleRouting);
+
+        // Initialize. (The "Ready" status is set by initChat(); the initial
+        // markup already renders it, so there is no flash.)
+        handleRouting(); // Handle initial route
+
+        // ============================================
+        // CRM Tab Switching
+        // ============================================
+        function switchCrmTab(tab) {
+            // Update tab buttons
+            document.querySelectorAll('.crm-tab').forEach(btn => {
+                btn.classList.toggle('active', btn.dataset.tab === tab);
+            });
+
+            // Show/hide tab content
+            document.getElementById('crmPeopleTab').style.display = tab === 'people' ? 'flex' : 'none';
+            document.getElementById('crmNetworkTab').style.display = tab === 'network' ? 'flex' : 'none';
+
+            // Initialize network graph when switching to network tab
+            if (tab === 'network') {
+                if (!networkInitialized) {
+                    // Use setTimeout to ensure container is visible before getting dimensions
+                    setTimeout(() => initNetworkGraph(), 50);
+                } else {
+                    // Re-render with correct dimensions if already initialized
+                    setTimeout(() => {
+                        const container = document.getElementById('networkGraph');
+                        const rect = container.getBoundingClientRect();
+                        if (rect.width > 0 && rect.height > 0 && networkSvg) {
+                            networkSvg.attr('viewBox', [0, 0, rect.width, rect.height]);
+                            renderNetwork();
+                        }
+                    }, 50);
+                }
+            }
+        }
+
+        // ============================================
+        // D3.js Network Graph
+        // ============================================
+        let networkInitialized = false;
+        let networkSimulation = null;
+        let networkSvg = null;
+        let networkData = { nodes: [], edges: [] };
+        let selectedNetworkNode = null;
+        let networkCenterPersonId = null;  // Person ID to center the graph on
+
+        // Category colors
+        const categoryColors = {
+            work: '#3182ce',
+            personal: '#38a169',
+            family: '#d69e2e',
+            unknown: '#718096'
+        };
+
+        async function initNetworkGraph() {
+            const container = document.getElementById('networkGraph');
+            let rect = container.getBoundingClientRect();
+
+            // If container is hidden, use fallback dimensions (will be updated on render)
+            const width = rect.width || 800;
+            const height = rect.height || 600;
+
+            // Create SVG
+            networkSvg = d3.select('#networkGraph')
+                .append('svg')
+                .attr('width', '100%')
+                .attr('height', '100%')
+                .attr('viewBox', [0, 0, width, height]);
+
+            // Add zoom behavior
+            const zoom = d3.zoom()
+                .scaleExtent([0.1, 4])
+                .on('zoom', (event) => {
+                    networkSvg.select('g.network-content').attr('transform', event.transform);
+                });
+
+            networkSvg.call(zoom);
+
+            // Double-click to reset view
+            networkSvg.on('dblclick.zoom', () => {
+                networkSvg.transition().duration(500).call(zoom.transform, d3.zoomIdentity);
+            });
+
+            // Create container group
+            networkSvg.append('g').attr('class', 'network-content');
+
+            // Create tooltip
+            const tooltip = d3.select('#networkGraph')
+                .append('div')
+                .attr('class', 'network-tooltip')
+                .style('display', 'none');
+
+            networkInitialized = true;
+
+            // Load initial data
+            await loadNetworkData();
+        }
+
+        async function loadNetworkData(centerOnPersonId = null) {
+            const container = document.getElementById('networkGraph');
+
+            // Update center person if provided
+            if (centerOnPersonId !== null) {
+                networkCenterPersonId = centerOnPersonId;
+            }
+
+            try {
+                // Build query params based on filters
+                const strengthSlider = document.getElementById('networkStrengthSlider');
+                const minStrength = strengthSlider ? parseInt(strengthSlider.value) / 100 : 0;
+
+                const params = new URLSearchParams();
+                if (minStrength > 0) params.append('min_strength', minStrength.toFixed(2));
+
+                // Add center_on and depth for second-degree connections
+                if (networkCenterPersonId) {
+                    params.append('center_on', networkCenterPersonId);
+                    params.append('depth', '2');  // Include second-degree connections
+                }
+
+                const response = await fetch(`/api/crm/network?${params.toString()}`);
+                if (!response.ok) throw new Error('Failed to load network data');
+
+                networkData = await response.json();
+
+                // Filter by selected categories
+                const categories = getSelectedCategories();
+                networkData.nodes = networkData.nodes.filter(n => categories.includes(n.category));
+
+                // Filter edges to only include nodes that exist
+                const nodeIds = new Set(networkData.nodes.map(n => n.id));
+                networkData.edges = networkData.edges.filter(e =>
+                    nodeIds.has(e.source) && nodeIds.has(e.target)
+                );
+
+                renderNetwork();
+            } catch (error) {
+                console.error('Error loading network data:', error);
+                container.innerHTML = `
+                    <div class="network-empty">
+                        <div class="network-empty-icon">⚠️</div>
+                        <p>Failed to load network data</p>
+                    </div>
+                `;
+            }
+        }
+
+        function getSelectedCategories() {
+            const categories = [];
+            if (document.getElementById('networkCatWork')?.checked) categories.push('work');
+            if (document.getElementById('networkCatPersonal')?.checked) categories.push('personal');
+            if (document.getElementById('networkCatFamily')?.checked) categories.push('family');
+            if (document.getElementById('networkCatUnknown')?.checked) categories.push('unknown');
+            return categories;
+        }
+
+        function renderNetwork() {
+            const container = document.getElementById('networkGraph');
+            const rect = container.getBoundingClientRect();
+            const width = rect.width;
+            const height = rect.height;
+
+            if (networkData.nodes.length === 0) {
+                const content = networkSvg.select('g.network-content');
+                content.selectAll('*').remove();
+                container.querySelector('.network-empty')?.remove();
+                container.insertAdjacentHTML('beforeend', `
+                    <div class="network-empty">
+                        <div class="network-empty-icon">🔗</div>
+                        <p>No connections found.<br>Try adjusting the filters or adding more relationships.</p>
+                    </div>
+                `);
+                return;
+            }
+
+            // Remove any empty state
+            container.querySelector('.network-empty')?.remove();
+
+            // Get the content group
+            const content = networkSvg.select('g.network-content');
+            content.selectAll('*').remove();
+
+            // Create copy of data for D3 (it will mutate it)
+            const nodes = networkData.nodes.map(d => ({...d}));
+            const links = networkData.edges.map(d => ({
+                source: d.source,
+                target: d.target,
+                weight: d.weight,
+                type: d.type
+            }));
+
+            // Stop any existing simulation
+            if (networkSimulation) {
+                networkSimulation.stop();
+            }
+
+            // Create force simulation
+            networkSimulation = d3.forceSimulation(nodes)
+                .force('link', d3.forceLink(links)
+                    .id(d => d.id)
+                    .distance(100))
+                .force('charge', d3.forceManyBody().strength(-200))
+                .force('center', d3.forceCenter(width / 2, height / 2))
+                .force('collision', d3.forceCollide().radius(d => getNodeRadius(d) + 5));
+
+            // Create links
+            const link = content.append('g')
+                .attr('class', 'links')
+                .selectAll('line')
+                .data(links)
+                .join('line')
+                .attr('class', 'network-link')
+                .attr('stroke-width', d => Math.max(1, Math.min(5, d.weight / 5)))
+                .attr('stroke-opacity', d => Math.min(0.8, 0.2 + d.weight / 50));
+
+            // Create node groups
+            const node = content.append('g')
+                .attr('class', 'nodes')
+                .selectAll('g')
+                .data(nodes)
+                .join('g')
+                .attr('class', d => `network-node degree-${d.degree}`)
+                .call(d3.drag()
+                    .on('start', dragstarted)
+                    .on('drag', dragged)
+                    .on('end', dragended));
+
+            // Add circles to nodes
+            node.append('circle')
+                .attr('r', d => getNodeRadius(d))
+                .attr('fill', d => categoryColors[d.category] || categoryColors.unknown)
+                .attr('fill-opacity', d => d.degree === 2 ? 0.5 : 1);
+
+            // Add labels to high-strength nodes
+            node.filter(d => d.strength > 0.7)
+                .append('text')
+                .attr('class', 'network-node-label')
+                .attr('dy', d => getNodeRadius(d) + 12)
+                .text(d => d.name.split(' ')[0]); // First name only
+
+            // Add tooltips
+            const tooltip = d3.select('#networkGraph .network-tooltip');
+
+            node.on('mouseover', (event, d) => {
+                const degreeLabel = d.degree === 0 ? 'Center' : (d.degree === 1 ? '1st degree' : '2nd degree');
+                tooltip
+                    .style('display', 'block')
+                    .style('left', (event.offsetX + 10) + 'px')
+                    .style('top', (event.offsetY - 10) + 'px')
+                    .html(`
+                        <strong>${d.name}</strong><br>
+                        ${degreeLabel}<br>
+                        Category: ${d.category}<br>
+                        Strength: ${(d.strength * 100).toFixed(0)}%<br>
+                        Interactions: ${d.interaction_count}
+                    `);
+            })
+            .on('mouseout', () => {
+                tooltip.style('display', 'none');
+            })
+            .on('click', (event, d) => {
+                event.stopPropagation();
+                selectNetworkNode(d);
+            });
+
+            // Update positions on tick
+            networkSimulation.on('tick', () => {
+                link
+                    .attr('x1', d => d.source.x)
+                    .attr('y1', d => d.source.y)
+                    .attr('x2', d => d.target.x)
+                    .attr('y2', d => d.target.y);
+
+                node.attr('transform', d => `translate(${d.x},${d.y})`);
+            });
+
+            // Drag functions
+            function dragstarted(event, d) {
+                if (!event.active) networkSimulation.alphaTarget(0.3).restart();
+                d.fx = d.x;
+                d.fy = d.y;
+            }
+
+            function dragged(event, d) {
+                d.fx = event.x;
+                d.fy = event.y;
+            }
+
+            function dragended(event, d) {
+                if (!event.active) networkSimulation.alphaTarget(0);
+                d.fx = null;
+                d.fy = null;
+            }
+        }
+
+        function getNodeRadius(node) {
+            const baseRadius = 5 + node.strength * 20;
+            // Center node (degree 0) is largest, first-degree normal, second-degree smaller
+            if (node.degree === 0) {
+                return baseRadius * 1.5;  // Center person is 50% larger
+            } else if (node.degree === 2) {
+                return baseRadius * 0.7;  // Second-degree is 30% smaller
+            }
+            return baseRadius;
+        }
+
+        function selectNetworkNode(node) {
+            selectedNetworkNode = node;
+
+            // Update visual selection
+            d3.selectAll('.network-node').classed('selected', d => d.id === node.id);
+
+            // Update the detail panel with this person's info
+            if (typeof selectCrmPerson === 'function') {
+                selectCrmPerson(node.id);
+            }
+
+            // Re-center the graph on this person to show their connections
+            loadNetworkData(node.id);
+        }
+
+        function updateNetworkFilters() {
+            // Update strength display
+            const slider = document.getElementById('networkStrengthSlider');
+            const valueDisplay = document.getElementById('networkStrengthValue');
+            if (slider && valueDisplay) {
+                valueDisplay.textContent = slider.value + '%';
+            }
+
+            // Reload data with new filters
+            if (networkInitialized) {
+                loadNetworkData();
+            }
+        }
+
+        function resetNetworkView() {
+            // Reset filters
+            document.getElementById('networkStrengthSlider').value = 0;
+            document.getElementById('networkStrengthValue').textContent = '0%';
+            document.getElementById('networkCatWork').checked = true;
+            document.getElementById('networkCatPersonal').checked = true;
+            document.getElementById('networkCatFamily').checked = true;
+            document.getElementById('networkCatUnknown').checked = true;
+
+            // Reset center person
+            networkCenterPersonId = null;
+            selectedNetworkNode = null;
+
+            // Reset zoom
+            if (networkSvg) {
+                networkSvg.transition().duration(500).call(
+                    d3.zoom().transform,
+                    d3.zoomIdentity
+                );
+            }
+
+            // Reload data without center
+            loadNetworkData();
+        }
+
+        // =====================
+        // CRM People List Functionality
+        // =====================
+
+        // CRM State
+        const crmState = {
+            initialized: false,
+            people: [],
+            selectedPersonId: null,
+            searchQuery: '',
+            timelineFilter: null, // null = all, or 'gmail', 'calendar', 'imessage', etc.
+            timelineDaysShown: 30, // Number of days currently shown
+            timelineData: null, // Cached timeline data for load more
+            sortBy: 'strength',
+            showAll: false,
+            reviewQueue: [],
+            reviewIndex: 0,
+            searchDebounce: null,
+        };
+
+        // Initialize CRM when page is shown
+        function initCrm() {
+            if (!crmState.initialized) {
+                crmState.initialized = true;
+                loadCrmPeople();
+                loadReviewQueueCount();
+            }
+        }
+
+        // Load people from API
+        async function loadCrmPeople() {
+            const peopleList = document.getElementById('crmPeopleList');
+            peopleList.innerHTML = '<div class="crm-loading">Loading people...</div>';
+
+            try {
+                const params = new URLSearchParams();
+                params.set('sort', crmState.sortBy);
+                params.set('limit', '200');
+
+                if (crmState.searchQuery) {
+                    params.set('q', crmState.searchQuery);
+                }
+
+                // By default, hide zero-interaction people unless showAll is enabled
+                if (!crmState.showAll) {
+                    params.set('has_interactions', 'true');
+                }
+
+                const response = await fetch(`/api/crm/people?${params.toString()}`);
+                if (!response.ok) throw new Error('Failed to load people');
+
+                const data = await response.json();
+                crmState.people = data.people || [];
+
+                renderCrmPeopleList();
+                document.getElementById('crmStatsBadge').textContent = data.total || crmState.people.length;
+            } catch (error) {
+                console.error('Error loading CRM people:', error);
+                peopleList.innerHTML = '<div class="crm-empty-state"><p>Failed to load people</p></div>';
+            }
+        }
+
+        // Render people list
+        function renderCrmPeopleList() {
+            const peopleList = document.getElementById('crmPeopleList');
+
+            if (crmState.people.length === 0) {
+                const emptyMessage = crmState.searchQuery
+                    ? 'No people match your search'
+                    : (crmState.showAll ? 'No people found' : 'No people with interactions found');
+                peopleList.innerHTML = `<div class="crm-empty-state"><p>${emptyMessage}</p></div>`;
+                return;
+            }
+
+            peopleList.innerHTML = crmState.people.map(person => {
+                const initials = getInitials(person.canonical_name || person.display_name || '?');
+                const isActive = person.id === crmState.selectedPersonId;
+
+                return `
+                    <div class="crm-person-card ${isActive ? 'active' : ''}" onclick="selectCrmPerson('${person.id}')">
+                        <div class="crm-person-avatar">${initials}</div>
+                        <div class="crm-person-info">
+                            <div class="crm-person-name">${escapeHtml(person.canonical_name || person.display_name)}</div>
+                            <div class="crm-person-meta">${escapeHtml(person.company || person.emails?.[0] || '')}</div>
+                            <div class="crm-person-stats">
+                                ${person.email_count ? `<span class="crm-person-stat" title="Emails">📧${person.email_count}</span>` : ''}
+                                ${person.meeting_count ? `<span class="crm-person-stat" title="Meetings">📅${person.meeting_count}</span>` : ''}
+                                ${person.message_count ? `<span class="crm-person-stat" title="Messages">💬${person.message_count}</span>` : ''}
+                                ${person.mention_count ? `<span class="crm-person-stat" title="Mentions">📝${person.mention_count}</span>` : ''}
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        // Get initials from name
+        function getInitials(name) {
+            return name
+                .split(' ')
+                .map(part => part.charAt(0).toUpperCase())
+                .slice(0, 2)
+                .join('');
+        }
+
+        // Handle search input
+        function handleCrmSearch() {
+            clearTimeout(crmState.searchDebounce);
+            crmState.searchDebounce = setTimeout(() => {
+                crmState.searchQuery = document.getElementById('crmSearchInput').value.trim();
+                loadCrmPeople();
+            }, 300);
+        }
+
+        // Handle sort change
+        function handleCrmSortChange() {
+            crmState.sortBy = document.getElementById('crmSortSelect').value;
+            loadCrmPeople();
+        }
+
+        // Handle show all toggle
+        function handleCrmShowAllChange() {
+            const checkbox = document.getElementById('crmShowAllCheckbox');
+            crmState.showAll = checkbox.checked;
+            document.getElementById('crmShowAllToggle').classList.toggle('active', crmState.showAll);
+            loadCrmPeople();
+        }
+
+        // Select a person with progressive loading
+        async function selectCrmPerson(personId) {
+            crmState.selectedPersonId = personId;
+            renderCrmPeopleList(); // Update active state
+
+            // 1. Immediately show header with name from list (instant feedback)
+            const personFromList = crmState.people.find(p => p.id === personId);
+            renderPersonHeaderWithSkeletons(personFromList || { id: personId });
+
+            // 2. Load full person data in background
+            try {
+                const response = await fetch(`/api/crm/people/${personId}`);
+                if (!response.ok) throw new Error('Failed to load person');
+
+                const person = await response.json();
+                renderCrmPersonDetail(person);
+            } catch (error) {
+                console.error('Error loading person:', error);
+                // Show error but keep the header visible
+                const contentArea = document.getElementById('crmDetailContent');
+                if (contentArea) {
+                    contentArea.innerHTML = `
+                        <div class="crm-section-error">
+                            <div class="error-icon">!</div>
+                            <div>Failed to load person details</div>
+                            <button class="crm-retry-btn" onclick="selectCrmPerson('${personId}')">Retry</button>
+                        </div>
+                    `;
+                }
+            }
+        }
+
+        // Render person header immediately with skeleton placeholders for content
+        function renderPersonHeaderWithSkeletons(person) {
+            const main = document.getElementById('crmMain');
+            const name = person.canonical_name || person.display_name || 'Loading...';
+            const initials = getInitials(name);
+            const company = person.company || '';
+            const position = person.position || '';
+
+            main.innerHTML = `
+                <div class="crm-detail-header">
+                    <div style="display: flex; align-items: center; gap: 1rem;">
+                        <div class="crm-person-avatar" style="width: 56px; height: 56px; font-size: 1.25rem;">${initials}</div>
+                        <div>
+                            <h2 style="font-size: 1.25rem; margin-bottom: 0.25rem;">${escapeHtml(name)}</h2>
+                            <p style="color: var(--text-secondary); font-size: 0.875rem;">
+                                ${position ? escapeHtml(position) + ' at ' : ''}
+                                ${company ? escapeHtml(company) : ''}
+                            </p>
+                        </div>
+                    </div>
+                </div>
+                <div class="crm-detail-content" id="crmDetailContent">
+                    <!-- Skeleton stats grid -->
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 1rem; margin-bottom: 1.5rem;">
+                        <div class="crm-skeleton crm-skeleton-stat"></div>
+                        <div class="crm-skeleton crm-skeleton-stat"></div>
+                        <div class="crm-skeleton crm-skeleton-stat"></div>
+                        <div class="crm-skeleton crm-skeleton-stat"></div>
+                    </div>
+
+                    <!-- Skeleton contact info -->
+                    <div class="crm-skeleton-section">
+                        <div class="crm-skeleton crm-skeleton-text short"></div>
+                        <div class="crm-skeleton crm-skeleton-text medium"></div>
+                    </div>
+
+                    <!-- Timeline loading placeholder -->
+                    <div class="crm-timeline" id="personTimeline">
+                        <div class="crm-section-loading">
+                            <div class="spinner"></div>
+                            <span>Loading timeline...</span>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        // Render person detail view
+        function renderCrmPersonDetail(person) {
+            const main = document.getElementById('crmMain');
+            const initials = getInitials(person.canonical_name || person.display_name || '?');
+
+            main.innerHTML = `
+                <div class="crm-detail-header">
+                    <div style="display: flex; align-items: center; gap: 1rem;">
+                        <div class="crm-person-avatar" style="width: 56px; height: 56px; font-size: 1.25rem;">${initials}</div>
+                        <div>
+                            <h2 style="font-size: 1.25rem; margin-bottom: 0.25rem;">${escapeHtml(person.canonical_name || person.display_name)}</h2>
+                            <p style="color: var(--text-secondary); font-size: 0.875rem;">
+                                ${person.position ? escapeHtml(person.position) + ' at ' : ''}
+                                ${person.company ? escapeHtml(person.company) : ''}
+                            </p>
+                        </div>
+                    </div>
+                </div>
+                <div class="crm-detail-content">
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 1rem; margin-bottom: 1.5rem;">
+                        <div style="background: var(--bg-secondary); padding: 1rem; border-radius: 8px; text-align: center;">
+                            <div style="font-size: 1.5rem; font-weight: 600; color: var(--crm-accent);">${person.email_count || 0}</div>
+                            <div style="font-size: 0.75rem; color: var(--text-muted);">Emails</div>
+                        </div>
+                        <div style="background: var(--bg-secondary); padding: 1rem; border-radius: 8px; text-align: center;">
+                            <div style="font-size: 1.5rem; font-weight: 600; color: var(--crm-accent);">${person.meeting_count || 0}</div>
+                            <div style="font-size: 0.75rem; color: var(--text-muted);">Meetings</div>
+                        </div>
+                        <div style="background: var(--bg-secondary); padding: 1rem; border-radius: 8px; text-align: center;">
+                            <div style="font-size: 1.5rem; font-weight: 600; color: var(--crm-accent);">${person.message_count ? person.message_count.toLocaleString() : 0}</div>
+                            <div style="font-size: 0.75rem; color: var(--text-muted);">Messages</div>
+                        </div>
+                        <div style="background: var(--bg-secondary); padding: 1rem; border-radius: 8px; text-align: center;">
+                            <div style="font-size: 1.5rem; font-weight: 600; color: var(--crm-accent);">${person.mention_count || 0}</div>
+                            <div style="font-size: 0.75rem; color: var(--text-muted);">Mentions</div>
+                        </div>
+                        <div style="background: var(--bg-secondary); padding: 1rem; border-radius: 8px; text-align: center;">
+                            <div style="font-size: 1.5rem; font-weight: 600; color: var(--crm-accent);">${Math.round(person.relationship_strength * 100)}%</div>
+                            <div style="font-size: 0.75rem; color: var(--text-muted);">Strength</div>
+                        </div>
+                    </div>
+
+                    ${person.emails?.length ? `
+                    <div style="margin-bottom: 1.5rem;">
+                        <h3 style="font-size: 0.875rem; color: var(--text-muted); margin-bottom: 0.5rem;">Email</h3>
+                        ${person.emails.map(email => `<p style="font-size: 0.875rem; color: var(--text-primary);">${escapeHtml(email)}</p>`).join('')}
+                    </div>
+                    ` : ''}
+
+                    ${person.phone_numbers?.length ? `
+                    <div style="margin-bottom: 1.5rem;">
+                        <h3 style="font-size: 0.875rem; color: var(--text-muted); margin-bottom: 0.5rem;">Phone</h3>
+                        ${person.phone_numbers.map(phone => `<p style="font-size: 0.875rem; color: var(--text-primary);">${escapeHtml(phone)}</p>`).join('')}
+                    </div>
+                    ` : ''}
+
+                    ${person.notes ? `
+                    <div style="margin-bottom: 1.5rem;">
+                        <h3 style="font-size: 0.875rem; color: var(--text-muted); margin-bottom: 0.5rem;">Notes</h3>
+                        <p style="font-size: 0.875rem; color: var(--text-primary); white-space: pre-wrap;">${escapeHtml(person.notes)}</p>
+                    </div>
+                    ` : ''}
+
+                    ${person.tags?.length ? `
+                    <div style="margin-bottom: 1.5rem;">
+                        <h3 style="font-size: 0.875rem; color: var(--text-muted); margin-bottom: 0.5rem;">Tags</h3>
+                        <div style="display: flex; flex-wrap: wrap; gap: 0.5rem;">
+                            ${person.tags.map(tag => `<span style="background: var(--bg-tertiary); padding: 0.25rem 0.5rem; border-radius: 4px; font-size: 0.75rem;">${escapeHtml(tag)}</span>`).join('')}
+                        </div>
+                    </div>
+                    ` : ''}
+
+                    <div class="crm-timeline" id="personTimeline">
+                        <div class="crm-section-loading">
+                            <div class="spinner"></div>
+                            <span>Loading timeline...</span>
+                        </div>
+                    </div>
+                </div>
+            `;
+
+            // Load timeline after rendering (non-blocking)
+            loadPersonTimeline(person.id);
+        }
+
+        // Load and render aggregated timeline for a person with timeout handling
+        // Performance: days_back=90 for fast initial load (vs 365 before)
+        async function loadPersonTimeline(personId, sourceTypeFilter = null, daysBack = 90) {
+            const container = document.getElementById('personTimeline');
+            if (!container) return;
+
+            // Reset days shown when loading fresh
+            crmState.timelineDaysShown = 30;
+            crmState.timelineFilter = sourceTypeFilter;
+            crmState.timelineDaysBack = daysBack;
+
+            // Show initial loading state
+            container.innerHTML = `
+                <div class="crm-section-loading" id="timelineLoadingState">
+                    <div class="spinner"></div>
+                    <span>Loading timeline...</span>
+                </div>
+            `;
+
+            // Set up timeout handlers for slow loading feedback
+            let slowTimeout, failTimeout;
+            const loadingState = document.getElementById('timelineLoadingState');
+
+            slowTimeout = setTimeout(() => {
+                if (loadingState) {
+                    loadingState.classList.add('slow');
+                    loadingState.querySelector('span').textContent = 'Taking longer than expected...';
+                }
+            }, 10000); // 10 seconds
+
+            failTimeout = setTimeout(() => {
+                if (loadingState) {
+                    container.innerHTML = `
+                        <div class="crm-timeline-header">
+                            <h3>Timeline</h3>
+                        </div>
+                        <div class="crm-section-error">
+                            <div class="error-icon">!</div>
+                            <div>Timeline is taking too long to load</div>
+                            <button class="crm-retry-btn" onclick="loadPersonTimeline('${personId}', ${sourceTypeFilter ? `'${sourceTypeFilter}'` : 'null'}, ${daysBack})">Retry</button>
+                        </div>
+                    `;
+                }
+            }, 30000); // 30 seconds
+
+            try {
+                // Fetch 90 days with items (was 365, caused slow loads)
+                let url = `/api/crm/people/${personId}/timeline/aggregated?days_back=${daysBack}&include_items=true&max_items_per_group=10`;
+                if (sourceTypeFilter) {
+                    url += `&source_type=${sourceTypeFilter}`;
+                }
+                const response = await fetch(url);
+
+                // Clear timeouts on success
+                clearTimeout(slowTimeout);
+                clearTimeout(failTimeout);
+
+                if (!response.ok) throw new Error('Failed to load timeline');
+
+                const data = await response.json();
+                crmState.timelineData = data; // Store for "load more"
+                renderPersonTimeline(container, data);
+            } catch (error) {
+                // Clear timeouts on error
+                clearTimeout(slowTimeout);
+                clearTimeout(failTimeout);
+
+                console.error('Error loading timeline:', error);
+                container.innerHTML = `
+                    <div class="crm-timeline-header">
+                        <h3>Timeline</h3>
+                    </div>
+                    <div class="crm-section-error">
+                        <div class="error-icon">!</div>
+                        <div>Failed to load timeline</div>
+                        <button class="crm-retry-btn" onclick="loadPersonTimeline('${personId}', ${sourceTypeFilter ? `'${sourceTypeFilter}'` : 'null'}, ${daysBack})">Retry</button>
+                    </div>
+                `;
+            }
+        }
+
+        // Filter timeline by source type
+        function filterTimeline(sourceType) {
+            crmState.timelineFilter = sourceType;
+            if (crmState.selectedPersonId) {
+                loadPersonTimeline(crmState.selectedPersonId, sourceType);
+            }
+        }
+
+        // Load more timeline days
+        function loadMoreTimelineDays() {
+            crmState.timelineDaysShown += 30;
+            const container = document.getElementById('personTimeline');
+            if (container && crmState.timelineData) {
+                renderPersonTimeline(container, crmState.timelineData);
+            }
+        }
+
+        // Render aggregated timeline
+        function renderPersonTimeline(container, data) {
+            if (!data.days || data.days.length === 0) {
+                container.innerHTML = `
+                    <div class="crm-timeline-header">
+                        <h3>Timeline</h3>
+                    </div>
+                    <div class="crm-timeline-loading">No interactions found</div>
+                `;
+                return;
+            }
+
+            // Format source type for display
+            function formatSourceType(type) {
+                const names = {
+                    gmail: 'emails',
+                    calendar: 'meetings',
+                    vault: 'notes',
+                    granola: 'notes',
+                    imessage: 'messages',
+                    whatsapp: 'messages',
+                    contacts: 'contacts',
+                    phone: 'calls'
+                };
+                return names[type] || type;
+            }
+
+            // Build date range text
+            let dateRangeText = '';
+            if (data.date_range_start && data.date_range_end) {
+                dateRangeText = `${data.date_range_start} to ${data.date_range_end}`;
+            }
+
+            // Collect unique source types for filter buttons
+            const sourceTypes = new Set();
+            for (const day of data.days) {
+                for (const group of day.groups) {
+                    sourceTypes.add(group.source_type);
+                }
+            }
+
+            // Build filter buttons HTML
+            const activeFilter = crmState.timelineFilter;
+            let filterButtonsHtml = `
+                <button class="crm-timeline-filter-btn ${!activeFilter ? 'active' : ''}" onclick="filterTimeline(null)">All</button>
+            `;
+            const filterLabels = {
+                gmail: '📧 Email',
+                calendar: '📅 Calendar',
+                vault: '📝 Notes',
+                granola: '📝 Notes',
+                imessage: '💬 iMessage',
+                whatsapp: '💬 WhatsApp',
+                contacts: '📇 Contacts',
+                phone: '📞 Phone'
+            };
+            for (const type of sourceTypes) {
+                const label = filterLabels[type] || type;
+                filterButtonsHtml += `
+                    <button class="crm-timeline-filter-btn ${activeFilter === type ? 'active' : ''}" onclick="filterTimeline('${type}')">${label}</button>
+                `;
+            }
+
+            let html = `
+                <div class="crm-timeline-header">
+                    <h3>Timeline</h3>
+                    <span class="crm-timeline-meta">${data.total_interactions.toLocaleString()} interactions</span>
+                </div>
+                <div class="crm-timeline-filters">
+                    ${filterButtonsHtml}
+                </div>
+            `;
+
+            // Show days based on current limit
+            const daysToShow = data.days.slice(0, crmState.timelineDaysShown);
+
+            for (const day of daysToShow) {
+                html += `
+                    <div class="crm-timeline-day">
+                        <div class="crm-timeline-date">
+                            <span>${escapeHtml(day.date_display)}</span>
+                            <span class="crm-timeline-date-count">${day.total_count} interaction${day.total_count !== 1 ? 's' : ''}</span>
+                        </div>
+                        <div class="crm-timeline-groups">
+                `;
+
+                for (const group of day.groups) {
+                    const groupId = `timeline-group-${day.date}-${group.source_type}`;
+                    const hasItems = group.items && group.items.length > 0;
+
+                    html += `
+                        <div class="crm-timeline-group" id="${groupId}">
+                            <div class="crm-timeline-group-header" onclick="toggleTimelineGroup('${groupId}')">
+                                <div class="crm-timeline-group-badge">${group.source_badge}</div>
+                                <div class="crm-timeline-group-info">
+                                    <div class="crm-timeline-group-title">
+                                        <span>${group.count} ${formatSourceType(group.source_type)}</span>
+                                        <span class="crm-timeline-group-count">${group.count}</span>
+                                    </div>
+                                    ${group.preview ? `<div class="crm-timeline-group-preview">${escapeHtml(group.preview)}</div>` : ''}
+                                </div>
+                                ${hasItems ? '<div class="crm-timeline-group-expand">▼</div>' : ''}
+                            </div>
+                    `;
+
+                    if (hasItems) {
+                        html += `<div class="crm-timeline-items" id="${groupId}-items">`;
+                        for (const item of group.items) {
+                            html += `
+                                <div class="crm-timeline-item">
+                                    <div class="crm-timeline-item-title">
+                                        ${item.source_link ? `<a href="${escapeHtml(item.source_link)}" target="_blank">${escapeHtml(item.title)}</a>` : escapeHtml(item.title)}
+                                        ${item.snippet ? `<div class="crm-timeline-item-snippet">${escapeHtml(item.snippet)}</div>` : ''}
+                                    </div>
+                                </div>
+                            `;
+                        }
+                        html += '</div>';
+                    }
+                    html += '</div>'; // Close crm-timeline-group
+                }
+
+                html += `
+                        </div>
+                    </div>
+                `;
+            }
+
+            // Show "Load More" button if there are more days
+            if (data.days.length > crmState.timelineDaysShown) {
+                const remainingDays = data.days.length - crmState.timelineDaysShown;
+                html += `
+                    <button class="crm-timeline-load-more" onclick="loadMoreTimelineDays()">
+                        Load ${Math.min(30, remainingDays)} more days (${remainingDays} remaining)
+                    </button>
+                `;
+            }
+
+            // Show "Load Full Year" button if we loaded less than 365 days
+            if (crmState.timelineDaysBack < 365) {
+                html += `
+                    <button class="crm-timeline-load-more" style="margin-top: 0.5rem; background: var(--bg-tertiary);" onclick="loadFullYearTimeline()">
+                        Load Full Year History
+                    </button>
+                `;
+            }
+
+            container.innerHTML = html;
+        }
+
+        // Load full year timeline (slower, but complete)
+        function loadFullYearTimeline() {
+            if (crmState.selectedPersonId) {
+                loadPersonTimeline(crmState.selectedPersonId, crmState.timelineFilter, 365);
+            }
+        }
+
+        // Toggle timeline group expansion
+        function toggleTimelineGroup(groupId) {
+            const group = document.getElementById(groupId);
+            if (group) {
+                group.classList.toggle('expanded');
+            }
+        }
+
+        // =====================
+        // Review Queue
+        // =====================
+
+        // Load review queue count for badge
+        async function loadReviewQueueCount() {
+            try {
+                const response = await fetch('/api/crm/review-queue?limit=1');
+                if (!response.ok) return;
+
+                const data = await response.json();
+                const badge = document.getElementById('crmReviewBadge');
+                const count = data.total_pending || 0;
+                badge.textContent = count;
+                badge.classList.toggle('empty', count === 0);
+            } catch (error) {
+                console.error('Error loading review queue count:', error);
+            }
+        }
+
+        // Open review queue modal
+        async function openReviewQueueModal() {
+            document.getElementById('reviewQueueModal').classList.add('visible');
+            await loadReviewQueue();
+        }
+
+        // Close review queue modal
+        function closeReviewQueueModal() {
+            document.getElementById('reviewQueueModal').classList.remove('visible');
+        }
+
+        // Load review queue
+        async function loadReviewQueue() {
+            const body = document.getElementById('reviewQueueBody');
+            body.innerHTML = '<div class="crm-loading">Loading review queue...</div>';
+
+            try {
+                const response = await fetch('/api/crm/review-queue?limit=50');
+                if (!response.ok) throw new Error('Failed to load review queue');
+
+                const data = await response.json();
+                crmState.reviewQueue = data.items || [];
+                crmState.reviewIndex = 0;
+
+                renderReviewQueueItem();
+            } catch (error) {
+                console.error('Error loading review queue:', error);
+                body.innerHTML = '<div class="review-empty"><p>Failed to load review queue</p></div>';
+            }
+        }
+
+        // Render current review queue item
+        function renderReviewQueueItem() {
+            const body = document.getElementById('reviewQueueBody');
+
+            if (crmState.reviewQueue.length === 0) {
+                body.innerHTML = `
+                    <div class="review-empty">
+                        <div class="review-empty-icon">✅</div>
+                        <p>No items to review</p>
+                        <p style="font-size: 0.75rem; margin-top: 0.5rem;">All matches have been confirmed or rejected.</p>
+                    </div>
+                `;
+                document.getElementById('crmReviewBadge').textContent = '0';
+                document.getElementById('crmReviewBadge').classList.add('empty');
+                return;
+            }
+
+            const item = crmState.reviewQueue[crmState.reviewIndex];
+            const total = crmState.reviewQueue.length;
+            const current = crmState.reviewIndex + 1;
+            const progress = (current / total) * 100;
+
+            // Determine confidence level for styling
+            let confidenceClass = 'low';
+            if (item.confidence >= 0.7) confidenceClass = 'high';
+            else if (item.confidence >= 0.5) confidenceClass = 'medium';
+
+            body.innerHTML = `
+                <div class="review-progress">
+                    <span>${current} of ${total}</span>
+                    <div class="review-progress-bar">
+                        <div class="review-progress-fill" style="width: ${progress}%"></div>
+                    </div>
+                    <span>${Math.round(progress)}%</span>
+                </div>
+
+                <div class="review-item">
+                    <div class="review-source-info">
+                        <div class="review-source-label">Source Entity</div>
+                        <div class="review-source-name">${escapeHtml(item.observed_name || 'Unknown')}</div>
+                        <div class="review-source-details">
+                            ${item.observed_email ? `<div>📧 ${escapeHtml(item.observed_email)}</div>` : ''}
+                            ${item.observed_phone ? `<div>📱 ${escapeHtml(item.observed_phone)}</div>` : ''}
+                        </div>
+                        <span class="review-source-type">${escapeHtml(item.source_type)}</span>
+                    </div>
+
+                    <div class="review-arrow">↓</div>
+
+                    <div class="review-match">
+                        <div class="review-match-label">Proposed Match</div>
+                        <div class="review-match-name">${escapeHtml(item.proposed_person_name)}</div>
+                        <div class="review-confidence">
+                            <span style="font-size: 0.75rem; color: var(--text-muted);">Confidence:</span>
+                            <div class="review-confidence-bar">
+                                <div class="review-confidence-fill ${confidenceClass}" style="width: ${item.confidence * 100}%"></div>
+                            </div>
+                            <span class="review-confidence-text">${Math.round(item.confidence * 100)}%</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="review-actions">
+                    <button class="review-btn review-btn-reject" onclick="rejectReviewItem('${item.id}')">
+                        ✗ Reject
+                    </button>
+                    <button class="review-btn review-btn-confirm" onclick="confirmReviewItem('${item.id}')">
+                        ✓ Confirm
+                    </button>
+                </div>
+            `;
+        }
+
+        // Confirm review item
+        async function confirmReviewItem(entityId) {
+            try {
+                const response = await fetch(`/api/crm/review-queue/${entityId}/confirm`, {
+                    method: 'POST',
+                });
+                if (!response.ok) throw new Error('Failed to confirm');
+
+                advanceReviewQueue();
+            } catch (error) {
+                console.error('Error confirming review item:', error);
+                alert('Failed to confirm match');
+            }
+        }
+
+        // Reject review item
+        async function rejectReviewItem(entityId) {
+            try {
+                const response = await fetch(`/api/crm/review-queue/${entityId}/reject`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ create_new_person: false }),
+                });
+                if (!response.ok) throw new Error('Failed to reject');
+
+                advanceReviewQueue();
+            } catch (error) {
+                console.error('Error rejecting review item:', error);
+                alert('Failed to reject match');
+            }
+        }
+
+        // Advance to next review item
+        function advanceReviewQueue() {
+            // Remove current item from queue
+            crmState.reviewQueue.splice(crmState.reviewIndex, 1);
+
+            // Adjust index if needed
+            if (crmState.reviewIndex >= crmState.reviewQueue.length) {
+                crmState.reviewIndex = 0;
+            }
+
+            // Update badge
+            const badge = document.getElementById('crmReviewBadge');
+            badge.textContent = crmState.reviewQueue.length;
+            badge.classList.toggle('empty', crmState.reviewQueue.length === 0);
+
+            // Render next item
+            renderReviewQueueItem();
+        }
+    </script>
+</body>
+</html>

@@ -1,0 +1,890 @@
+"""
+Tests for People Tracking functionality.
+P1.4 Acceptance Criteria:
+- Extracts person names from note content
+- Handles aliases (Alex → Alex Johnson)
+- Handles misspellings
+- Tracks last-mention date per person
+- Person filter works in search API
+- "What do I know about Alex" returns relevant context
+- Excludes self-references (configured user name)
+"""
+import tempfile
+from pathlib import Path
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+import api.services.people as people_module
+from api.services.people import (
+    PeopleRegistry,
+    extract_people_from_text,
+    resolve_person_name,
+)
+
+# Most tests in this file are fast unit tests
+pytestmark = pytest.mark.unit
+
+# Obviously-synthetic people-dictionary content (never real names) covering
+# every shape the dictionary-dependent tests below need: 3+ non-excluded
+# names, at least one alias distinct from its canonical name, and both a
+# "work" and a "family" category.
+_SYNTHETIC_PEOPLE_DICTIONARY = {
+    "Alex Chen": {"aliases": ["Al Chen", "Alexandra Chen"], "category": "work"},
+    "Sam Rivera": {"aliases": [], "category": "family"},
+    "Jordan Lee": {"aliases": ["Jordy"], "category": "personal"},
+}
+
+
+def _install_synthetic_people_dictionary(monkeypatch):
+    """api.services.people derives ALIAS_MAP/KNOWN_NAMES from
+    PEOPLE_DICTIONARY once at import time, so resolve_person_name and
+    extract_people_from_text never read PEOPLE_DICTIONARY directly --
+    patching only that name would leave them looking at whatever (usually
+    empty) dictionary was present when this process started. Mirror the
+    module's own derivation so the patched data is fully consistent for
+    every caller, not just the dict lookups this test file makes itself."""
+    alias_map: dict[str, str] = {}
+    known_names: set[str] = set(_SYNTHETIC_PEOPLE_DICTIONARY.keys())
+    for name, info in _SYNTHETIC_PEOPLE_DICTIONARY.items():
+        alias_map[name.lower()] = name
+        for alias in info.get("aliases", []):
+            alias_map[alias.lower()] = name
+            known_names.add(alias)
+    monkeypatch.setattr(people_module, "PEOPLE_DICTIONARY", _SYNTHETIC_PEOPLE_DICTIONARY)
+    monkeypatch.setattr(people_module, "ALIAS_MAP", alias_map)
+    monkeypatch.setattr(people_module, "KNOWN_NAMES", known_names)
+
+
+class TestPeopleExtraction:
+    """Test person name extraction from text."""
+
+    def test_extracts_bold_names(self):
+        """Should extract names in bold format."""
+        text = "Met with **Alex** and **Sarah** today to discuss the budget."
+        people = extract_people_from_text(text)
+
+        assert "Alex" in people
+        assert "Sarah" in people
+
+    def test_extracts_names_from_people_dictionary(self, monkeypatch):
+        """Should recognize names from the People Dictionary."""
+        _install_synthetic_people_dictionary(monkeypatch)
+
+        # Use names from the dictionary for the test, skipping excluded
+        # names (names with exclude=True like self-references are filtered
+        # out) -- none of the synthetic entries are excluded.
+        dictionary_names = [
+            name for name, info in people_module.PEOPLE_DICTIONARY.items()
+            if not info.get("exclude", False)
+        ][:3]
+        assert len(dictionary_names) >= 3
+
+        # Build test text using names from dictionary (no bold formatting)
+        text = f"{dictionary_names[0]} and {dictionary_names[1]} went to the park. {dictionary_names[2]} called."
+        people = extract_people_from_text(text)
+
+        for name in dictionary_names:
+            assert name in people, f"Expected {name} to be extracted from dictionary"
+
+    def test_handles_common_patterns(self):
+        """Should extract names from common patterns."""
+        text = """
+        Attendees: Kevin, Sarah, Mike
+        1-1 with Hayley
+        Meeting with Alex about budgets
+        """
+        people = extract_people_from_text(text)
+
+        assert "Kevin" in people
+        assert "Hayley" in people
+        assert "Alex" in people
+
+    def test_excludes_self_references(self):
+        """Should exclude self-references (configured user name)."""
+        from config.settings import settings
+        user_name = settings.user_name if settings.user_name else "User"
+        text = f"{user_name} met with Alex to discuss the project. I'll follow up."
+        people = extract_people_from_text(text)
+
+        assert user_name not in people
+        assert "Alex" in people
+
+    def test_handles_possessives(self):
+        """Should extract names even with possessives."""
+        # Use bold format to ensure extraction regardless of dictionary config
+        text = "**Alex**'s idea was great. **Jane**'s schedule is busy."
+        people = extract_people_from_text(text)
+
+        assert "Alex" in people
+        assert "Jane" in people
+
+
+class TestAliasResolution:
+    """Test alias and fuzzy name resolution."""
+
+    def test_resolves_known_alias(self):
+        """Should resolve known aliases to canonical names."""
+        # Alex should resolve (known in dictionary)
+        resolved = resolve_person_name("Alex")
+        assert resolved == "Alex"  # or "Alex Johnson" if we expand
+
+    def test_resolves_misspelling(self, monkeypatch):
+        """Should resolve common misspellings via a dictionary alias."""
+        _install_synthetic_people_dictionary(monkeypatch)
+
+        # Find a misspelling mapping from the dictionary -- the synthetic
+        # dictionary guarantees at least one true alias exists.
+        misspelling_found = False
+        for canonical, info in people_module.PEOPLE_DICTIONARY.items():
+            aliases = info.get("aliases", [])
+            for alias in aliases:
+                if alias.lower() != canonical.lower():  # It's a true alias/misspelling
+                    resolved = resolve_person_name(alias)
+                    assert resolved == canonical, f"Expected '{alias}' to resolve to '{canonical}'"
+                    misspelling_found = True
+                    break
+            if misspelling_found:
+                break
+
+        assert misspelling_found, "synthetic dictionary must contain a resolvable alias"
+
+    def test_resolves_email_to_name(self):
+        """Should resolve email addresses to names."""
+        resolved = resolve_person_name("user@example.com")
+        # Should recognize as name or return as-is if not in registry
+        assert resolved in ["User", "user@example.com"]
+
+    def test_preserves_unknown_names(self):
+        """Should preserve names not in dictionary."""
+        resolved = resolve_person_name("RandomPerson")
+        assert resolved == "RandomPerson"
+
+
+class TestPeopleRegistry:
+    """Test the People Registry storage and queries."""
+
+    @pytest.fixture
+    def temp_registry_path(self):
+        """Create temp path for registry storage."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir) / "people_registry.json"
+
+    @pytest.fixture
+    def registry(self, temp_registry_path):
+        """Create a fresh registry."""
+        return PeopleRegistry(storage_path=str(temp_registry_path))
+
+    def test_records_person_mention(self, registry):
+        """Should record person mentions with metadata."""
+        registry.record_mention(
+            name="Alex",
+            source_file="/vault/meeting.md",
+            mention_date="2025-01-05"
+        )
+
+        person = registry.get_person("Alex")
+        assert person is not None
+        assert person["mention_count"] >= 1
+        assert "/vault/meeting.md" in person["related_notes"]
+
+    def test_tracks_last_mention_date(self, registry):
+        """Should track the most recent mention date."""
+        registry.record_mention("Sarah", "/vault/old.md", "2025-01-01")
+        registry.record_mention("Sarah", "/vault/new.md", "2025-01-10")
+
+        person = registry.get_person("Sarah")
+        assert person["last_mention_date"] == "2025-01-10"
+
+    def test_increments_mention_count(self, registry):
+        """Should increment mention count for repeated mentions."""
+        registry.record_mention("Kevin", "/vault/file1.md", "2025-01-01")
+        registry.record_mention("Kevin", "/vault/file2.md", "2025-01-02")
+        registry.record_mention("Kevin", "/vault/file3.md", "2025-01-03")
+
+        person = registry.get_person("Kevin")
+        assert person["mention_count"] == 3
+
+    def test_categorizes_people(self, registry, monkeypatch):
+        """Should categorize people as work/personal/family."""
+        _install_synthetic_people_dictionary(monkeypatch)
+
+        # Find a work person from dictionary
+        work_person = None
+        for name, info in people_module.PEOPLE_DICTIONARY.items():
+            if info.get("category") == "work":
+                work_person = name
+                break
+
+        if work_person:
+            registry.record_mention(work_person, "/vault/work.md", "2025-01-01")
+            person = registry.get_person(work_person)
+            assert person["category"] == "work", f"Expected {work_person} to be categorized as 'work'"
+        else:
+            # No work person in dictionary, test passes vacuously
+            pass
+
+        # Find a family person from dictionary
+        family_person = None
+        for name, info in people_module.PEOPLE_DICTIONARY.items():
+            if info.get("category") == "family":
+                family_person = name
+                break
+
+        if family_person:
+            registry.record_mention(family_person, "/vault/personal.md", "2025-01-01")
+            person = registry.get_person(family_person)
+            assert person["category"] == "family", f"Expected {family_person} to be categorized as 'family'"
+
+    def test_searches_by_person(self, registry):
+        """Should enable searching by person name."""
+        registry.record_mention("Alex", "/vault/meeting1.md", "2025-01-01")
+        registry.record_mention("Alex", "/vault/meeting2.md", "2025-01-02")
+
+        notes = registry.get_related_notes("Alex")
+        assert len(notes) == 2
+        assert "/vault/meeting1.md" in notes
+        assert "/vault/meeting2.md" in notes
+
+    def test_persists_registry(self, temp_registry_path):
+        """Registry should persist across instances."""
+        # Create and populate first registry
+        reg1 = PeopleRegistry(storage_path=str(temp_registry_path))
+        reg1.record_mention("TestPerson", "/vault/test.md", "2025-01-01")
+        reg1.save()
+
+        # Create new instance and verify data persisted
+        reg2 = PeopleRegistry(storage_path=str(temp_registry_path))
+        person = reg2.get_person("TestPerson")
+        assert person is not None
+        assert person["mention_count"] == 1
+
+
+@pytest.mark.slow
+class TestPeopleIntegration:
+    """Integration tests for people tracking with indexer."""
+
+    @pytest.fixture
+    def temp_vault(self):
+        """Create test vault with people mentions."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            vault = Path(tmpdir) / "vault"
+            vault.mkdir()
+
+            # Note with bold names
+            (vault / "meeting1.md").write_text("""---
+tags: [meeting]
+type: meeting
+---
+
+# Team Standup
+
+Met with **Alex** and **Sarah** today.
+Discussed Q1 goals with the team.
+""")
+
+            # Note with misspelled name
+            (vault / "family.md").write_text("""---
+tags: [personal]
+type: note
+---
+
+# Weekend Plans
+
+Taking Alice to the park. Jane is making dinner.
+""")
+
+            yield vault
+
+    def test_indexer_extracts_people(self, temp_vault):
+        """Indexer should extract people during indexing."""
+        with tempfile.TemporaryDirectory() as db_dir:
+            from api.services.indexer import IndexerService
+
+            indexer = IndexerService(
+                vault_path=str(temp_vault),
+                db_path=db_dir
+            )
+            indexer.index_all()
+
+            # Search should find people in metadata
+            results = indexer.vector_store.search("team standup", top_k=5)
+            assert len(results) >= 1
+
+            indexer.stop()
+
+
+# ---------------------------------------------------------------------------
+# GET /api/people/search bounds its results and batches the recency lookup.
+#
+# These tests build isolated PersonEntityStore/InteractionStore instances
+# (temp SQLite files, no dependency on data/crm.db) and monkeypatch the
+# getters api.routes.people imports, so they run as fast unit tests on a
+# fresh clone. A separate integration-marked latency test at the bottom
+# exercises the real dataset when present.
+# ---------------------------------------------------------------------------
+
+def _make_person(**kwargs):
+    from api.services.person_entity import PersonEntity
+    defaults = dict(canonical_name="", emails=[], last_seen=None)
+    defaults.update(kwargs)
+    return PersonEntity(**defaults)
+
+
+class TestSearchPeopleEndpoint:
+    """GET /api/people/search — limit validation and preserved ordering."""
+
+    @pytest.fixture
+    def stores(self, tmp_path, monkeypatch):
+        from api.services.person_entity import PersonEntityStore
+        from api.services.interaction_store import InteractionStore
+        import api.routes.people as people_routes
+
+        person_store = PersonEntityStore(db_path=str(tmp_path / "people.db"))
+        interaction_store = InteractionStore(
+            db_path=str(tmp_path / "interactions.db"), strict=False
+        )
+
+        now = datetime.now(timezone.utc)
+        # Exact canonical-name match, but the oldest last_seen of the three —
+        # must still sort first (exact match beats recency).
+        exact_old = _make_person(
+            id="exact-old",
+            canonical_name="Ada Test",
+            emails=["ada.test@example.com"],
+            last_seen=now - timedelta(days=400),
+        )
+        # Substring match on canonical_name, more recent than the exact match.
+        partial_recent = _make_person(
+            id="partial-recent",
+            canonical_name="Ada Testerson",
+            emails=["ada.testerson@example.com"],
+            last_seen=now - timedelta(days=1),
+        )
+        # Substring match via email only.
+        email_match = _make_person(
+            id="email-match",
+            canonical_name="Someone Else",
+            emails=["contains.ada.test@example.com"],
+            last_seen=now - timedelta(days=2),
+        )
+        # Does not match "ada test" anywhere.
+        non_match = _make_person(
+            id="non-match",
+            canonical_name="Bob Nomatch",
+            emails=["bob@example.com"],
+            last_seen=now,
+        )
+        for entity in (exact_old, partial_recent, email_match, non_match):
+            person_store.add(entity)
+
+        # One of the four has a real interaction; the other three have none
+        # at all -- exercising both branches of the batched recency lookup:
+        # "absent from the batch map" must mean "no interactions", not
+        # "go run a per-person fallback query".
+        self._insert_raw_interaction(interaction_store, "partial-recent", "gmail", days_ago=1)
+
+        monkeypatch.setattr(people_routes, "get_person_entity_store", lambda: person_store)
+        monkeypatch.setattr(people_routes, "get_interaction_store", lambda: interaction_store)
+        return person_store, interaction_store
+
+    @staticmethod
+    def _insert_raw_interaction(interaction_store, person_id, source_type, days_ago):
+        """Insert an interaction row directly, bypassing InteractionStore.add()
+        (which resolves person_id against the global PersonEntityStore
+        singleton, not this test's isolated one)."""
+        import uuid
+        conn = interaction_store._get_connection()
+        ts = (datetime.now(timezone.utc) - timedelta(days=days_ago)).isoformat()
+        try:
+            conn.execute(
+                "INSERT INTO interactions (id, person_id, timestamp, source_type, title) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (str(uuid.uuid4()), person_id, ts, source_type, "test"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    @pytest.fixture
+    def client(self, stores):
+        from fastapi.testclient import TestClient
+        from api.main import app
+        return TestClient(app)
+
+    def test_limit_zero_is_rejected(self, client):
+        # This app's global RequestValidationError handler (api/main.py)
+        # converts all validation errors to 400, not FastAPI's default 422.
+        resp = client.get("/api/people/search", params={"q": "ada", "limit": 0})
+        assert resp.status_code == 400
+
+    def test_limit_over_max_is_rejected(self, client):
+        resp = client.get("/api/people/search", params={"q": "ada", "limit": 201})
+        assert resp.status_code == 400
+
+    def test_limit_boundaries_are_accepted(self, client):
+        assert client.get("/api/people/search", params={"q": "ada", "limit": 1}).status_code == 200
+        assert client.get("/api/people/search", params={"q": "ada", "limit": 200}).status_code == 200
+
+    def test_default_limit_is_20(self, client):
+        resp = client.get("/api/people/search", params={"q": "ada"})
+        assert resp.status_code == 200
+        # Only 3 of the 4 synthetic entities match "ada" at all, well under
+        # the default of 20, so this just confirms the default didn't clamp
+        # unexpectedly low (e.g. to something like 1 or 5).
+        assert resp.json()["count"] == 3
+
+    def test_exact_match_sorts_first_even_when_older(self, client):
+        resp = client.get("/api/people/search", params={"q": "Ada Test", "limit": 20})
+        assert resp.status_code == 200
+        data = resp.json()
+        names = [p["canonical_name"] for p in data["people"]]
+        assert names[0] == "Ada Test", "exact canonical-name match must sort first"
+        assert "Bob Nomatch" not in names
+
+    def test_non_exact_matches_sort_by_recency(self, client):
+        resp = client.get("/api/people/search", params={"q": "ada.test", "limit": 20})
+        assert resp.status_code == 200
+        names = [p["canonical_name"] for p in resp.json()["people"]]
+        # None of these are an exact canonical-name match for "ada.test", so
+        # order falls back to most-recent last_seen first.
+        assert names.index("Ada Testerson") < names.index("Someone Else")
+
+    def test_total_reflects_full_match_count_not_page_size(self, client):
+        resp = client.get("/api/people/search", params={"q": "ada", "limit": 1})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["count"] == 1
+        assert data["total"] == 3
+
+    def test_recency_lookup_is_batched_once(self, client, stores, monkeypatch):
+        """The recency query must run as exactly one batched call for the
+        whole page, no matter how many results are returned -- and the
+        per-person fallback (get_last_interaction_by_source) must never
+        run, including for the three people in this fixture with zero
+        interactions: an id absent from the batch result means "no
+        interactions", not "go run the fallback query"."""
+        _, interaction_store = stores
+        batch_calls = []
+        original_batch = interaction_store.get_last_interaction_by_source_batch
+
+        def batch_spy(person_ids):
+            batch_calls.append(list(person_ids))
+            return original_batch(person_ids)
+
+        per_person_calls = []
+
+        def per_person_spy(person_id):
+            per_person_calls.append(person_id)
+            return {}
+
+        monkeypatch.setattr(interaction_store, "get_last_interaction_by_source_batch", batch_spy)
+        monkeypatch.setattr(interaction_store, "get_last_interaction_by_source", per_person_spy)
+
+        resp = client.get("/api/people/search", params={"q": "ada", "limit": 20})
+        assert resp.status_code == 200
+        data = resp.json()
+
+        assert len(batch_calls) == 1, "expected exactly one batched recency call"
+        returned_ids = {p["entity_id"] for p in data["people"]}
+        assert set(batch_calls[0]) == returned_ids
+        assert per_person_calls == [], (
+            f"the per-person fallback must never run once results are batched, "
+            f"but it ran for: {per_person_calls}"
+        )
+
+        # The fixture's zero-interaction people must still report "no active
+        # channels" correctly, not silently omit the field or error.
+        by_id = {p["entity_id"]: p for p in data["people"]}
+        assert by_id["exact-old"]["active_channels"] == []
+        assert by_id["partial-recent"]["active_channels"] == ["gmail"]
+
+
+class TestExactMatchOutsideCandidateWindow:
+    """A query with far more matches than the internal candidate cap
+    (`limit * 5`, minimum 200) must still surface the exact canonical-name
+    match. The store's candidate window is ordered by recency, so the
+    exact match -- the single oldest of hundreds of substring matches here
+    -- would otherwise be excluded from the window entirely and never
+    returned at all, not just reordered."""
+
+    @pytest.fixture
+    def client(self, tmp_path, monkeypatch):
+        from api.services.person_entity import PersonEntityStore
+        from api.services.interaction_store import InteractionStore
+        import api.routes.people as people_routes
+        from fastapi.testclient import TestClient
+        from api.main import app
+
+        person_store = PersonEntityStore(db_path=str(tmp_path / "people.db"))
+        interaction_store = InteractionStore(
+            db_path=str(tmp_path / "interactions.db"), strict=False
+        )
+
+        now = datetime.now(timezone.utc)
+        # 205 filler people, all matching the substring "widget" and all
+        # more recently seen than the exact match below -- comfortably more
+        # than the 200-row candidate window a default query uses.
+        for i in range(205):
+            person_store.add(_make_person(
+                id=f"filler-{i}",
+                canonical_name=f"Widget Owner {i}",
+                last_seen=now - timedelta(seconds=i),
+            ))
+        # The exact canonical-name match for query "widget" -- the oldest
+        # last_seen of anyone matching, so a plain recency-ordered candidate
+        # fetch excludes it from the top 200 entirely.
+        person_store.add(_make_person(
+            id="exact-widget",
+            canonical_name="Widget",
+            last_seen=now - timedelta(days=3650),
+        ))
+
+        monkeypatch.setattr(people_routes, "get_person_entity_store", lambda: person_store)
+        monkeypatch.setattr(people_routes, "get_interaction_store", lambda: interaction_store)
+        return TestClient(app)
+
+    def test_exact_match_still_returned_first(self, client):
+        resp = client.get("/api/people/search", params={"q": "widget", "limit": 20})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["people"][0]["canonical_name"] == "Widget"
+        assert data["total"] == 206
+
+    def test_exact_match_included_at_mcp_default_limit_too(self, client):
+        """MCP's default limit=10 hits the same >=200 candidate cap (the
+        formula is `max(limit * 5, 200)`), so the splice must still apply."""
+        resp = client.get("/api/people/search", params={"q": "widget", "limit": 10})
+        assert resp.status_code == 200
+        names = [p["canonical_name"] for p in resp.json()["people"]]
+        assert names[0] == "Widget"
+
+
+class TestSearchPeopleLikeEscaping:
+    """`%` and `_` in a search query must match literally, not act as SQL
+    LIKE wildcards, since matching runs in SQL rather than a Python
+    substring scan."""
+
+    @pytest.fixture
+    def client(self, tmp_path, monkeypatch):
+        from api.services.person_entity import PersonEntityStore
+        from api.services.interaction_store import InteractionStore
+        import api.routes.people as people_routes
+        from fastapi.testclient import TestClient
+        from api.main import app
+
+        person_store = PersonEntityStore(db_path=str(tmp_path / "people.db"))
+        interaction_store = InteractionStore(
+            db_path=str(tmp_path / "interactions.db"), strict=False
+        )
+
+        now = datetime.now(timezone.utc)
+        # A literal "_" in the name, plus a distractor with an arbitrary
+        # character in the same position -- an unescaped "_" (SQL LIKE's
+        # single-character wildcard) would incorrectly match both.
+        person_store.add(_make_person(id="underscore-literal", canonical_name="Foo_Bar", last_seen=now))
+        person_store.add(_make_person(id="underscore-distractor", canonical_name="FooXBar", last_seen=now))
+        # A literal "%" in the name, plus a distractor with extra characters
+        # in the same position -- an unescaped "%" (SQL LIKE's multi-character
+        # wildcard) would incorrectly match both.
+        person_store.add(_make_person(id="percent-literal", canonical_name="100%Club", last_seen=now))
+        person_store.add(_make_person(id="percent-distractor", canonical_name="100XYZClub", last_seen=now))
+
+        monkeypatch.setattr(people_routes, "get_person_entity_store", lambda: person_store)
+        monkeypatch.setattr(people_routes, "get_interaction_store", lambda: interaction_store)
+        return TestClient(app)
+
+    def test_underscore_matches_literally(self, client):
+        resp = client.get("/api/people/search", params={"q": "foo_bar", "limit": 20})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert {p["entity_id"] for p in data["people"]} == {"underscore-literal"}
+        assert data["total"] == 1
+
+    def test_percent_matches_literally(self, client):
+        resp = client.get("/api/people/search", params={"q": "100%club", "limit": 20})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert {p["entity_id"] for p in data["people"]} == {"percent-literal"}
+        assert data["total"] == 1
+
+
+class TestListPeopleEndpoint:
+    """GET /api/people/list — SQL-side ordering and category filter."""
+
+    @pytest.fixture
+    def stores(self, tmp_path, monkeypatch):
+        from api.services.person_entity import PersonEntityStore
+        from api.services.interaction_store import InteractionStore
+        import api.routes.people as people_routes
+
+        person_store = PersonEntityStore(db_path=str(tmp_path / "people.db"))
+        interaction_store = InteractionStore(
+            db_path=str(tmp_path / "interactions.db"), strict=False
+        )
+
+        now = datetime.now(timezone.utc)
+        oldest = _make_person(
+            id="oldest", canonical_name="Carol Old", category="work",
+            last_seen=now - timedelta(days=10),
+        )
+        middle = _make_person(
+            id="middle", canonical_name="Dave Mid", category="personal",
+            last_seen=now - timedelta(days=5),
+        )
+        newest = _make_person(
+            id="newest", canonical_name="Erin New", category="work",
+            last_seen=now,
+        )
+        for entity in (oldest, middle, newest):
+            person_store.add(entity)
+
+        monkeypatch.setattr(people_routes, "get_person_entity_store", lambda: person_store)
+        monkeypatch.setattr(people_routes, "get_interaction_store", lambda: interaction_store)
+        return person_store, interaction_store
+
+    @pytest.fixture
+    def client(self, stores):
+        from fastapi.testclient import TestClient
+        from api.main import app
+        return TestClient(app)
+
+    def test_orders_most_recent_first(self, client):
+        resp = client.get("/api/people/list", params={"limit": 10})
+        assert resp.status_code == 200
+        names = [p["canonical_name"] for p in resp.json()["people"]]
+        assert names == ["Erin New", "Dave Mid", "Carol Old"]
+
+    def test_category_filter_applied_in_sql(self, client):
+        resp = client.get("/api/people/list", params={"limit": 10, "category": "work"})
+        assert resp.status_code == 200
+        names = {p["canonical_name"] for p in resp.json()["people"]}
+        assert names == {"Erin New", "Carol Old"}
+
+    def test_limit_truncates(self, client):
+        resp = client.get("/api/people/list", params={"limit": 1})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["count"] == 1
+        assert data["people"][0]["canonical_name"] == "Erin New"
+
+    def test_recency_lookup_is_batched_once(self, client, stores, monkeypatch):
+        """/api/people/list must use the same batched recency lookup as
+        /api/people/search instead of one query per returned person."""
+        _, interaction_store = stores
+        batch_calls = []
+        original_batch = interaction_store.get_last_interaction_by_source_batch
+
+        def batch_spy(person_ids):
+            batch_calls.append(list(person_ids))
+            return original_batch(person_ids)
+
+        per_person_calls = []
+
+        def per_person_spy(person_id):
+            per_person_calls.append(person_id)
+            return {}
+
+        monkeypatch.setattr(interaction_store, "get_last_interaction_by_source_batch", batch_spy)
+        monkeypatch.setattr(interaction_store, "get_last_interaction_by_source", per_person_spy)
+
+        resp = client.get("/api/people/list", params={"limit": 10})
+        assert resp.status_code == 200
+        returned_ids = {p["entity_id"] for p in resp.json()["people"]}
+
+        assert len(batch_calls) == 1, "expected exactly one batched recency call"
+        assert set(batch_calls[0]) == returned_ids
+        assert per_person_calls == [], (
+            f"the per-person fallback must never run, but it ran for: {per_person_calls}"
+        )
+
+
+class TestInteractionStoreBatchRecency:
+    """InteractionStore.get_last_interaction_by_source_batch."""
+
+    @pytest.fixture
+    def store(self, tmp_path):
+        from api.services.interaction_store import InteractionStore
+        return InteractionStore(db_path=str(tmp_path / "interactions.db"), strict=False)
+
+    def _insert_raw(self, store, person_id, source_type, days_ago, iid=None):
+        import uuid
+        conn = store._get_connection()
+        ts = (datetime.now(timezone.utc) - timedelta(days=days_ago)).isoformat()
+        try:
+            conn.execute(
+                "INSERT INTO interactions (id, person_id, timestamp, source_type, title) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (iid or str(uuid.uuid4()), person_id, ts, source_type, "test"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_empty_input_returns_empty_dict(self, store):
+        assert store.get_last_interaction_by_source_batch([]) == {}
+
+    def test_matches_per_person_single_lookup(self, store):
+        self._insert_raw(store, "p1", "gmail", days_ago=1)
+        self._insert_raw(store, "p1", "gmail", days_ago=5)  # older gmail, should be superseded
+        self._insert_raw(store, "p1", "imessage", days_ago=2)
+        self._insert_raw(store, "p2", "slack", days_ago=3)
+
+        batch = store.get_last_interaction_by_source_batch(["p1", "p2"])
+        single_p1 = store.get_last_interaction_by_source("p1")
+        single_p2 = store.get_last_interaction_by_source("p2")
+
+        assert batch["p1"] == single_p1
+        assert batch["p2"] == single_p2
+        assert set(batch["p1"].keys()) == {"gmail", "imessage"}
+
+    def test_person_with_no_interactions_is_absent(self, store):
+        self._insert_raw(store, "p1", "gmail", days_ago=1)
+        batch = store.get_last_interaction_by_source_batch(["p1", "no-such-person"])
+        assert "no-such-person" not in batch
+
+    def test_chunks_over_900_ids(self, store):
+        """More than SQLite's ~999 bound-parameter limit must not error."""
+        self._insert_raw(store, "p-5", "gmail", days_ago=1)
+        many_ids = [f"p-{i}" for i in range(1500)]
+        batch = store.get_last_interaction_by_source_batch(many_ids)
+        assert batch["p-5"]["gmail"]
+
+
+class TestPersonEntityStoreSearchHelpers:
+    """PersonEntityStore.count_search / list_recent."""
+
+    @pytest.fixture
+    def store(self, tmp_path):
+        from api.services.person_entity import PersonEntityStore
+        return PersonEntityStore(db_path=str(tmp_path / "people.db"))
+
+    def test_count_search_matches_number_of_search_results_below_limit(self, store):
+        for i in range(5):
+            store.add(_make_person(
+                id=f"p{i}", canonical_name=f"Ada Match {i}", emails=[],
+                last_seen=datetime.now(timezone.utc),
+            ))
+        store.add(_make_person(id="other", canonical_name="No Hit", emails=[]))
+
+        assert store.count_search("ada") == 5
+        # A limit smaller than the true count still reports the full total.
+        assert len(store.search("ada", limit=2)) == 2
+
+    def test_count_search_excludes_merged_people(self, store):
+        """count_search() must exclude merged rows by default. Simulate a
+        merge the same way a real merge operation's durable record
+        (merged_person_ids.json) would represent it: a secondary id mapped
+        to the primary it was merged into."""
+        now = datetime.now(timezone.utc)
+        store.add(_make_person(id="primary", canonical_name="Ada Merged Primary",
+                                emails=[], last_seen=now))
+        store.add(_make_person(id="secondary", canonical_name="Ada Merged Secondary",
+                                emails=[], last_seen=now))
+        assert store.count_search("ada merged") == 2
+
+        store._merged_ids = {"secondary": "primary"}
+
+        assert store.count_search("ada merged") == 1
+        # include_merged=True restores the pre-merge count, same as search().
+        assert store.count_search("ada merged", include_merged=True) == 2
+
+    def test_list_recent_orders_and_filters_by_category(self, store):
+        now = datetime.now(timezone.utc)
+        store.add(_make_person(id="a", canonical_name="A", category="work",
+                                last_seen=now - timedelta(days=1)))
+        store.add(_make_person(id="b", canonical_name="B", category="family",
+                                last_seen=now))
+        store.add(_make_person(id="c", canonical_name="C", category="work",
+                                last_seen=now - timedelta(days=2)))
+
+        all_recent = store.list_recent(limit=10)
+        assert [e.canonical_name for e in all_recent] == ["B", "A", "C"]
+
+        work_only = store.list_recent(limit=10, category="work")
+        assert [e.canonical_name for e in work_only] == ["A", "C"]
+
+    def test_list_recent_respects_limit(self, store):
+        for i in range(3):
+            store.add(_make_person(id=f"p{i}", canonical_name=f"Person {i}",
+                                    last_seen=datetime.now(timezone.utc) - timedelta(days=i)))
+        assert len(store.list_recent(limit=2)) == 2
+
+
+@pytest.mark.slow
+class TestSearchPeopleLatency:
+    """A broad people search stays fast against an owned synthetic corpus.
+
+    The corpus exercises the real SQLite stores and route while deliberately
+    avoiding claims about production-scale data or operator-owned records.
+    """
+
+    @pytest.fixture
+    def client_and_population(self, tmp_path, monkeypatch):
+        from fastapi.testclient import TestClient
+        from api.main import app
+        from api.services.interaction_store import Interaction, InteractionStore
+        from api.services.person_entity import PersonEntityStore
+        import api.routes.people as people_routes
+        import api.services.person_entity as person_entity_mod
+
+        ambient_sentinel = tmp_path / "ambient-crm.db"
+        ambient_sentinel.write_text("synthetic ambient sentinel")
+        monkeypatch.setattr(PersonEntityStore, "CRM_DB_PATH", ambient_sentinel)
+
+        people_store = PersonEntityStore(db_path=str(tmp_path / "people.db"))
+        monkeypatch.setattr(person_entity_mod, "_entity_store", people_store)
+        interaction_store = InteractionStore(
+            db_path=str(tmp_path / "interactions.db"), strict=False
+        )
+        now = datetime.now(timezone.utc)
+        matching_people = 180
+        for index in range(matching_people + 60):
+            matching = index < matching_people
+            person_id = f"latency-person-{index}"
+            people_store.add(_make_person(
+                id=person_id,
+                canonical_name=(f"Alex Synthetic {index}" if matching else f"Morgan Synthetic {index}"),
+                emails=[f"person{index}@example.test"],
+                category=("work" if index % 3 else "personal"),
+                sources=["vault", "gmail"] if index % 2 else ["calendar", "contacts"],
+                last_seen=now - timedelta(minutes=index),
+            ))
+            if index % 2 == 0:
+                interaction_store.add(Interaction(
+                    id=f"latency-interaction-{index}", person_id=person_id,
+                    timestamp=now - timedelta(minutes=index),
+                    source_type="gmail" if index % 4 else "calendar",
+                    title=f"Synthetic interaction {index}",
+                ))
+
+        monkeypatch.setattr(people_routes, "get_person_entity_store", lambda: people_store)
+        monkeypatch.setattr(people_routes, "get_interaction_store", lambda: interaction_store)
+        return TestClient(app), matching_people, ambient_sentinel
+
+    def test_broad_query_under_200ms(self, client_and_population):
+        import time
+
+        client, matching_people, ambient_sentinel = client_and_population
+        warmup = client.get("/api/people/search", params={"q": "alex"})
+        assert warmup.status_code == 200
+        assert warmup.json()["total"] == matching_people
+
+        # Best of several samples (same approach as test_crm_api.py's
+        # _warm_latency_ms) rather than a single call: this host runs many
+        # concurrent agent sessions, and one unlucky sample sharing a CPU
+        # quantum with unrelated work shouldn't fail this check.
+        samples = []
+        for _ in range(5):
+            start = time.perf_counter()
+            resp = client.get("/api/people/search", params={"q": "alex"})
+            samples.append((time.perf_counter() - start) * 1000)
+            assert resp.status_code == 200
+        elapsed_ms = min(samples)
+
+        data = resp.json()
+        assert data["total"] == matching_people
+        assert data["count"] == 20
+        assert all("alex" in person["canonical_name"].lower() for person in data["people"])
+        assert ambient_sentinel.read_text() == "synthetic ambient sentinel"
+        assert elapsed_ms < 200, f"?q=alex took {elapsed_ms:.1f}ms (best of 5), expected under 200ms"

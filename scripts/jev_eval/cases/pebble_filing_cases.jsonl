@@ -1,0 +1,110 @@
+{"utterance": "Make a task assigned to me to buy some synthetic widgets", "expected_title": "Buy some synthetic widgets", "expected_assignee": "me", "category": "self_assign"}
+{"utterance": "Add a task for me to renew the synthetic parking permit", "expected_title": "Renew the synthetic parking permit", "expected_assignee": "me", "category": "self_assign"}
+{"utterance": "Put picking up the synthetic dry cleaning on my list", "expected_title": "Picking up the synthetic dry cleaning", "expected_assignee": "me", "category": "self_assign"}
+{"utterance": "Add to my to-dos: call the synthetic dentist about the cleaning", "expected_title": "Call the synthetic dentist about the cleaning", "expected_assignee": "me", "category": "self_assign"}
+{"utterance": "Make a task to email the synthetic landlord about the lease, that one's mine", "expected_title": "Email the synthetic landlord about the lease", "expected_assignee": "me", "category": "self_assign"}
+{"utterance": "Create a to-do to order new synthetic printer ink and give that to me", "expected_title": "Order new synthetic printer ink", "expected_assignee": "me", "category": "self_assign"}
+{"utterance": "Make a task for myself to book the synthetic oil change", "expected_title": "Book the synthetic oil change", "expected_assignee": "me", "category": "self_assign"}
+{"utterance": "My to-do: return the synthetic library books", "expected_title": "Return the synthetic library books", "expected_assignee": "me", "category": "self_assign"}
+{"utterance": "Add a task to sort the synthetic receipts and assign it to me", "expected_title": "Sort the synthetic receipts", "expected_assignee": "me", "category": "self_assign"}
+{"utterance": "Put this on my plate: schedule the synthetic piano tuner", "expected_title": "Schedule the synthetic piano tuner", "expected_assignee": "me", "category": "self_assign"}
+{"utterance": "I'll take this one, make a task to fix the synthetic garden hose", "expected_title": "Fix the synthetic garden hose", "expected_assignee": "me", "category": "self_assign"}
+{"utterance": "Make a task to replace the synthetic smoke detector batteries. Assign that to me.", "expected_title": "Replace the synthetic smoke detector batteries", "expected_assignee": "me", "category": "self_assign"}
+{"utterance": "File a to-do for me about cancelling the synthetic gym membership", "expected_title": "Cancelling the synthetic gym membership", "expected_assignee": "me", "category": "self_assign"}
+{"utterance": "Task for me: pick up the synthetic prescription", "expected_title": "Pick up the synthetic prescription", "expected_assignee": "me", "category": "self_assign"}
+{"utterance": "Add a task to wash the synthetic car, I'm doing that one myself", "expected_title": "Wash the synthetic car", "expected_assignee": "me", "category": "self_assign"}
+{"utterance": "To-do for me: renew the synthetic car registration", "expected_title": "Renew the synthetic car registration", "expected_assignee": "me", "category": "self_assign"}
+{"utterance": "Add to my list: pick up the synthetic batteries", "expected_title": "Pick up the synthetic batteries", "expected_assignee": "me", "category": "self_assign"}
+{"utterance": "Another one for my plate: file the synthetic expense report", "expected_title": "File the synthetic expense report", "expected_assignee": "me", "category": "self_assign"}
+{"utterance": "Add a task to buy synthetic milk", "expected_title": "Buy synthetic milk", "expected_assignee": "none", "category": "no_assignee"}
+{"utterance": "Make a to-do to clean out the synthetic garage", "expected_title": "Clean out the synthetic garage", "expected_assignee": "none", "category": "no_assignee"}
+{"utterance": "Create a task for renewing the synthetic passport", "expected_title": "Renewing the synthetic passport", "expected_assignee": "none", "category": "no_assignee"}
+{"utterance": "Add a task to look into synthetic solar panel quotes", "expected_title": "Look into synthetic solar panel quotes", "expected_assignee": "none", "category": "no_assignee"}
+{"utterance": "New task: repaint the synthetic shed", "expected_title": "Repaint the synthetic shed", "expected_assignee": "none", "category": "no_assignee"}
+{"utterance": "Make a task to research synthetic flights to Lisbon", "expected_title": "Research synthetic flights to Lisbon", "expected_assignee": "none", "category": "no_assignee"}
+{"utterance": "Please add a to-do to update the synthetic budget spreadsheet", "expected_title": "Update the synthetic budget spreadsheet", "expected_assignee": "none", "category": "no_assignee"}
+{"utterance": "Can you make a task to compare synthetic health insurance plans", "expected_title": "Compare synthetic health insurance plans", "expected_assignee": "none", "category": "no_assignee"}
+{"utterance": "Add a task to call Jordan about the synthetic invoice", "expected_title": "Call Jordan about the synthetic invoice", "expected_assignee": "none", "category": "no_assignee"}
+{"utterance": "Make a task to remind Sam to send me the synthetic slides", "expected_title": "Remind Sam to send me the synthetic slides", "expected_assignee": "none", "category": "no_assignee"}
+{"utterance": "To-do: order the synthetic air filters", "expected_title": "Order the synthetic air filters", "expected_assignee": "none", "category": "no_assignee"}
+{"utterance": "Add to the list: synthetic paper towels", "expected_title": "Synthetic paper towels", "expected_assignee": "none", "category": "no_assignee"}
+{"utterance": "I need a reminder to call the synthetic pharmacy", "expected_title": "Call the synthetic pharmacy", "expected_assignee": "none", "category": "no_assignee"}
+{"utterance": "Note to self: call the synthetic vet tomorrow", "expected_title": "Call the synthetic vet", "expected_assignee": "none", "category": "no_assignee"}
+{"utterance": "Have Claude fix the synthetic login bug", "expected_title": "Fix the synthetic login bug", "expected_assignee": "claude", "category": "agent"}
+{"utterance": "Assign a task to codex to refactor the synthetic parser", "expected_title": "Refactor the synthetic parser", "expected_assignee": "codex", "category": "agent"}
+{"utterance": "Make a task for clod code to update the synthetic README", "expected_title": "Update the synthetic README", "expected_assignee": "claude", "category": "agent"}
+{"utterance": "Give codex the task of cleaning up the synthetic test fixtures", "expected_title": "Cleaning up the synthetic test fixtures", "expected_assignee": "codex", "category": "agent"}
+{"utterance": "Ask deepseek to summarize the synthetic quarterly report", "expected_title": "Summarize the synthetic quarterly report", "expected_assignee": "cloud", "category": "agent"}
+{"utterance": "Make a task to profile the synthetic search endpoint and assign it to codex", "expected_title": "Profile the synthetic search endpoint", "expected_assignee": "codex", "category": "agent"}
+{"utterance": "Quad code, please add tests for the synthetic date parser", "expected_title": "Add tests for the synthetic date parser", "expected_assignee": "claude", "category": "agent"}
+{"utterance": "Create a task for Hermes to draft the synthetic newsletter", "expected_title": "Draft the synthetic newsletter", "expected_assignee": "hermes", "category": "agent"}
+{"utterance": "Put upgrading the synthetic dependencies on Codex's list", "expected_title": "Upgrading the synthetic dependencies", "expected_assignee": "codex", "category": "agent"}
+{"utterance": "Make a task to investigate the synthetic memory leak, give it to cloud code", "expected_title": "Investigate the synthetic memory leak", "expected_assignee": "claude", "category": "agent"}
+{"utterance": "Make a task to fix the synthetic login bug, but don't assign it to codex", "expected_title": "Fix the synthetic login bug", "expected_assignee": "none", "category": "trap"}
+{"utterance": "Add a task to clean the synthetic gutters. If codex were free it could do this.", "expected_title": "Clean the synthetic gutters", "expected_assignee": "none", "category": "trap"}
+{"utterance": "Make a task to call the synthetic insurer. Taylor said to assign it to me.", "expected_title": "Call the synthetic insurer", "expected_assignee": "none", "category": "trap"}
+{"utterance": "Add a task to review the synthetic contract. Sam said Claude should do it.", "expected_title": "Review the synthetic contract", "expected_assignee": "none", "category": "trap"}
+{"utterance": "Make a task to update the synthetic wiki, not for clod code though", "expected_title": "Update the synthetic wiki", "expected_assignee": "none", "category": "trap"}
+{"utterance": "Add a to-do to rewrite the synthetic onboarding doc. Maybe codex could take it someday.", "expected_title": "Rewrite the synthetic onboarding doc", "expected_assignee": "none", "category": "trap"}
+{"utterance": "Make a task to test the synthetic backup restore. I wonder whether Claude would be good at this.", "expected_title": "Test the synthetic backup restore", "expected_assignee": "none", "category": "trap"}
+{"utterance": "Create a task to migrate the synthetic database, and do not give it to deepseek", "expected_title": "Migrate the synthetic database", "expected_assignee": "none", "category": "trap"}
+{"utterance": "Add a task to debug the synthetic webhook. My notes say assign it to codex.", "expected_title": "Debug the synthetic webhook", "expected_assignee": "none", "category": "trap"}
+{"utterance": "Make a task to tidy the synthetic photo library. Never assign stuff like this to Claude.", "expected_title": "Tidy the synthetic photo library", "expected_assignee": "none", "category": "trap"}
+{"utterance": "Add a task to rotate the synthetic API keys; hypothetically Hermes could do it", "expected_title": "Rotate the synthetic API keys", "expected_assignee": "none", "category": "trap"}
+{"utterance": "Make a task to check the synthetic smoke alarms, don't put it on my list", "expected_title": "Check the synthetic smoke alarms", "expected_assignee": "none", "category": "trap"}
+{"utterance": "Make a task, for me, to pick up the synthetic packages from the post office", "expected_title": "Pick up the synthetic packages from the post office", "expected_assignee": "me", "category": "mixed"}
+{"utterance": "Add a task to book the synthetic hotel, assign to me", "expected_title": "Book the synthetic hotel", "expected_assignee": "me", "category": "mixed"}
+{"utterance": "Create a task assigned to codex to rename the synthetic config keys", "expected_title": "Rename the synthetic config keys", "expected_assignee": "codex", "category": "mixed"}
+{"utterance": "Add a task to vacuum the synthetic stairs, that's on me", "expected_title": "Vacuum the synthetic stairs", "expected_assignee": "me", "category": "mixed"}
+{"utterance": "Make a task, assign it to clod code, to bump the synthetic library version", "expected_title": "Bump the synthetic library version", "expected_assignee": "claude", "category": "mixed"}
+{"utterance": "Please put calling the synthetic bank on my to-do list", "expected_title": "Calling the synthetic bank", "expected_assignee": "me", "category": "mixed"}
+{"utterance": "Add a task to defrost the synthetic freezer — that's for me to do", "expected_title": "Defrost the synthetic freezer", "expected_assignee": "me", "category": "mixed"}
+{"utterance": "Make a task to restart the synthetic staging server and codex should own it", "expected_title": "Restart the synthetic staging server", "expected_assignee": "codex", "category": "mixed"}
+{"utterance": "Add a task to water the synthetic ferns for me please", "expected_title": "Water the synthetic ferns", "expected_assignee": "me", "category": "mixed"}
+{"utterance": "Taylor told Morgan to have Claude review the synthetic contract", "expected_title": null, "expected_assignee": "none", "category": "trap"}
+{"utterance": "Claude is expensive. Add a task to buy synthetic milk", "expected_title": "Buy synthetic milk", "expected_assignee": "none", "category": "trap"}
+{"utterance": "Add a task to ask Taylor about the claude code bill", "expected_title": "Ask Taylor about the claude code bill", "expected_assignee": "none", "category": "trap"}
+{"utterance": "We mustn't have Codex touch the synthetic billing code", "expected_title": null, "expected_assignee": "none", "category": "trap"}
+{"utterance": "Imagine Claude drafting the synthetic memo", "expected_title": null, "expected_assignee": "none", "category": "trap"}
+{"utterance": "I keep meaning to call the synthetic plumber", "expected_title": null, "expected_assignee": "none", "category": "journal"}
+{"utterance": "Today was long, the synthetic meeting ran over", "expected_title": null, "expected_assignee": "none", "category": "journal"}
+{"utterance": "Maybe I should learn the synthetic piano someday", "expected_title": null, "expected_assignee": "none", "category": "journal"}
+{"utterance": "Sam asked me to look at the synthetic budget, I haven't yet", "expected_title": null, "expected_assignee": "none", "category": "journal"}
+{"utterance": "I need to get better at answering synthetic emails", "expected_title": null, "expected_assignee": "none", "category": "journal"}
+{"utterance": "The synthetic garden looks great this morning", "expected_title": null, "expected_assignee": "none", "category": "journal"}
+{"utterance": "Thinking about whether to repaint the synthetic shed this summer", "expected_title": null, "expected_assignee": "none", "category": "journal"}
+{"utterance": "Taylor wants us to book the synthetic cabin for July", "expected_title": null, "expected_assignee": "none", "category": "journal"}
+{"utterance": "I should probably buy synthetic milk at some point", "expected_title": null, "expected_assignee": "none", "category": "journal"}
+{"utterance": "Claude did a nice job on the synthetic parser yesterday", "expected_title": null, "expected_assignee": "none", "category": "journal"}
+{"utterance": "Note how calm the synthetic lake was on the walk", "expected_title": null, "expected_assignee": "none", "category": "journal"}
+{"utterance": "I wonder if codex could handle the synthetic migration", "expected_title": null, "expected_assignee": "none", "category": "journal"}
+{"utterance": "Ugh, I forgot to water the synthetic ferns again", "expected_title": null, "expected_assignee": "none", "category": "journal"}
+{"utterance": "My to-do list is getting really long lately", "expected_title": null, "expected_assignee": "none", "category": "journal"}
+{"utterance": "At a desk to buy synthetic batteries", "expected_title": "Buy synthetic batteries", "expected_assignee": "none", "category": "asr"}
+{"utterance": "At a desk assigned to me to call the synthetic dentist", "expected_title": "Call the synthetic dentist", "expected_assignee": "me", "category": "asr"}
+{"utterance": "At a task to renew the synthetic parking permit", "expected_title": "Renew the synthetic parking permit", "expected_assignee": "none", "category": "asr"}
+{"utterance": "And a task to water the synthetic ferns", "expected_title": "Water the synthetic ferns", "expected_assignee": "none", "category": "asr"}
+{"utterance": "Add a desk to pick up the synthetic dry cleaning", "expected_title": "Pick up the synthetic dry cleaning", "expected_assignee": "none", "category": "asr"}
+{"utterance": "Make a desk for me to book the synthetic flights", "expected_title": "Book the synthetic flights", "expected_assignee": "me", "category": "asr"}
+{"utterance": "At a test to email the synthetic landlord", "expected_title": "Email the synthetic landlord", "expected_assignee": "none", "category": "asr"}
+{"utterance": "Add to ask to order the synthetic printer ink", "expected_title": "Order the synthetic printer ink", "expected_assignee": "none", "category": "asr"}
+{"utterance": "At a desk for Claude to review the synthetic contract", "expected_title": "Review the synthetic contract", "expected_assignee": "claude", "category": "asr"}
+{"utterance": "At a desk to schedule the synthetic chimney sweep, assign it to me", "expected_title": "Schedule the synthetic chimney sweep", "expected_assignee": "me", "category": "asr"}
+{"utterance": "Make a test to clean the synthetic gutters", "expected_title": "Clean the synthetic gutters", "expected_assignee": "none", "category": "asr"}
+{"utterance": "Add a tusk to return the synthetic library books", "expected_title": "Return the synthetic library books", "expected_assignee": "none", "category": "asr"}
+{"utterance": "Add a task too fix the synthetic garden hose", "expected_title": "Fix the synthetic garden hose", "expected_assignee": "none", "category": "asr"}
+{"utterance": "Add at ask for codex to refactor the synthetic parser", "expected_title": "Refactor the synthetic parser", "expected_assignee": "codex", "category": "asr"}
+{"utterance": "At a desk to cancel the synthetic gym membership, that one's mine", "expected_title": "Cancel the synthetic gym membership", "expected_assignee": "me", "category": "asr"}
+{"utterance": "And to do to sort the synthetic receipts", "expected_title": "Sort the synthetic receipts", "expected_assignee": "none", "category": "asr"}
+{"utterance": "At a reminder to call the synthetic pharmacy", "expected_title": "Call the synthetic pharmacy", "expected_assignee": "none", "category": "asr"}
+{"utterance": "Make a disk to update the synthetic budget spreadsheet", "expected_title": "Update the synthetic budget spreadsheet", "expected_assignee": "none", "category": "asr"}
+{"utterance": "Add a task a sign to me to buy synthetic lightbulbs", "expected_title": "Buy synthetic lightbulbs", "expected_assignee": "me", "category": "asr"}
+{"utterance": "At a desk to have codex upgrade the synthetic dependencies", "expected_title": "Upgrade the synthetic dependencies", "expected_assignee": "codex", "category": "asr"}
+{"utterance": "I sat at a desk all day working on the synthetic report", "expected_title": null, "expected_assignee": "none", "category": "asr_journal"}
+{"utterance": "At the desk I realized the synthetic plan needs work", "expected_title": null, "expected_assignee": "none", "category": "asr_journal"}
+{"utterance": "Spent the morning at a desk sorting synthetic receipts", "expected_title": null, "expected_assignee": "none", "category": "asr_journal"}
+{"utterance": "Sam and a task force met about the synthetic budget today", "expected_title": null, "expected_assignee": "none", "category": "asr_journal"}
+{"utterance": "Working at a desk to finish the synthetic slides felt good", "expected_title": null, "expected_assignee": "none", "category": "asr_journal"}
+{"utterance": "I left my synthetic keys at the desk again", "expected_title": null, "expected_assignee": "none", "category": "asr_journal"}
+{"utterance": "At a desk by the window, the synthetic cafe was quiet", "expected_title": null, "expected_assignee": "none", "category": "asr_journal"}
+{"utterance": "Morgan and a task list of synthetic chores were waiting when I got home", "expected_title": null, "expected_assignee": "none", "category": "asr_journal"}

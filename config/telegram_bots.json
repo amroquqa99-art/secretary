@@ -1,0 +1,34 @@
+[
+  {
+    "name": "fitness",
+    "token_env": "TELEGRAM_FITNESS_BOT_TOKEN",
+    "chat_id_env": "TELEGRAM_FITNESS_CHAT_ID",
+    "persona_file": "config/personas/fitness.md"
+  },
+  {
+    "name": "therapist",
+    "token_env": "TELEGRAM_THERAPIST_BOT_TOKEN",
+    "chat_id_env": "TELEGRAM_THERAPIST_CHAT_ID",
+    "persona_file": "config/personas/therapist.md"
+  },
+  {
+    "name": "doctor",
+    "token_env": "TELEGRAM_DOCTOR_BOT_TOKEN",
+    "chat_id_env": "TELEGRAM_DOCTOR_CHAT_ID",
+    "persona_file": "config/personas/doctor.md",
+    "orchestrates": true
+  },
+  {
+    "name": "finance",
+    "label": "Finance",
+    "token_env": "TELEGRAM_FINANCE_BOT_TOKEN",
+    "chat_id_env": "TELEGRAM_FINANCE_CHAT_ID",
+    "persona_file": "config/personas/finance.md"
+  },
+  {
+    "name": "journal",
+    "token_env": "TELEGRAM_JOURNAL_BOT_TOKEN",
+    "chat_id_env": "TELEGRAM_JOURNAL_CHAT_ID",
+    "persona_file": "config/personas/journal.md"
+  }
+]

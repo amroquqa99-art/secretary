@@ -1,0 +1,252 @@
+"""Keyless-install regression matrix.
+
+Running with no model-provider key, no reachable local model server, and no
+remote provider configured is a documented, supported way to run this
+system -- and each failure shape below has broken it, in each case found
+live by a real person and fixed one at a time. This module stands guard
+against recurrence in the same shape: a reusable fully-keyless fixture,
+plus one regression assertion per affected path, so a future path hit by
+the same "no key, no local model" gap can be added here instead of
+discovered live again.
+
+Fixture design avoids two hazards:
+
+- Never reloads `config.settings` (which would split the singleton).
+  Every module under test does `from config.settings import settings` at
+  its own import time, binding its own name to the *same* underlying
+  `Settings()` object (`config/settings.py`'s module-level `settings =
+  Settings()`, instantiated exactly once). Swapping in a whole new
+  `Settings(...)` instance the way `tests/conftest.py`'s `mock_settings`
+  does would only be visible to code that re-fetches
+  `config.settings.settings` fresh -- not to a module's already-bound
+  name. Patching *attributes* on the shared object instead is visible
+  from every module's binding without needing a fresh import anywhere.
+- Never reads an ambient environment variable / real `.env` -- every
+  setting this matrix cares about is pinned explicitly via
+  `monkeypatch.setattr`, never left to whatever the process environment
+  happens to contain.
+
+No test here requires network access, a real credential, a GPU, a running
+server, or writes to a real database.
+
+Each affected path below carries a real, currently-passing assertion:
+
+- Health honesty              -> real assertion
+- Preflight doesn't raise     -> real assertion
+- LocalLLMClient /v1 doubling -> real assertion
+- Titling doesn't raise       -> real assertion (see below)
+- Chat omits raw exception    -> real assertion
+
+Titling's own acceptance criteria is broader than what's tested here (a
+shared local-or-remote fallback resolver so titling can actually *succeed*
+on a remote-only or Anthropic-only install instead of only ever trying the
+local server) -- that part is out of this matrix's scope. What this
+matrix asks for regarding titling is narrower: that a keyless install's
+titling failure doesn't raise and leaves the placeholder title in place.
+That guarantee holds today (the broad `except Exception` in
+`_maybe_retitle`), so it's written below as a real, currently-passing
+assertion rather than a placeholder.
+"""
+from __future__ import annotations
+
+from unittest.mock import patch
+
+import pytest
+
+pytestmark = pytest.mark.unit
+
+
+@pytest.fixture
+def keyless_settings(monkeypatch):
+    """Patch the shared settings singleton into a fully keyless shape.
+
+    No Anthropic key, no reachable local model server (the *setting* that
+    would point at one is pinned to a bogus URL; reachability itself is
+    mocked per-test rather than dialed for real), no remote provider,
+    no Telegram. Returns the shared object so a test can read from it if
+    needed.
+    """
+    from config.settings import settings
+
+    patches = {
+        "anthropic_api_key": "",
+        "local_llm_url": "http://127.0.0.1:1",  # never actually dialed
+        "llm_backend": "anthropic",
+        "agent_remote_executor": False,
+        "remote_llm_base_url": "",
+        "remote_llm_model": "",
+        "remote_llm_api_key": "",
+        "agent_default_route": "",
+        "telegram_bot_token": "",
+        "telegram_chat_id": "",
+    }
+    for name, value in patches.items():
+        # raising=True (default): a typo'd/renamed field must fail loudly,
+        # not silently no-op while the singleton keeps whatever value it
+        # picked up at import time (possibly from a real ambient .env/
+        # environment variable -- exactly the hazard this fixture
+        # exists to avoid).
+        monkeypatch.setattr(settings, name, value)
+
+    # Belt-and-suspenders against the same hazard from the other direction:
+    # nothing here should matter given the settings patches above (no code
+    # path this matrix exercises reads these env vars directly instead of
+    # going through `settings`), but scrub them anyway so a provider SDK's
+    # own env-var fallback can never smuggle a real credential into a test.
+    for env_var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
+        monkeypatch.delenv(env_var, raising=False)
+
+    return settings
+
+
+class TestHealthReportsHonestly:
+    """`api_key_configured` reflects whether an Anthropic
+    key is actually set, not merely whether `local_llm_url` (which has a
+    non-empty default regardless of backend) happens to be a non-empty
+    string."""
+
+    def test_api_key_configured_false_when_keyless(self, keyless_settings):
+        from fastapi.testclient import TestClient
+
+        from api.main import app
+
+        client = TestClient(app)
+        response = client.get("/health")
+        data = response.json()
+        assert data["checks"]["api_key_configured"] is False
+        assert data["status"] == "degraded"
+
+
+class TestPreflightDegradesInsteadOfRaising:
+    """With no Anthropic key, no reachable local server, and the remote
+    provider unconfigured, `_default_llm_caller`'s final
+    `raise RuntimeError(...)` is caught by `run_preflight`'s own
+    except-clause, which resolves to a routing=ask result with
+    `preflight_error` set -- never an unhandled exception reaching the
+    worker."""
+
+    def test_default_caller_degrades_to_ask_not_an_exception(self, keyless_settings):
+        from api.services.agent_worker import preflight as pf
+        from api.services.llm_client import LocalLLMClient
+
+        with patch.object(LocalLLMClient, "is_available", return_value=False):
+            result = pf.run_preflight(title="build a feature", tags=["agent"])
+
+        assert result.sane is True
+        assert result.sane_fatal is False
+        assert result.preflight_error
+        assert result.routing == pf.ROUTE_ASK
+
+
+class TestRemoteClientDoesNotDoubleV1:
+    """An OpenAI-compatible remote base URL that already
+    ends in `/v1` (the documented convention for these providers, e.g. the
+    remote-executor path on a keyless install) must not be doubled
+    into `.../v1/v1/chat/completions` once call sites append their own
+    `/v1/chat/completions` suffix."""
+
+    def test_base_url_ending_in_v1_is_stripped_once(self):
+        from api.services.llm_client import LocalLLMClient
+
+        client = LocalLLMClient(
+            base_url="https://api.example.com/v1", model="some-remote-model", api_key="k",
+        )
+        assert client.base_url == "https://api.example.com"
+
+    def test_base_url_without_v1_is_unaffected(self):
+        from api.services.llm_client import LocalLLMClient
+
+        client = LocalLLMClient(base_url="http://localhost:8080")
+        assert client.base_url == "http://localhost:8080"
+
+
+class _FakeTitlerMessage:
+    def __init__(self, role: str, content: str = "hello"):
+        self.role = role
+        # `format_conversation_history` (conversation_store.py) reads
+        # `.content` on every message before `_maybe_retitle` ever calls
+        # `generate_text` -- a message missing it would raise inside that
+        # helper, get caught by the same broad `except Exception`, and make
+        # this test pass without ever reaching the code path it's meant to
+        # exercise. Codex review flagged exactly this vacuous-pass risk.
+        self.content = content
+
+
+class _FakeTitlerStore:
+    def __init__(self, messages):
+        self._messages = messages
+        self.update_title_calls: list[tuple[str, str]] = []
+
+    def get_messages(self, conversation_id):
+        return self._messages
+
+    def update_title(self, conversation_id, title):
+        self.update_title_calls.append((conversation_id, title))
+        return True
+
+
+class TestTitlingDoesNotRaiseWhenNoModelIsUsable:
+    """On a keyless
+    install where the titler's local-only call fails, the existing
+    placeholder title is left in place without raising -- not "titling
+    succeeds via some fallback" (a shared local-or-remote fallback
+    resolver that would let titling succeed is out of scope here)."""
+
+    @pytest.mark.asyncio
+    async def test_maybe_retitle_swallows_unreachable_model_error(self, keyless_settings, monkeypatch):
+        from api.services import conversation_titler as titler_mod
+
+        store = _FakeTitlerStore([
+            _FakeTitlerMessage("user"),
+            _FakeTitlerMessage("assistant"),
+            _FakeTitlerMessage("user"),
+        ])
+        monkeypatch.setattr(titler_mod, "get_store", lambda: store)
+
+        calls = []
+
+        async def _unreachable(*args, **kwargs):
+            calls.append((args, kwargs))
+            raise ConnectionError("[Errno 111] Connection refused")
+
+        monkeypatch.setattr(titler_mod, "generate_text", _unreachable)
+
+        # Must not raise -- the placeholder title stays untouched.
+        await titler_mod._maybe_retitle("conv-1")
+
+        # Guards against the test passing vacuously (e.g. an earlier
+        # exception -- a malformed fake message, a missing attribute --
+        # getting caught by the same broad `except Exception` before
+        # `generate_text` is ever reached): confirm the unreachable-model
+        # branch is the one that actually fired.
+        assert calls, "generate_text was never called -- test would pass for the wrong reason"
+        assert store.update_title_calls == []
+
+
+class TestChatErrorMessageOmitsRawException:
+    """When a chat turn's model call exhausts its retries,
+    `agent_loop.py`'s round-loop fatal branch must not interpolate the raw
+    exception straight into the user-facing text
+    (`f"Sorry, I encountered an error: {e}"`). On a keyless install that
+    would read like an SDK's own internal message, not a plain "this isn't
+    set up yet" signal -- fixed, generic text must be shown instead.
+    """
+
+    @pytest.mark.asyncio
+    async def test_fatal_round_error_omits_raw_exception_text(self, keyless_settings):
+        from api.services import agent_loop
+
+        secret_detail = "sk-ant-totallyFakeTestKey0000"
+
+        class _FailingClient:
+            model = "local"
+
+            async def astream(self, *args, **kwargs):
+                raise RuntimeError(f"upstream 401: invalid_api_key {secret_detail}")
+                yield  # pragma: no cover -- unreachable; keeps this an async generator
+
+        with patch.object(agent_loop, "_select_client", return_value=_FailingClient()):
+            events = [e async for e in agent_loop.run_agent_loop("hello", max_tool_rounds=1)]
+
+        text = "".join(e.get("content", "") for e in events if e["type"] == "text")
+        assert secret_detail not in text

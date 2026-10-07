@@ -1,0 +1,10 @@
+[Unit]
+Description=LifeOS Infra Watchdog — declared tailnet routes, Pebble receiver, Obsidian
+After=network-online.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=120
+WorkingDirectory=__LIFEOS_DIR__
+EnvironmentFile=-__LIFEOS_DIR__/.env
+ExecStart=__LIFEOS_DIR__/scripts/infra-watchdog.sh

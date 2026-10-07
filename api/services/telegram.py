@@ -1,0 +1,1669 @@
+"""
+Telegram Bot service for LifeOS.
+
+Three capabilities:
+1. Send messages to Telegram (sync + async)
+2. Internal chat client consuming the SSE chat pipeline
+3. Bot listener (long-polling) for inbound messages
+
+Configure TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env.
+"""
+import asyncio
+import json
+import logging
+import re
+import threading
+import time
+from collections import deque
+from contextvars import ContextVar
+from pathlib import Path
+from typing import Optional
+
+import httpx
+
+from config.settings import settings, TelegramBotConfig
+
+logger = logging.getLogger(__name__)
+
+TELEGRAM_API = "https://api.telegram.org"
+MAX_MESSAGE_LENGTH = 4096
+# Cap on quoted text prepended to threaded replies. Generous enough to keep a
+# full nightly priorities summary (~1,000 chars) intact — truncating below that
+# would cut off the bullet a follow-up question is asking about.
+MAX_QUOTED_REPLY_CHARS = 1500
+
+# The bot token for the message currently being handled. A listener sets this
+# once at the top of _handle_update so every outbound send during that update —
+# of which there are many, scattered across command handlers — goes out from the
+# right bot without threading a token through each call. Unset (None) means the
+# primary bot, which is also the default for non-listener callers (agent worker,
+# reminders, scheduler).
+_active_bot_token: ContextVar[Optional[str]] = ContextVar("active_bot_token", default=None)
+
+
+# ---------------------------------------------------------------------------
+# Bot token resolution
+# ---------------------------------------------------------------------------
+
+def _resolve_bot(bot: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """Resolve a bot name to its ``(token, chat_id)``.
+
+    Looks up ``bot`` in the primary bot and the specialized-bot registry.
+    Returns the matching pair, or ``(None, None)`` if unresolved — callers then
+    fall back to the primary token and chat. Resolving both together matters:
+    a bot can only post to its own chat, so routing the token without the
+    chat_id would send a specialized bot's message to the primary chat. Unknown
+    or empty names are ignored so a misconfigured caller doesn't break the send.
+    """
+    if not bot:
+        return None, None
+    if bot == "primary":
+        return (settings.telegram_bot_token or None), (settings.telegram_chat_id or None)
+    for cfg in settings.telegram_bots:
+        if cfg.name == bot:
+            return (cfg.token or None), (cfg.chat_id or None)
+    logger.warning(f"Telegram bot '{bot}' not found in registry, falling back to primary")
+    return None, None
+
+
+def _token_for_bot(bot: Optional[str]) -> Optional[str]:
+    """Resolve a bot name to its token (see :func:`_resolve_bot`)."""
+    return _resolve_bot(bot)[0]
+
+
+def valid_bot_names() -> list[str]:
+    """Names a caller may legitimately route a send to, newest state.
+
+    ``"primary"`` plus whatever the registry (``config/telegram_bots.json``)
+    currently holds. Read on every call rather than cached at import: the
+    ``telegram_bots`` property is uncached and reflects the current
+    environment, and a registry with no specialized bots is a valid state (a
+    fresh clone configures only the primary bot).
+    """
+    return ["primary"] + [cfg.name for cfg in settings.telegram_bots]
+
+
+def is_known_bot(bot: Optional[str]) -> bool:
+    """Whether ``bot`` resolves to a configured bot. Empty means primary."""
+    return not bot or bot in valid_bot_names()
+
+
+def validate_bot_name(bot: Optional[str]) -> Optional[str]:
+    """Return the name to store, or raise ``ValueError`` if it isn't configured.
+
+    Used wherever a bot name is *written* (scheduler create/update) so an
+    orphaned name — the residue of a bot rename — is rejected at the point of
+    entry instead of silently degrading to the primary chat weeks later.
+    Empty or unset stays valid and continues to mean the primary bot.
+
+    Surrounding whitespace is trimmed, so a tool argument that arrived as
+    ``' ledger'`` stores as ``'ledger'`` and resolves at fire time. Case is
+    *not* folded: matching stays exact, in parity with :func:`_resolve_bot`.
+    """
+    if bot is not None:
+        bot = bot.strip()
+    if is_known_bot(bot):
+        return bot
+    raise ValueError(
+        f"Unknown Telegram bot '{bot}'. Configured names: "
+        f"{', '.join(valid_bot_names())} — a registry entry "
+        f"(config/telegram_bots.json) counts only once its token env var is set"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Message sending
+# ---------------------------------------------------------------------------
+
+def _telegram_url(method: str, token: Optional[str] = None) -> str:
+    token = token or _active_bot_token.get() or settings.telegram_bot_token
+    return f"{TELEGRAM_API}/bot{token}/{method}"
+
+
+def _split_message(text: str) -> list[str]:
+    """Split text into chunks that fit Telegram's 4096-char limit."""
+    if len(text) <= MAX_MESSAGE_LENGTH:
+        return [text]
+
+    parts = []
+    while text:
+        if len(text) <= MAX_MESSAGE_LENGTH:
+            parts.append(text)
+            break
+        # Try to split at a newline near the limit
+        split_at = text.rfind("\n", 0, MAX_MESSAGE_LENGTH)
+        if split_at < MAX_MESSAGE_LENGTH // 2:
+            split_at = MAX_MESSAGE_LENGTH
+        parts.append(text[:split_at])
+        text = text[split_at:].lstrip("\n")
+    return parts
+
+
+def _clean_markdown_for_telegram(text: str) -> str:
+    """
+    Strip Markdown constructs Telegram can't render.
+
+    Telegram MarkdownV2 supports bold, italic, underline, strike, code, links.
+    We keep it simple: use Markdown parse mode and strip unsupported constructs.
+    """
+    # Remove horizontal rules
+    text = re.sub(r"^---+$", "", text, flags=re.MULTILINE)
+    # Convert headers to bold
+    text = re.sub(r"^#{1,6}\s+(.+)$", r"*\1*", text, flags=re.MULTILINE)
+    # Remove image syntax
+    text = re.sub(r"!\[([^\]]*)\]\([^)]+\)", r"\1", text)
+    return text.strip()
+
+
+async def send_typing_indicator(chat_id: str = None):
+    """Send 'typing...' chat action. Lasts ~5 seconds in the Telegram UI."""
+    chat_id = chat_id or settings.telegram_chat_id
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            await client.post(
+                _telegram_url("sendChatAction"),
+                json={"chat_id": chat_id, "action": "typing"},
+            )
+    except Exception:
+        pass  # Non-critical, don't log
+
+
+class TypingIndicator:
+    """Context manager that sends typing indicators every 4 seconds."""
+
+    def __init__(self, chat_id: str):
+        self.chat_id = chat_id
+        self._task: Optional[asyncio.Task] = None
+
+    async def _loop(self):
+        try:
+            while True:
+                await send_typing_indicator(self.chat_id)
+                await asyncio.sleep(4)
+        except asyncio.CancelledError:
+            pass
+
+    async def __aenter__(self):
+        self._task = asyncio.create_task(self._loop())
+        return self
+
+    async def __aexit__(self, *exc):
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+
+
+def send_message_capture_ids(
+    text: str,
+    chat_id: str = None,
+    bot: str = None,
+    reply_to_message_id: int | None = None,
+) -> list[int]:
+    """Send a message and return the Telegram `message_id` of every chunk sent.
+
+    Used by the agent worker to track clarification questions and terminal-state
+    notifications so reply-threaded answers can be matched back to the right
+    pending question. Long messages split across multiple 4096-char chunks; a
+    reply can land on *any* chunk, so we capture them all (not just the first).
+    Falls back to plain text if Markdown parse fails. Returns an empty list when
+    Telegram is disabled or every send failed.
+
+    Args:
+        bot: Optional bot name to send from. Resolved via the registry;
+            falls back to the primary token if unset or unknown.
+    """
+    if not settings.telegram_enabled:
+        return []
+    token, bot_chat_id = _resolve_bot(bot)
+    chat_id = chat_id or bot_chat_id or settings.telegram_chat_id
+    text = _clean_markdown_for_telegram(text)
+    ids: list[int] = []
+    for part in _split_message(text):
+        payload = {"chat_id": chat_id, "text": part, "parse_mode": "Markdown"}
+        if reply_to_message_id is not None:
+            payload["reply_to_message_id"] = int(reply_to_message_id)
+            payload["allow_sending_without_reply"] = True
+        try:
+            resp = httpx.post(
+                _telegram_url("sendMessage", token),
+                json=payload,
+                timeout=30.0,
+            )
+            if resp.status_code != 200:
+                payload.pop("parse_mode", None)
+                resp = httpx.post(
+                    _telegram_url("sendMessage", token),
+                    json=payload,
+                    timeout=30.0,
+                )
+            if resp.status_code == 200:
+                msg_id = (resp.json().get("result") or {}).get("message_id")
+                if msg_id is not None:
+                    ids.append(int(msg_id))
+            else:
+                logger.error(f"Telegram send failed: {resp.status_code} {resp.text[:200]}")
+        except Exception as e:
+            logger.error(f"Telegram send error: {e}")
+    return ids
+
+
+def send_message(
+    text: str,
+    chat_id: str = None,
+    bot: str = None,
+    reply_to_message_id: int | None = None,
+) -> bool:
+    """
+    Send a message via Telegram (synchronous).
+
+    Use from background threads (scheduler, alerts).
+    Falls back to plain text if Markdown parse fails.
+
+    Args:
+        bot: Optional bot name to send from. Resolved via the registry;
+            falls back to the primary token if unset or unknown.
+    """
+    if not settings.telegram_enabled:
+        logger.debug("Telegram not configured, skipping send")
+        return False
+
+    token, bot_chat_id = _resolve_bot(bot)
+    chat_id = chat_id or bot_chat_id or settings.telegram_chat_id
+    text = _clean_markdown_for_telegram(text)
+
+    success = True
+    for part in _split_message(text):
+        payload = {"chat_id": chat_id, "text": part, "parse_mode": "Markdown"}
+        if reply_to_message_id is not None:
+            payload["reply_to_message_id"] = int(reply_to_message_id)
+            payload["allow_sending_without_reply"] = True
+        try:
+            resp = httpx.post(
+                _telegram_url("sendMessage", token),
+                json=payload,
+                timeout=30.0,
+            )
+            if resp.status_code != 200:
+                # Retry without parse_mode (plain text fallback)
+                payload.pop("parse_mode", None)
+                resp = httpx.post(
+                    _telegram_url("sendMessage", token),
+                    json=payload,
+                    timeout=30.0,
+                )
+            if resp.status_code != 200:
+                logger.error(f"Telegram send failed: {resp.status_code} {resp.text[:200]}")
+                success = False
+        except Exception as e:
+            logger.error(f"Telegram send error: {e}")
+            success = False
+    return success
+
+
+async def send_message_async(
+    text: str,
+    chat_id: str = None,
+    bot: str = None,
+    reply_to_message_id: int | None = None,
+) -> bool:
+    """
+    Send a message via Telegram (async).
+
+    Use from FastAPI routes.
+
+    Args:
+        bot: Optional bot name to send from. Resolved via the registry;
+            falls back to the primary token if unset or unknown.
+    """
+    if not settings.telegram_enabled:
+        return False
+
+    token, bot_chat_id = _resolve_bot(bot)
+    chat_id = chat_id or bot_chat_id or settings.telegram_chat_id
+    text = _clean_markdown_for_telegram(text)
+
+    success = True
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        for part in _split_message(text):
+            payload = {"chat_id": chat_id, "text": part, "parse_mode": "Markdown"}
+            if reply_to_message_id is not None:
+                payload["reply_to_message_id"] = int(reply_to_message_id)
+                payload["allow_sending_without_reply"] = True
+            try:
+                resp = await client.post(
+                    _telegram_url("sendMessage", token),
+                    json=payload,
+                )
+                if resp.status_code != 200:
+                    payload.pop("parse_mode", None)
+                    resp = await client.post(
+                        _telegram_url("sendMessage", token),
+                        json=payload,
+                    )
+                if resp.status_code != 200:
+                    logger.error(f"Telegram send failed: {resp.status_code} {resp.text[:200]}")
+                    success = False
+            except Exception as e:
+                logger.error(f"Telegram send error: {e}")
+                success = False
+    return success
+
+
+# ---------------------------------------------------------------------------
+# Internal chat client (consumes SSE from /api/ask/stream or the Hermes proxy)
+# ---------------------------------------------------------------------------
+
+class HermesUnavailable(RuntimeError):
+    """Raised by chat_via_api() for a ``backend="hermes"`` call that couldn't
+    reach ``/api/hermes/ask/stream`` — a 503 (Hermes unconfigured) or a 502
+    (configured but unreachable), the two statuses `api/routes/_proxy.py`'s
+    router returns BEFORE any turn-visible side effect (e.g. the journal
+    capture, via `pre_send`) can have run — see that router's docstring on
+    hook ordering. Callers (the Telegram listener) catch this and retry
+    the same turn on backend="lifeos", disclosing the degradation once rather
+    than failing the turn or silently degrading. Never raised once a side
+    effect could already have landed: a journal turn that fails *after*
+    capture succeeds surfaces as an in-stream `error` event instead (folded
+    into `answer` below), specifically so a caller here never retries a turn
+    whose fragment is already on disk.
+    """
+
+
+async def chat_via_api(
+    question: str,
+    conversation_id: str = None,
+    persona: str = None,
+    persona_id: str = None,
+    backend: str = "lifeos",
+) -> dict:
+    """
+    Run a question through the LifeOS chat pipeline (non-streaming).
+
+    POSTs to the local /api/ask/stream endpoint (backend="lifeos", the
+    default) or the Hermes proxy at /api/hermes/ask/stream (backend="hermes")
+    and collects SSE events — both speak the identical event
+    vocabulary, except the Hermes path never emits `claude_intent` and only
+    ever emits `journal_capture` on a journal-persona turn (same as native).
+
+    Args:
+        persona: Optional per-bot system-prompt preamble (e.g. the fitness bot),
+            forwarded to the orchestrator so its replies are domain-primed.
+            This is the primary bot's shape only — every other caller
+            uses `persona_id` instead, since server-side persona resolution
+            keyed by id is what makes the Hermes envelope, journal-capture
+            gate, and orchestrating-persona spawn all resolve correctly.
+            Mutually exclusive with `persona_id` (the target endpoint 400s if
+            both are sent).
+        persona_id: Registered persona id (Telegram bot name) to resolve
+            server-side, on either backend.
+        backend: "lifeos" (default) targets
+            the native pipeline; "hermes" targets the Hermes proxy and raises
+            `HermesUnavailable` on a 502/503 response so the caller can retry
+            on "lifeos" for this turn.
+
+    Returns:
+        {"answer": str, "conversation_id": str, "claude_intent": bool, "task": str|None,
+         "journal_capture": {"path": str, "created": bool}|None}
+
+        `journal_capture` is populated only on the journal persona's turns
+        and only once the fragment is on disk — it is the caller's proof
+        of capture, not something to infer from the turn completing.
+    """
+    port = settings.port
+    body: dict = {"question": question}
+    if conversation_id:
+        body["conversation_id"] = conversation_id
+    if persona:
+        body["persona"] = persona
+    if persona_id:
+        body["persona_id"] = persona_id
+
+    path = "/api/hermes/ask/stream" if backend == "hermes" else "/api/ask/stream"
+
+    full_text = ""
+    conv_id = conversation_id
+    claude_intent = False
+    task = None
+    engine = "claude_code"
+    sources = []
+    statuses = []
+    perf_trace = None
+    journal_capture = None
+
+    async with httpx.AsyncClient(timeout=300.0) as client:
+        async with client.stream(
+            "POST",
+            f"http://localhost:{port}{path}",
+            json=body,
+        ) as resp:
+            if resp.status_code != 200:
+                error_body = await resp.aread()
+                if backend == "hermes" and resp.status_code in (502, 503):
+                    raise HermesUnavailable(
+                        f"Hermes backend returned HTTP {resp.status_code}: {error_body[:500]}"
+                    )
+                raise RuntimeError(f"Chat pipeline returned HTTP {resp.status_code}: {error_body[:500]}")
+            async for line in resp.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                try:
+                    event = json.loads(line[6:])
+                except json.JSONDecodeError:
+                    continue
+                etype = event.get("type")
+                if etype == "content":
+                    full_text += event.get("content", "")
+                elif etype == "self_correction":
+                    full_text = ""
+                elif etype == "conversation_id":
+                    conv_id = event.get("conversation_id", conv_id)
+                elif etype == "claude_intent":
+                    claude_intent = True
+                    task = event.get("task", question)
+                    engine = event.get("engine", "claude_code")
+                elif etype == "status":
+                    statuses.append(event.get("message", ""))
+                elif etype == "sources":
+                    sources = event.get("sources", [])
+                elif etype == "perf_trace":
+                    perf_trace = event
+                elif etype == "journal_capture":
+                    # Proof the fragment reached disk, not an inference
+                    # from the turn completing. Relayed verbatim so callers
+                    # (api/routes/journal_ingest.py) can require it.
+                    journal_capture = {
+                        "path": event.get("path"),
+                        "created": bool(event.get("created")),
+                    }
+                elif etype == "error":
+                    error_msg = event.get("message", "Unknown error")
+                    logger.error(f"Chat pipeline error: {error_msg}")
+                    full_text += f"\n\nError: {error_msg}" if full_text else f"Error: {error_msg}"
+
+    return {
+        "answer": full_text,
+        "conversation_id": conv_id,
+        "claude_intent": claude_intent,
+        "task": task,
+        "engine": engine,
+        "sources": sources,
+        "statuses": statuses,
+        "perf_trace": perf_trace,
+        "journal_capture": journal_capture,
+    }
+
+
+async def chat_via_api_with_log(question: str) -> dict:
+    """Run a question through the chat pipeline and capture execution metadata.
+
+    Like chat_via_api() but also returns tool_statuses, token usage, and cost
+    for reminder execution logging.
+
+    Returns:
+        {"answer": str, "conversation_id": str, "tool_statuses": list[str],
+         "cost_usd": float, "model": str, "input_tokens": int, "output_tokens": int}
+    """
+    port = settings.port
+    body: dict = {"question": question}
+
+    full_text = ""
+    conv_id = None
+    tool_statuses: list[str] = []
+    cost_usd = 0.0
+    model = ""
+    input_tokens = 0
+    output_tokens = 0
+
+    async with httpx.AsyncClient(timeout=300.0) as client:
+        async with client.stream(
+            "POST",
+            f"http://localhost:{port}/api/ask/stream",
+            json=body,
+        ) as resp:
+            if resp.status_code != 200:
+                error_body = await resp.aread()
+                raise RuntimeError(f"Chat pipeline returned HTTP {resp.status_code}: {error_body[:500]}")
+            async for line in resp.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                try:
+                    event = json.loads(line[6:])
+                except json.JSONDecodeError:
+                    continue
+                etype = event.get("type", "")
+                if etype == "content":
+                    full_text += event.get("content", "")
+                elif etype == "self_correction":
+                    full_text = ""
+                elif etype == "conversation_id":
+                    conv_id = event.get("conversation_id", conv_id)
+                elif etype == "status":
+                    tool_statuses.append(event.get("message", ""))
+                elif etype == "usage":
+                    cost_usd = event.get("cost_usd", 0)
+                    model = event.get("model", "")
+                    input_tokens = event.get("input_tokens", 0)
+                    output_tokens = event.get("output_tokens", 0)
+                elif etype == "error":
+                    error_msg = event.get("message", "Unknown error")
+                    full_text += f"\n\nError: {error_msg}" if full_text else f"Error: {error_msg}"
+
+    return {
+        "answer": full_text,
+        "conversation_id": conv_id,
+        "tool_statuses": tool_statuses,
+        "cost_usd": cost_usd,
+        "model": model,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Vault reopen (status-anchor resume)
+# ---------------------------------------------------------------------------
+
+def _reopen_vault_task_for_resume(task_id: str) -> bool:
+    """Swap a vault task's terminal lifecycle tag back to running and its
+    status back to in-progress, mirroring the reopen sequence the agent
+    worker's own internal reopen paths (`_resume_as_followup`,
+    `code_reopened_for_pending_messages`) already perform.
+
+    Calls `TaskManager` in-process (the Telegram listener runs inside the
+    same API process the worker's own `/api/tasks/*` writes ultimately
+    reach) rather than the worker's HTTP self-calls, which exist so the
+    worker can run on a different host from the API.
+
+    Returns True only once BOTH the tag swap and the status write succeed
+    — the session's `claimed`/tag/status triple must never be claimed as
+    consistent on a partial write. False means either no terminal tag was
+    present anymore (the card was retagged/reassigned since the session
+    finished) or the status write failed after a successful tag swap, in
+    which case the tag swap is undone (best-effort) so the card fails
+    closed at its original terminal tag rather than being left stranded
+    at `#agent-running` with a stale (still-terminal) status. Either way
+    the caller must not claim the session.
+    """
+    from api.services.agent_worker.worker import (
+        BUDGET_EXCEEDED_TAG, COMPLETED_TAG, FAILED_TAG, RUNNING_TAG,
+    )
+    from api.services.task_manager import TaskConflictError, get_task_manager
+
+    manager = get_task_manager()
+    swapped_from: str | None = None
+    for terminal_tag in (COMPLETED_TAG, FAILED_TAG, BUDGET_EXCEEDED_TAG):
+        try:
+            if manager.swap_tag(task_id, terminal_tag, RUNNING_TAG):
+                swapped_from = terminal_tag
+                break
+        except TaskConflictError as exc:
+            logger.warning(f"status-anchor reopen tag swap conflict for {task_id}: {exc}")
+        except Exception as exc:
+            logger.warning(f"status-anchor reopen tag swap failed for {task_id}: {exc}")
+    if swapped_from is None:
+        return False
+    try:
+        manager.update(task_id, status="in_progress")
+    except Exception as exc:
+        logger.warning(f"status-anchor reopen status write failed for {task_id}: {exc}")
+        try:
+            manager.swap_tag(task_id, RUNNING_TAG, swapped_from)
+        except Exception as restore_exc:
+            logger.warning(
+                f"status-anchor reopen tag restore failed for {task_id}: {restore_exc}"
+            )
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Bot listener (long-polling)
+# ---------------------------------------------------------------------------
+
+class TelegramBotListener:
+    """
+    Background thread that receives messages via Telegram long-polling.
+
+    Forwards messages through the LifeOS chat pipeline and sends responses back.
+    """
+
+    _STATE_FILE = Path(__file__).resolve().parent.parent.parent / "data" / "telegram_state.json"
+    _DEDUP_WINDOW = 1000  # Track last N message IDs for deduplication
+
+    def __init__(self, bot: Optional[TelegramBotConfig] = None):
+        # bot=None means the primary bot (legacy behavior). The primary keeps the
+        # legacy state file so its update offset survives this upgrade; named bots
+        # get their own offset file so concurrent pollers don't clobber each other.
+        self._bot = bot or settings.telegram_primary_bot
+        self._is_primary = self._bot.name == "primary"
+        # Bots that own Claude Code session reply threads: the primary, plus any
+        # orchestration bot (e.g. doctor). These run the agent/Claude-Code reply
+        # hooks — scoped to their own bot — instead of being pure chat.
+        self._owns_agent_sessions = self._is_primary or self._bot.orchestrates
+        self._token = self._bot.token
+        self._chat_id = self._bot.chat_id
+        self._persona = self._bot.persona
+        self._state_file = (
+            self._STATE_FILE if self._is_primary
+            else Path(f"data/telegram_state_{self._bot.name}.json")
+        )
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        # Conversation state: chat_id -> conversation_id (per-instance, so each
+        # bot's threads stay isolated from the others')
+        self._conversations: dict[str, str] = {}
+        self._last_result: dict | None = None  # Last chat result for /inspect
+        self._last_update_id = self._load_last_update_id()
+        self._processed_ids: deque[int] = deque(maxlen=self._DEDUP_WINDOW)
+        # Whether this bot has already disclosed, in-channel, that it's
+        # answering via the native pipeline because Hermes is unconfigured or
+        # unreachable. Set once per listener lifetime so the disclosure is a
+        # single notice, not per-message spam — see _disclose_hermes_fallback.
+        self._hermes_fallback_notified = False
+
+    def _load_last_update_id(self) -> int:
+        """Load persisted update_id from disk, or 0 if unavailable."""
+        try:
+            if self._state_file.exists():
+                data = json.loads(self._state_file.read_text())
+                update_id = data.get("last_update_id", 0)
+                if not isinstance(update_id, int) or update_id < 0:
+                    logger.warning(f"Invalid update_id in state file: {update_id!r}, resetting to 0")
+                    return 0
+                logger.info(f"Restored Telegram update offset for '{self._bot.name}': {update_id}")
+                return update_id
+        except Exception as e:
+            logger.warning(f"Could not load Telegram state: {e}")
+        return 0
+
+    def _save_last_update_id(self):
+        """Persist current update_id to disk (atomic write)."""
+        try:
+            self._state_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._state_file.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"last_update_id": self._last_update_id}))
+            tmp.rename(self._state_file)
+        except Exception as e:
+            logger.warning(f"Could not save Telegram state: {e}")
+
+    def start(self):
+        if not (self._token and self._chat_id):
+            logger.info(f"Telegram bot '{self._bot.name}' not configured, listener not started")
+            return
+
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._run,
+            daemon=True,
+            name=f"TelegramBotListener-{self._bot.name}",
+        )
+        self._thread.start()
+        logger.info(f"Telegram bot listener started: {self._bot.name}")
+
+    def stop(self):
+        self._stop_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=5)
+        logger.info("Telegram bot listener stopped")
+
+    def _run(self):
+        """Main polling loop (runs in background thread)."""
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        try:
+            self._loop.run_until_complete(self._poll_loop())
+        except Exception as e:
+            logger.error(f"Telegram bot listener crashed: {e}")
+        finally:
+            self._loop.close()
+
+    async def _poll_loop(self):
+        """Long-polling loop for Telegram updates."""
+        logger.info("Telegram bot polling started")
+
+        while not self._stop_event.is_set():
+            try:
+                updates = await self._get_updates()
+                for update in updates:
+                    await self._handle_update(update)
+            except Exception as e:
+                logger.error(f"Telegram polling error: {e}")
+                # Wait before retrying on error
+                await asyncio.sleep(5)
+
+    async def _get_updates(self) -> list[dict]:
+        """Fetch new updates from Telegram with long-polling."""
+        try:
+            async with httpx.AsyncClient(timeout=35.0) as client:
+                resp = await client.get(
+                    _telegram_url("getUpdates", self._token),
+                    params={
+                        "offset": self._last_update_id + 1,
+                        "timeout": 30,
+                        "allowed_updates": json.dumps(["message"]),
+                    },
+                )
+                if resp.status_code != 200:
+                    logger.warning(f"getUpdates failed: {resp.status_code}")
+                    return []
+                data = resp.json()
+                if not data.get("ok"):
+                    return []
+                updates = data.get("result", [])
+                if updates:
+                    self._last_update_id = updates[-1]["update_id"]
+                    self._save_last_update_id()
+                return updates
+        except httpx.ReadTimeout:
+            # Normal for long-polling
+            return []
+        except Exception as e:
+            logger.error(f"getUpdates error: {e}")
+            await asyncio.sleep(2)
+            return []
+
+    def _maybe_deposit_agent_answer(self, reply_to_message_id: int, text: str) -> bool:
+        """If `reply_to_message_id` matches an open agent-worker clarification
+        question, record the answer and short-circuit the chat pipeline.
+
+        Importing the session store lazily keeps the chat-only deployment
+        path workable even when the agent worker package isn't initialized.
+        """
+        try:
+            from api.services.agent_worker.session_store import SessionStore
+            store = SessionStore()
+            return store.deposit_answer(reply_to_message_id, text, bot=self._bot.name)
+        except Exception as exc:
+            logger.warning(f"agent-worker deposit_answer failed: {exc}")
+            return False
+
+    async def _handle_agent_spawn(self, rest: str, chat_id: str):
+        """Spawn an operator agent on demand: `/agent [local|claude] <task>`.
+
+        Explicit `local`/`claude` forces the model; otherwise preflight
+        auto-routes (and asks via the clarification flow when ambiguous). The
+        completion notification is replyable via the Phase 1 follow-up model.
+        """
+        explicit = None
+        parts = rest.split(maxsplit=1)
+        if parts and parts[0].lower() in ("local", "claude"):
+            explicit = parts[0].lower()
+            task = parts[1].strip() if len(parts) > 1 else ""
+        else:
+            task = rest.strip()
+
+        if not task:
+            await send_message_async(
+                "Usage: /agent [local|claude] <task>\n"
+                "e.g. `/agent draft a reply to the landlord` (auto-routes), "
+                "or `/agent claude refactor the parser`.",
+                chat_id=chat_id,
+            )
+            return
+
+        try:
+            from api.services.agent_worker.operator_spawn import create_operator_session
+            from api.services.agent_worker.session_store import SessionStore
+            store = SessionStore()
+            result = await asyncio.to_thread(
+                create_operator_session, store, task, explicit_routing=explicit,
+            )
+        except Exception as exc:
+            logger.warning(f"operator spawn failed: {exc}")
+            await send_message_async(
+                f"Couldn't spawn agent: {str(exc)[:200]}", chat_id=chat_id,
+            )
+            return
+
+        if not result.get("ok"):
+            await send_message_async(
+                f"Couldn't spawn agent: {result.get('error')}", chat_id=chat_id,
+            )
+            return
+
+        if result.get("needs_routing"):
+            # Preflight couldn't pick a model — ask, and register the answer so
+            # the worker resolves routing and dispatches. Operator replies to
+            # this message (the reply-deposit hook matches it).
+            question = (
+                "Should I run this on the local Gemma model or on Claude? "
+                "Reply 'local' or 'claude'."
+            )
+            ids = send_message_capture_ids(question, chat_id)
+            if ids:
+                store.create_pending_question(
+                    session_id=result["session_id"], task_id=result["task_id"],
+                    question=question, sent_message_id=ids[0],
+                    sent_message_ids=ids, kind="clarification",
+                )
+            return
+
+        label = "Claude (cloud)" if result["routing"] == "claude" else "local Gemma"
+        await send_message_async(
+            f"🤖 Spawned {label} agent: {task[:120]}\n"
+            f"I'll send the result here when it's done — reply to it (or just message "
+            f"me within 30 min) to continue the thread.",
+            chat_id=chat_id,
+        )
+
+    async def _run_chat_turn(self, text: str, chat_id: str, conv_id: Optional[str]) -> Optional[dict]:
+        """Run one chat turn for this bot, routing to its configured backend.
+
+        The primary bot always calls the native
+        pipeline with its raw persona preamble. Every
+        specialized bot (fitness/therapist/doctor/finance/journal) resolves
+        its persona server-side via `persona_id` instead of a raw preamble —
+        that's what lets the Hermes envelope, the journal-capture gate, and
+        the persona_id-gated orchestrating-persona spawn (`api/routes/chat.py`)
+        all key off the right persona, on either backend (see chat_via_api()'s
+        docstring).
+
+        A `backend="hermes"` bot whose Hermes call raises `HermesUnavailable`
+        (unconfigured, or configured but unreachable — never once a
+        turn-visible side effect could have already happened, see that
+        exception's docstring) falls back to `_native_turn()` for this turn
+        and discloses the degradation once per listener lifetime —
+        never silently.
+
+        Returns `None` when the turn was already fully handled without ever
+        reaching a chat backend (see `_native_turn()`'s bare-affirmative
+        guard) — the caller must not send another reply for it.
+        """
+        if self._is_primary:
+            return await chat_via_api(text, conversation_id=conv_id, persona=self._persona)
+        if self._bot.backend != "hermes":
+            return await self._native_turn(text, chat_id, conv_id)
+        if not settings.hermes_backend_url:
+            logger.info(
+                f"bot '{self._bot.name}': Hermes not configured, answering via the native pipeline"
+            )
+            await self._disclose_hermes_fallback(chat_id)
+            return await self._native_turn(text, chat_id, conv_id)
+        try:
+            return await chat_via_api(
+                text, conversation_id=conv_id, persona_id=self._bot.name, backend="hermes",
+            )
+        except HermesUnavailable as exc:
+            logger.warning(
+                f"bot '{self._bot.name}': Hermes unreachable ({exc}), "
+                "falling back to the native pipeline for this turn"
+            )
+            await self._disclose_hermes_fallback(chat_id)
+            return await self._native_turn(text, chat_id, conv_id)
+
+    async def _native_turn(self, text: str, chat_id: str, conv_id: Optional[str]) -> Optional[dict]:
+        """Dispatch this specialized bot's turn to the native pipeline via
+        `persona_id` (configured backend="lifeos", Hermes unconfigured, or a
+        mid-conversation Hermes fallback — every native dispatch for a
+        specialized bot goes through here).
+
+        The native pipeline's persona_id-gated orchestrating-persona spawn
+        (`api/routes/chat.py`) fires unconditionally for ANY message once
+        `persona_id` names an orchestrating bot — including a bare "yes" or
+        "approved" reply that's actually a mis-threaded approval of a pending
+        goal, not a fresh problem report. On the Hermes path, spawning is the
+        model's own deliberate tool call, never an unconditional per-message
+        action, so no guard is needed there — but a native turn for an
+        orchestrating bot still reaches that same unconditional spawn gate,
+        so the guard against a mis-threaded bare affirmative is applied here,
+        the one place it's structurally needed.
+        """
+        if self._bot.orchestrates and await self._maybe_consume_bare_affirmative(text, chat_id):
+            return None
+        return await chat_via_api(
+            text, conversation_id=conv_id, persona_id=self._bot.name, backend="lifeos",
+        )
+
+    async def _maybe_consume_bare_affirmative(self, text: str, chat_id: str) -> bool:
+        """Route a short bare affirmative ("yes", "approved", "go ahead") to
+        the most recent open goal-approval gate on this bot, instead of
+        letting it reach the native persona_id-gated spawn as a fresh "report"
+        (see `_native_turn`'s guard above).
+
+        Returns True when the message was fully handled here (routed to an
+        open gate, or acked with a "nothing waiting" notice) — the caller
+        must not dispatch it to a chat backend. Returns False for a genuine
+        report (too long, not affirmative, or a gate was found but couldn't
+        be resumed — e.g. a
+        race with it being answered elsewhere), which proceeds normally.
+        """
+        stripped = text.strip()
+        if len(stripped) > 25:
+            return False
+        from api.services.agent_worker.worker import _is_affirmative
+        if not _is_affirmative(stripped):
+            return False
+        from api.services.agent_worker.session_store import SessionStore
+        try:
+            gate = SessionStore().get_latest_open_question(
+                bot=self._bot.name, kind="goal_approval",
+            )
+        except Exception as exc:
+            logger.warning(f"goal-gate lookup failed: {exc}")
+            gate = None
+        if gate and await self._maybe_handle_claude_code_reply(
+            int(gate["sent_message_id"]), stripped, chat_id,
+        ):
+            return True
+        if not gate:
+            await send_message_async(
+                f'I got "{stripped}" but there\'s nothing here waiting '
+                "for an approval — no session was started. If you meant "
+                "to answer an earlier message, use Telegram's Reply on "
+                "it; otherwise describe the problem you want me to fix.",
+                chat_id=chat_id,
+            )
+            return True
+        return False
+
+    async def _disclose_hermes_fallback(self, chat_id: str) -> None:
+        """One-time, per-listener-lifetime in-channel notice that this bot is
+        answering via the native LifeOS pipeline instead of Hermes —
+        covers both "Hermes was never configured" and "a turn's connection to
+        it failed." Never silent degradation, but never per-message spam
+        either — every occurrence is still logged by the caller above.
+        """
+        if self._hermes_fallback_notified:
+            return
+        self._hermes_fallback_notified = True
+        try:
+            await send_message_async(
+                "⚠️ Hermes isn't reachable right now — answering via the "
+                "native LifeOS pipeline until it's back.",
+                chat_id=chat_id,
+            )
+        except Exception as exc:
+            logger.warning(f"hermes-fallback notice failed to send: {exc}")
+
+    async def _handle_update(self, update: dict):
+        """Process a single Telegram update."""
+        # Route every outbound send during this update through this bot's token.
+        # Set once here so the many send sites below need no per-call token.
+        _active_bot_token.set(self._token)
+
+        message = update.get("message")
+        if not message:
+            return
+
+        text = message.get("text", "").strip()
+        chat_id = str(message["chat"]["id"])
+
+        # Auth check first — don't let unauthorized chats pollute the dedup window
+        if chat_id != self._chat_id:
+            logger.warning(f"Ignoring message from unauthorized chat: {chat_id}")
+            return
+
+        # Dedup safety net: skip messages already processed in this session
+        message_id = message.get("message_id")
+        if message_id and message_id in self._processed_ids:
+            logger.debug(f"Skipping duplicate message_id {message_id}")
+            return
+        if message_id:
+            self._processed_ids.append(message_id)
+
+        if not text:
+            return
+
+        # Agent-worker clarification hook. If this message is a
+        # reply-thread to an earlier clarification question, deposit
+        # the answer and short-circuit — don't route to the chat pipeline.
+        # Only bots that own agent/Claude-Code reply threads run this — the
+        # primary and any orchestration bot (doctor). The lookup is scoped to
+        # this bot: Telegram message_ids are unique per chat (per bot),
+        # so without scoping a specialized bot could collide with the primary's
+        # ids in the shared follow-up table. Pure-chat specialized bots skip it.
+        reply_to = message.get("reply_to_message")
+        if self._owns_agent_sessions and reply_to and reply_to.get("message_id"):
+            reply_to_id = int(reply_to["message_id"])
+            # A reply to a /claude completion resumes that Claude Code session —
+            # checked before the agent-worker deposit since both use
+            # the shared follow-up table but resume different subsystems.
+            if await self._maybe_handle_claude_code_reply(
+                reply_to_id, text, chat_id, quoted_text=reply_to.get("text"),
+            ):
+                return
+            if self._maybe_deposit_agent_answer(reply_to_id, text):
+                return
+
+        logger.info(f"Telegram message: {text[:100]}")
+
+        # Show typing immediately so the user knows we received their message
+        await send_typing_indicator(chat_id)
+
+        # Handle known commands (unrecognized /commands fall through to chat)
+        if text.startswith("/"):
+            handled = await self._handle_command(text, chat_id)
+            if handled:
+                return
+
+        # Plan approval, clarification, and /claude follow-up are all routed
+        # through threaded replies (handled near the top of this method
+        # via _maybe_handle_claude_code_reply / _maybe_deposit_agent_answer). A
+        # plain non-threaded message is always a fresh chat query, never
+        # an implicit follow-up — so unrelated questions never get
+        # silently swallowed into a finished agent or /claude thread.
+
+        # Orchestrating bots (e.g. doctor) route every fresh message through
+        # the same chat pipeline as every other bot below: on the Hermes
+        # backend, the doctor persona supervises its own workers via
+        # `lifeos_agent_spawn` (config/personas/doctor.hermes.md); on a native
+        # fallback, `_run_chat_turn`'s persona_id path still triggers a real
+        # Claude Code spawn via the persona_id-gated orchestration block in
+        # `api/routes/chat.py`, tagged `bot="doctor"` for Telegram parity. A
+        # threaded reply to either kind of spawned session is already handled
+        # above (the resume hook) by the time this point is reached.
+
+        # Threaded-reply context: when the user replies to one of the bot's own
+        # messages (e.g. correcting a "Logged: …" line, or asking about a bullet
+        # in a summary sent via the raw Bot API), pass the quoted text as context
+        # so the orchestrator can resolve deictic questions about it.
+        # Primary-bot agent/Claude-Code reply threads short-circuited above, so
+        # this only sees replies to ordinary messages.
+        effective_text = text
+        if reply_to and reply_to.get("text"):
+            quoted = reply_to["text"].strip()
+            if len(quoted) > MAX_QUOTED_REPLY_CHARS:
+                quoted = quoted[:MAX_QUOTED_REPLY_CHARS] + "…"
+            effective_text = f'[replying to my earlier message: "{quoted}"]\n{text}'
+
+        # Send through chat pipeline (intent classification happens there)
+        try:
+            async with TypingIndicator(chat_id):
+                conv_id = self._conversations.get(chat_id)
+                result = await self._run_chat_turn(effective_text, chat_id, conv_id)
+                if result is None:
+                    # A native-fallback bare affirmative was fully
+                    # handled inside _native_turn (routed to an open goal
+                    # gate, or acked with a "nothing waiting" notice) without
+                    # ever reaching a chat backend — nothing more to send.
+                    return
+                self._conversations[chat_id] = result["conversation_id"]
+                self._last_result = result
+
+            # Check if the chat pipeline detected a code intent or an explicit
+            # engine handoff ("use codex" / "use claude code"). Engine
+            # handoffs spawn background sessions whose follow-ups route to the
+            # primary bot, so only the primary honors them. A specialized bot
+            # redirects instead of falling through to a possibly-empty answer.
+            # The Hermes backend never emits `claude_intent` (Hermes has
+            # no engine-handoff concept of its own — chat_via_api()'s parsing
+            # loop simply never sets it True), so this whole block is a no-op
+            # for a hermes-backed turn and `result["answer"]` below is used
+            # unconditionally — a bare `.get()` already tolerates that with no
+            # special-casing needed. The accepted, deliberate side effect: the
+            # "code task → main bot" redirect only ever fires on a native-
+            # pipeline turn (the primary bot, or a specialized bot's fallback
+            # turn) — a hermes-backed specialized bot never redirects an
+            # inferred code task, since Hermes never tells us it saw one.
+            if result.get("claude_intent"):
+                task = result.get("task", text)
+                engine = result.get("engine", "claude_code")
+                if not self._is_primary:
+                    await send_message_async(
+                        "That looks like a coding/agent task — send it to your main "
+                        "LifeOS bot, which runs Claude Code and Codex.",
+                        chat_id=chat_id,
+                    )
+                    return
+                if engine == "codex":
+                    logger.info(f"Engine handoff → Codex: {task[:50]}...")
+                    await self._handle_codex_command(task, chat_id)
+                else:
+                    logger.info(f"Engine handoff → Claude Code: {task[:50]}...")
+                    await self._handle_claude_command(task, chat_id)
+                return
+
+            answer = result["answer"]
+            if not answer:
+                answer = "No response generated."
+
+            await send_message_async(answer, chat_id=chat_id)
+        except Exception as e:
+            logger.error(f"Error processing Telegram message: {e}")
+            await send_message_async(
+                f"Error processing your message: {str(e)[:200]}",
+                chat_id=chat_id,
+            )
+
+    # Commands that spawn agent-worker / Claude Code / Codex sessions. Their
+    # completion notices and clarification questions are sent later from a
+    # background thread (where the active-bot token is unset → primary), and the
+    # reply-thread hooks only run on the primary listener. So these belong to the
+    # primary bot only; specialized bots are pure chat surfaces and redirect.
+    _PRIMARY_ONLY_COMMANDS = frozenset({
+        "/agent", "/claude", "/codex",
+        "/claude_status", "/claudestatus", "/claude_cancel", "/claudecancel",
+        "/codex_status", "/codexstatus", "/codex_cancel", "/codexcancel",
+    })
+
+    async def _handle_command(self, text: str, chat_id: str) -> bool:
+        """Handle known bot commands. Returns True if handled, False to fall through to chat."""
+        command = text.split()[0].lower()
+
+        if not self._is_primary and command in self._PRIMARY_ONLY_COMMANDS:
+            await send_message_async(
+                "Agent and Claude Code/Codex commands run on your main LifeOS bot — "
+                "send this there.",
+                chat_id=chat_id,
+            )
+            return True
+
+        if command in ("/new", "/clear"):
+            self._conversations.pop(chat_id, None)
+            await send_message_async("Started a new conversation.", chat_id=chat_id)
+
+        elif command == "/status":
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    resp = await client.get(f"http://localhost:{settings.port}/health")
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        status = data.get("status", "unknown")
+                        await send_message_async(
+                            f"LifeOS status: *{status}*",
+                            chat_id=chat_id,
+                        )
+                    else:
+                        await send_message_async(
+                            "LifeOS health check failed.",
+                            chat_id=chat_id,
+                        )
+            except Exception as e:
+                await send_message_async(
+                    f"Could not reach LifeOS server: {e}",
+                    chat_id=chat_id,
+                )
+
+        elif command == "/codex":
+            task = text[len("/codex"):].strip()
+            if not task:
+                await send_message_async("Usage: /codex <task description>", chat_id=chat_id)
+            else:
+                await self._handle_codex_command(task, chat_id)
+
+        elif command == "/claude":
+            task = text[len("/claude"):].strip()
+            if not task:
+                await send_message_async("Usage: /claude <task description>", chat_id=chat_id)
+            else:
+                await self._handle_claude_command(task, chat_id)
+
+        elif command == "/agent":
+            await self._handle_agent_spawn(text[len("/agent"):].strip(), chat_id)
+
+        elif command in ("/claude_status", "/claudestatus"):
+            await self._handle_claude_status(chat_id)
+
+        elif command in ("/claude_cancel", "/claudecancel"):
+            await self._handle_claude_cancel(chat_id)
+
+        elif command in ("/codex_status", "/codexstatus"):
+            await self._handle_codex_status(chat_id)
+
+        elif command in ("/codex_cancel", "/codexcancel"):
+            await self._handle_codex_cancel(chat_id)
+
+        elif command == "/inspect":
+            await self._handle_inspect(chat_id)
+
+        elif command == "/help":
+            help_text = (
+                "*LifeOS Telegram Bot*\n\n"
+                "Send any message to query LifeOS (calendar, emails, vault, etc.)\n\n"
+                "*Commands:*\n"
+                "/new or /clear - Start a new conversation\n"
+                "/status - Check LifeOS server health\n"
+                "/inspect - Show sources checked in last response\n"
+                "/agent [local|claude] <task> - Spawn an agent (auto-routes if no model given)\n"
+                "/claude <task> - Run a task with Claude Code\n"
+                "/claude\\_status - Check active Claude Code session\n"
+                "/claude\\_cancel - Cancel active Claude Code session\n"
+                "/codex <task> - Run a task with Codex\n"
+                "/codex\\_status - Check active Codex session\n"
+                "/codex\\_cancel - Cancel active Codex session\n"
+                "/help - Show this message"
+            )
+            await send_message_async(help_text, chat_id=chat_id)
+
+        else:
+            # Unknown command — fall through to chat pipeline
+            return False
+
+        return True
+
+    # ------------------------------------------------------------------
+    # Claude Code orchestration
+    # ------------------------------------------------------------------
+
+    _APPROVAL_KEYWORDS = {"approve", "approved", "yes", "go", "proceed", "ok"}
+    _REJECTION_KEYWORDS = {"reject", "rejected", "no", "cancel", "stop"}
+
+    async def _maybe_handle_claude_code_reply(
+        self, reply_to_message_id: int, text: str, chat_id: str,
+        quoted_text: str | None = None,
+    ) -> bool:
+        """If a reply targets a CLI (Claude Code or Codex) completion message,
+        resume the linked agent-worker session.
+
+        Rows are registered with ``kind='followup'`` against a session_store
+        row whose ``routing='claude_code'`` or ``routing='codex'``. Depositing
+        the answer is enough — the worker's ``_resume_as_followup`` picks it
+        up on the next tick and routes through the right executor's resume().
+
+        ``kind='goal_approval'`` replies are also consumed here, with an
+        immediate ack: the worker only drains the answer on its next tick (up
+        to poll_seconds later) and the agent may not emit anything for minutes
+        after that, so without a deposit-time ack the operator can't tell
+        whether their 'yes' landed at all.
+
+        ``kind='status_anchor'`` replies: every operator-facing session message
+        (streamed [NOTIFY] bodies, heartbeats, acks) registers its Telegram
+        message id against the session. A threaded reply to ANY of them is
+        consumed here as a context note — queued (with ``quoted_text``, the
+        message being replied to, as context) and delivered at the session's
+        next turn boundary; a terminal session is reopened for it.
+
+        Returns True if the reply was consumed.
+        """
+        try:
+            from api.services.agent_worker.session_store import SessionStore
+            store = SessionStore()
+            q = store.get_open_question_by_message_id(reply_to_message_id, bot=self._bot.name)
+        except Exception as exc:
+            logger.warning(f"cli reply lookup failed: {exc}")
+            return False
+        if not q:
+            # A reply landing on an ALREADY-answered goal message must not fall
+            # through — on an orchestration bot it would spawn a brand-new
+            # session with the bare reply as its "report" (the yes/yes/approved
+            # fan-out). Consume it with a pointer instead.
+            try:
+                done = store.get_open_question_by_message_id(
+                    reply_to_message_id, bot=self._bot.name, include_answered=True,
+                )
+            except Exception as exc:
+                logger.warning(f"answered-question lookup failed: {exc}")
+                done = None
+            if done and done.get("answered_at") and done.get("kind") == "goal_approval":
+                await send_message_async(
+                    "I already have your answer for that goal — it's in motion. "
+                    "To add something, reply to my latest update.",
+                    chat_id=chat_id,
+                )
+                return True
+            return False
+        if q.get("kind") == "status_anchor":
+            return await self._handle_status_anchor_reply(q, text, chat_id, quoted_text)
+        if q.get("kind") == "goal_approval":
+            # Same affirmative parser the worker's _resume_goal uses, so the
+            # ack never disagrees with what the worker will actually do.
+            from api.services.agent_worker.worker import _is_affirmative
+            if not store.deposit_answer(reply_to_message_id, text, bot=self._bot.name):
+                # Race: answered between the lookup above and this deposit.
+                await send_message_async(
+                    "I already have your answer for that goal — it's in motion. "
+                    "To add something, reply to my latest update.",
+                    chat_id=chat_id,
+                )
+                return True
+            if _is_affirmative(text):
+                ack = ("✅ Goal locked — starting work now. "
+                       "I'll post updates here as I go.")
+            else:
+                ack = ("✏️ Got it — reworking the goal with your changes. "
+                       "I'll propose an updated version shortly.")
+            self._send_anchored_ack(store, q.get("session_id"), q.get("task_id"), ack, chat_id)
+            return True
+        if q.get("kind") != "followup":
+            return False
+        session_id = q.get("session_id")
+        if not session_id:
+            return False
+        session = store.get_by_session_id(session_id)
+        if not session or session.routing not in ("claude_code", "codex"):
+            return False
+        store.deposit_answer(reply_to_message_id, text, bot=self._bot.name)
+        label = "Codex" if session.routing == "codex" else "Claude Code"
+        # Truthful ack: the answer is queued now, but the worker's next tick
+        # is what actually reopens and dispatches the session
+        # (`_resume_as_followup`). A separate in-thread "resumed" message
+        # follows once that CLI turn actually starts; if it never does, the
+        # stuck-session sweep surfaces that instead of leaving this silent.
+        await send_message_async(
+            f"📨 Got it — queued for the {label} session. I'll confirm here "
+            f"once it actually resumes.",
+            chat_id=chat_id,
+        )
+        return True
+
+    async def _handle_status_anchor_reply(
+        self, q: dict, text: str, chat_id: str, quoted_text: str | None,
+    ) -> bool:
+        """Route a threaded reply on a status/heartbeat/ack message back into
+        its session as a context note.
+
+        A RUNNING/CLAIMED/BLOCKED session queues the note immediately — it
+        rides the next `pending_messages` drain regardless of what happens
+        here. A terminal session with a persisted CLI id is reopened
+        (guarded transition, THEN enqueue-then-CLAIM, mirroring the
+        reopen-on-send pattern) so the dispatch tick resumes it with the
+        note. The reopen swaps the backing vault task's terminal tag back
+        to running and its status back to in-progress — the same
+        tag/status pairing the worker's own reopen paths already perform —
+        *before* the note is queued or the session claimed: if that
+        transition fails (the terminal tag isn't on the card, e.g.
+        the operator retagged it in the meantime, or the status write
+        itself fails), nothing is queued and the session is left exactly
+        as it was — the operator is told the resume could not be
+        completed rather than getting the ordinary "queued"
+        acknowledgment, and no note is left behind to surface unexpectedly
+        on some later, unrelated reopen.
+        """
+        from api.services.agent_worker.session_store import (
+            STATUS_BUDGET_EXCEEDED, STATUS_COMPLETED, STATUS_FAILED, SessionStore,
+        )
+        store = SessionStore()
+        session_id = q.get("session_id")
+        session = store.get_by_session_id(session_id) if session_id else None
+        if session is None:
+            return False
+        quoted = (quoted_text or "").strip()
+        if quoted:
+            if len(quoted) > MAX_QUOTED_REPLY_CHARS:
+                quoted = quoted[:MAX_QUOTED_REPLY_CHARS] + "…"
+            composed = f'[operator replied to your status update: "{quoted}"]\n{text}'
+        else:
+            composed = f"(operator note) {text}"
+        terminal = session.status in (STATUS_COMPLETED, STATUS_FAILED, STATUS_BUDGET_EXCEEDED)
+        if terminal:
+            if session.routing in ("claude_code", "codex") and session.claude_code_session_id:
+                from api.services.agent_worker.session_store import STATUS_CLAIMED
+                reopened = True
+                if session.origin != "operator":
+                    # Vault-task-backed session — swap the tag/status back to
+                    # running first, same as every internal reopen path. An
+                    # operator root-spawn has no backing card, so it skips
+                    # straight to the claim like `_resume_as_followup` does.
+                    reopened = _reopen_vault_task_for_resume(session.task_id)
+                if reopened:
+                    store.enqueue_message(session.session_id, "operator", composed)
+                    store.update_status(session.task_id, STATUS_CLAIMED)
+                    ack = ("📨 Got it — queued for the session. I'll confirm "
+                           "here once it actually resumes.")
+                else:
+                    ack = ("📨 Couldn't resume that session — its card isn't in "
+                           "a resumable state anymore (retagged or reassigned "
+                           "since it finished). Re-tag it with an engine "
+                           "assignee to retry.")
+            else:
+                ack = ("📨 Noted, but that session already ended and can't be "
+                       "resumed — send a fresh message to start a new one.")
+        else:
+            store.enqueue_message(session.session_id, "operator", composed)
+            ack = "📨 Noted — I'll pass this to the session at its next checkpoint."
+        self._send_anchored_ack(store, session.session_id, session.task_id, ack, chat_id)
+        return True
+
+    def _send_anchored_ack(
+        self, store, session_id: str | None, task_id: str | None,
+        ack: str, chat_id: str,
+    ) -> None:
+        """Send a session-scoped ack with the reply-affordance footer and
+        register its message id as a reply anchor, so the ack itself is part
+        of the replyable work thread. Falls back to a plain, footerless
+        send when id capture is unavailable.
+        """
+        from api.services.agent_worker.worker import _with_reply_footer
+        ids = []
+        try:
+            ids = send_message_capture_ids(_with_reply_footer(ack), chat_id) or []
+        except Exception as exc:
+            logger.warning(f"anchored ack send failed: {exc}")
+        if ids and session_id and task_id:
+            try:
+                store.add_reply_anchors(session_id, task_id, ids, bot=self._bot.name)
+            except Exception as exc:
+                logger.warning(f"ack anchor registration failed: {exc}")
+        elif not ids:
+            try:
+                send_message(ack, chat_id)  # plain, footerless fallback
+            except Exception as exc:
+                logger.warning(f"ack fallback send failed: {exc}")
+
+    def _should_use_plan_mode(self, task: str) -> bool:
+        """Conservative heuristic: plan mode only for complex-sounding tasks.
+        Delegates to the shared helper so Telegram and web-chat stay in sync."""
+        from api.services.agent_worker.claude_code_spawn import should_use_plan_mode
+        return should_use_plan_mode(task)
+
+    async def _handle_claude_command(self, task: str, chat_id: str):
+        """Spawn a /claude session by writing a routing='claude_code' row
+        that the agent worker dispatches on its next tick."""
+        from api.services.agent_worker.claude_code_spawn import spawn_claude_code_session
+        from api.services.agent_worker.session_store import SessionStore
+        from api.services.directory_resolver import resolve_working_directory
+
+        working_dir = resolve_working_directory(task)
+        plan_mode = self._should_use_plan_mode(task)
+        mode_label = " (plan mode)" if plan_mode else ""
+
+        await send_message_async(
+            f"Starting Claude Code{mode_label}...\nDirectory: `{working_dir}`",
+            chat_id=chat_id,
+        )
+        result = spawn_claude_code_session(
+            SessionStore(),
+            task,
+            working_dir=working_dir,
+            plan_mode=plan_mode,
+            chat_id=chat_id,
+        )
+        if not result.get("ok"):
+            await send_message_async(f"Error: {result.get('error')}", chat_id=chat_id)
+
+    async def _handle_claude_status(self, chat_id: str):
+        """List non-terminal routing='claude_code' sessions from the session_store."""
+        from api.services.agent_worker.session_store import (
+            TERMINAL_STATUSES, SessionStore,
+        )
+        store = SessionStore()
+        active = [
+            s for s in store.list_sessions(routing="claude_code", limit=10)
+            if s.status not in TERMINAL_STATUSES
+        ]
+        if not active:
+            await send_message_async("No active Claude Code session.", chat_id=chat_id)
+            return
+        lines = ["*Claude Code Sessions*"]
+        for s in active:
+            elapsed = max(0, int(time.time() - (s.started_at or 0)))
+            minutes, seconds = divmod(elapsed, 60)
+            lines.append(
+                f"- `{s.session_id[:8]}` status: {s.status} "
+                f"({minutes}m {seconds}s, ${s.total_dollars:.4f})"
+            )
+        await send_message_async("\n".join(lines), chat_id=chat_id)
+
+    async def _handle_claude_cancel(self, chat_id: str):
+        """Mark non-terminal routing='claude_code' sessions as FAILED so the
+        worker won't dispatch them again.
+
+        A subprocess already running in a worker tick keeps running until
+        it finishes or hits the watchdog — true mid-flight subprocess kill
+        requires a cross-process signal that isn't wired here. The status
+        update is enough to prevent further dispatch and surface
+        'cancelled' in /agents.
+        """
+        from api.services.agent_worker.session_store import TERMINAL_STATUSES, SessionStore
+        store = SessionStore()
+        active = [
+            s for s in store.list_sessions(routing="claude_code", limit=20)
+            if s.status not in TERMINAL_STATUSES
+        ]
+        if not active:
+            await send_message_async("No active Claude Code session.", chat_id=chat_id)
+            return
+        for s in active:
+            store.mark_cancelled(
+                s.task_id,
+                attempt_id=s.attempt_id,
+                turn_id=s.turn_id,
+                reason="operator requested cancellation",
+            )
+        await send_message_async(
+            f"Marked {len(active)} Claude Code session(s) cancelled.",
+            chat_id=chat_id,
+        )
+
+    # ------------------------------------------------------------------
+    # Codex orchestration — mirrors the /claude handlers above
+    # ------------------------------------------------------------------
+
+    async def _handle_codex_command(self, task: str, chat_id: str):
+        """Spawn a /codex session by writing a routing='codex' row that the
+        agent worker dispatches on its next tick."""
+        from api.services.agent_worker.codex_spawn import spawn_codex_session
+        from api.services.agent_worker.session_store import SessionStore
+        from api.services.directory_resolver import resolve_working_directory
+
+        working_dir = resolve_working_directory(task)
+
+        await send_message_async(
+            f"Starting Codex...\nDirectory: `{working_dir}`",
+            chat_id=chat_id,
+        )
+        result = spawn_codex_session(
+            SessionStore(),
+            task,
+            working_dir=working_dir,
+            chat_id=chat_id,
+        )
+        if not result.get("ok"):
+            await send_message_async(f"Error: {result.get('error')}", chat_id=chat_id)
+
+    async def _handle_codex_status(self, chat_id: str):
+        """List non-terminal routing='codex' sessions from the session_store."""
+        from api.services.agent_worker.session_store import (
+            TERMINAL_STATUSES, SessionStore,
+        )
+        store = SessionStore()
+        active = [
+            s for s in store.list_sessions(routing="codex", limit=10)
+            if s.status not in TERMINAL_STATUSES
+        ]
+        if not active:
+            await send_message_async("No active Codex session.", chat_id=chat_id)
+            return
+        lines = ["*Codex Sessions*"]
+        for s in active:
+            elapsed = max(0, int(time.time() - (s.started_at or 0)))
+            minutes, seconds = divmod(elapsed, 60)
+            lines.append(
+                f"- `{s.session_id[:8]}` status: {s.status} "
+                f"({minutes}m {seconds}s, ${s.total_dollars:.4f})"
+            )
+        await send_message_async("\n".join(lines), chat_id=chat_id)
+
+    async def _handle_codex_cancel(self, chat_id: str):
+        """Mark non-terminal routing='codex' sessions as FAILED — same
+        contract as /claude_cancel (status flip, not a real subprocess kill).
+        """
+        from api.services.agent_worker.session_store import TERMINAL_STATUSES, SessionStore
+        store = SessionStore()
+        active = [
+            s for s in store.list_sessions(routing="codex", limit=20)
+            if s.status not in TERMINAL_STATUSES
+        ]
+        if not active:
+            await send_message_async("No active Codex session.", chat_id=chat_id)
+            return
+        for s in active:
+            store.mark_cancelled(
+                s.task_id,
+                attempt_id=s.attempt_id,
+                turn_id=s.turn_id,
+                reason="operator requested cancellation",
+            )
+        await send_message_async(
+            f"Marked {len(active)} Codex session(s) cancelled.",
+            chat_id=chat_id,
+        )
+
+    async def _handle_inspect(self, chat_id: str):
+        """Show sources checked and results from the last query."""
+        if not self._last_result:
+            await send_message_async("No previous query to inspect.", chat_id=chat_id)
+            return
+
+        r = self._last_result
+        lines = ["*Last query inspection*\n"]
+
+        # Tool actions taken
+        statuses = r.get("statuses", [])
+        if statuses:
+            lines.append("*Actions:*")
+            for s in statuses:
+                lines.append(f"  - {s}")
+            lines.append("")
+
+        # Sources found (show only tool name + type, not input args)
+        sources = r.get("sources", [])
+        if sources:
+            lines.append("*Sources checked:*")
+            for src in sources:
+                stype = src.get("source_type", "")
+                # file_name contains tool(args) — extract just the tool name
+                raw = src.get("file_name", "")
+                tool_name = raw.split("(")[0] if "(" in raw else raw
+                lines.append(f"  - [{stype}] {tool_name}")
+            lines.append("")
+
+        # Performance
+        perf = r.get("perf_trace")
+        if perf:
+            total_ms = perf.get("total_ms", 0)
+            lines.append(f"*Time:* {total_ms:.0f}ms")
+            spans = perf.get("spans", [])
+            for span in spans:
+                if span.get("duration_ms", 0) > 50:
+                    lines.append(f"  - {span['name']}: {span['duration_ms']:.0f}ms")
+
+        if len(lines) == 1:
+            lines.append("No tool calls or sources in last response.")
+
+        await send_message_async("\n".join(lines), chat_id=chat_id)
+
+
+# ---------------------------------------------------------------------------
+# Singleton
+# ---------------------------------------------------------------------------
+
+_telegram_listeners: Optional[list[TelegramBotListener]] = None
+
+
+def get_telegram_listeners() -> list[TelegramBotListener]:
+    """Get or create the listeners for the primary bot plus any specialized bots.
+
+    The primary is included only when configured; specialized bots come from the
+    registry (``settings.telegram_bots``), which already drops any whose token is
+    unset — so a fresh clone with no extra tokens yields just the primary.
+    """
+    global _telegram_listeners
+    if _telegram_listeners is None:
+        listeners: list[TelegramBotListener] = []
+        if settings.telegram_enabled and settings.telegram_primary_listener_enabled:
+            listeners.append(TelegramBotListener(settings.telegram_primary_bot))
+        elif settings.telegram_enabled:
+            logger.info(
+                "Primary Telegram listener disabled "
+                "(TELEGRAM_PRIMARY_LISTENER_ENABLED=false); send-only mode. "
+                "The scheduler still delivers; another process owns getUpdates."
+            )
+        for bot in settings.telegram_bots:
+            listeners.append(TelegramBotListener(bot))
+        _telegram_listeners = listeners
+    return _telegram_listeners

@@ -1,0 +1,1007 @@
+"""Browser test for full schedule editing in the scheduled card drawer.
+
+Serves `web/` itself from an ephemeral port and stubs every `/api/` call the
+page makes — the assertions are about the JS in `web/agents/board.js`, not
+the live backend. No `requires_server` marker, so this runs at pre-push
+(`browser and not requires_server`).
+
+Covers: schedule type/value/timezone/action/executor/bot each saving through
+`PUT /api/scheduler/{id}` with the right body; an invalid cron expression
+showing the 422 detail inline and leaving the stored value untouched; the
+bot select offering only the names `GET /api/scheduler/bots` returns (plus
+an empty "primary" option) and disabling with a visible reason when that
+fetch fails; the executor/bot swap when the action select changes; an
+action switch whose target section isn't yet satisfied (no endpoint config,
+a blank message, a path that doesn't start with "/api/") holding locally
+instead of saving — through both the Action select's own change and every
+subsequent edit to the section's fields — until the section's own input
+satisfies the target action, then saving both together in one PUT; the
+next-fire preview updating from the PUT response; and Trigger now calling
+the trigger endpoint and refreshing the last-run line.
+"""
+import http.server
+import json
+import re
+import threading
+import time
+from pathlib import Path
+
+import pytest
+from playwright.sync_api import Page, expect
+
+pytestmark = [pytest.mark.browser, pytest.mark.slow]
+
+WEB_DIR = Path(__file__).resolve().parent.parent / "web"
+
+# Obviously synthetic — same shape GET /api/scheduler/bots returns.
+_BOT_NAMES = ["primary", "alerts", "ledger"]
+
+
+class _AgentsHandler(http.server.SimpleHTTPRequestHandler):
+    """Serves the agents board the way api/main.py does: `/agents` is
+    agents.html and the module tree hangs off `/static/`."""
+
+    def translate_path(self, path):
+        path = path.split("?", 1)[0].split("#", 1)[0]
+        if path in ("/agents", "/"):
+            return str(WEB_DIR / "agents.html")
+        if path.startswith("/static/"):
+            return str(WEB_DIR / path[len("/static/"):])
+        return str(WEB_DIR / path.lstrip("/"))
+
+    def log_message(self, *args):  # keep pytest output clean
+        pass
+
+
+@pytest.fixture(scope="module")
+def agents_base_url():
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _AgentsHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def _board_fixture():
+    return {
+        "lanes": {
+            "unassigned": [], "assigned": [], "in_progress": [], "human_queue": [],
+            "scheduled": [
+                {
+                    "kind": "schedule", "id": "s1", "name": "Morning briefing",
+                    "message_content": "Good morning", "enabled": True,
+                    "next_fire_at": "2099-01-01T09:00:00+00:00", "recurring": True,
+                    "last_run": None,
+                    "schedule_type": "cron", "schedule_value": "0 9 * * *",
+                    "timezone": "America/New_York", "action": "notify",
+                    "executor": "", "bot": "",
+                },
+            ],
+            "review": [], "done": [],
+        },
+        "generated_at": 0,
+        "api_host": "primary-host",
+    }
+
+
+def _stub_routes(page: Page, board_state: dict, schedule_puts: list, trigger_calls: list,
+                  bots_response: "dict | None" = None, bots_status: int = 200):
+    def d3_handler(route):
+        route.fulfill(status=200, content_type="application/javascript", body="window.d3 = window.d3 || {};")
+
+    page.route("**/d3.v7.min.js", d3_handler)
+
+    def api_handler(route):
+        url = route.request.url
+        method = route.request.method
+
+        if "/api/agents/board/stream" in url:
+            route.fulfill(status=200, content_type="text/event-stream", body="retry: 60000\n: ok\n\n")
+            return
+
+        if re.search(r"/api/scheduler/bots$", url) and method == "GET":
+            route.fulfill(
+                status=bots_status, content_type="application/json",
+                body=json.dumps(bots_response if bots_response is not None else {"bots": _BOT_NAMES}),
+            )
+            return
+
+        trigger_match = re.search(r"/api/scheduler/([^/]+)/trigger$", url)
+        if trigger_match and method == "POST":
+            trigger_calls.append(trigger_match.group(1))
+            for cards in board_state["lanes"].values():
+                for card in cards:
+                    if card["id"] == trigger_match.group(1):
+                        card["last_run"] = {"at": "2026-09-08T09:00:00+00:00", "outcome": "sent", "snippet": "delivered"}
+            route.fulfill(status=200, content_type="application/json", body=json.dumps({"status": "triggered", "id": trigger_match.group(1)}))
+            return
+
+        schedule_match = re.search(r"/api/scheduler/([^/]+)$", url)
+        if schedule_match and method == "PUT":
+            try:
+                body = json.loads(route.request.post_data or "{}")
+            except ValueError:
+                body = {}
+            schedule_puts.append(body)
+
+            # A cron/once value containing "bad" simulates the route's own
+            # validation rejecting an unparsable expression -- nothing is
+            # written to board_state on this path, mirroring the real
+            # route's "validate before store.update" order.
+            if "schedule_value" in body and "bad" in body["schedule_value"]:
+                route.fulfill(
+                    status=422, content_type="application/json",
+                    body=json.dumps({"detail": f"Invalid cron expression '{body['schedule_value']}': not a valid cron string"}),
+                )
+                return
+
+            schedule_id = schedule_match.group(1)
+            stored_card = None
+            for cards in board_state["lanes"].values():
+                for card in cards:
+                    if card["id"] == schedule_id:
+                        stored_card = card
+
+            # Mirrors api/services/scheduler_validation.py's
+            # `validate_action_inputs`: a PUT that touches `action`,
+            # `message_content`, or `endpoint_config` is checked against
+            # the RESULTING action's requirements, falling back to the
+            # entry's stored value for whichever of the three the patch
+            # doesn't touch -- an unrelated field (e.g. `enabled`) never
+            # re-validates a pre-existing entry.
+            if stored_card is not None and ({"action", "message_content", "endpoint_config"} & body.keys()):
+                resulting_action = body.get("action", stored_card.get("action"))
+                resulting_message = body.get("message_content", stored_card.get("message_content", ""))
+                resulting_endpoint_config = body.get("endpoint_config", stored_card.get("endpoint_config"))
+                if resulting_action == "endpoint":
+                    cfg = resulting_endpoint_config if isinstance(resulting_endpoint_config, dict) else {}
+                    endpoint_method = str(cfg.get("method", "")).strip().upper()
+                    endpoint_path = cfg.get("endpoint")
+                    if endpoint_method not in ("GET", "POST"):
+                        route.fulfill(
+                            status=422, content_type="application/json",
+                            body=json.dumps({"detail": f"endpoint_config.method must be 'GET' or 'POST', got {cfg.get('method')!r}"}),
+                        )
+                        return
+                    if not isinstance(endpoint_path, str) or not endpoint_path.startswith("/api/"):
+                        route.fulfill(
+                            status=422, content_type="application/json",
+                            body=json.dumps({"detail": f"endpoint_config.endpoint must start with '/api/', got {endpoint_path!r}"}),
+                        )
+                        return
+                elif resulting_action in ("notify", "prompt", "agent"):
+                    if not (resulting_message or "").strip():
+                        route.fulfill(
+                            status=422, content_type="application/json",
+                            body=json.dumps({"detail": "message_content must not be blank"}),
+                        )
+                        return
+
+            next_trigger_at = None
+            for cards in board_state["lanes"].values():
+                for card in cards:
+                    if card["id"] != schedule_id:
+                        continue
+                    card.update(body)
+                    # A successful schedule_type/schedule_value/timezone
+                    # change advances the next-fire time -- synthetic but
+                    # distinct from the fixture's original value so the
+                    # preview-updates-from-the-response assertion can't
+                    # pass by coincidence. An enabled change mirrors the
+                    # real store's own recompute: disabling clears the
+                    # next fire, re-enabling advances it the same way.
+                    if {"schedule_type", "schedule_value", "timezone"} & body.keys():
+                        card["next_fire_at"] = "2099-02-02T10:00:00+00:00"
+                    elif "enabled" in body:
+                        card["next_fire_at"] = "2099-02-02T10:00:00+00:00" if body["enabled"] else None
+                    next_trigger_at = card["next_fire_at"]
+            route.fulfill(
+                status=200, content_type="application/json",
+                body=json.dumps({"id": schedule_id, "next_trigger_at": next_trigger_at}),
+            )
+            return
+
+        if re.search(r"/api/agents/board$", url) and method == "GET":
+            route.fulfill(status=200, content_type="application/json", body=json.dumps(board_state))
+            return
+
+        route.fulfill(status=200, content_type="application/json", body="{}")
+
+    page.route("**/api/**", api_handler)
+
+
+def _open_board(page: Page, base_url, board_state=None, schedule_puts=None, trigger_calls=None,
+                 bots_response=None, bots_status=200):
+    _stub_routes(
+        page,
+        board_state if board_state is not None else _board_fixture(),
+        schedule_puts if schedule_puts is not None else [],
+        trigger_calls if trigger_calls is not None else [],
+        bots_response,
+        bots_status,
+    )
+    page.goto(f"{base_url}/agents")
+    page.wait_for_selector('[data-card-id="s1"]')
+    page.locator('[data-card-id="s1"]').click()
+    page.wait_for_selector('[data-field="schedule-type"]')
+
+
+def _wait_for(predicate, page: Page, timeout_ms=5000, interval_ms=25):
+    """Poll `predicate` until it's truthy or the timeout elapses — for
+    asserting on a plain Python side effect (e.g. an appended stub call)
+    that has no DOM signal Playwright's own `expect(...)` can wait on.
+    `page.wait_for_timeout(...)` doubles as the event-loop pump that
+    delivers an already-arrived route callback, the same reasoning
+    `tests/test_agents_board_ui_browser.py`'s identical helper documents."""
+    deadline = time.monotonic() + timeout_ms / 1000
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        page.wait_for_timeout(interval_ms)
+    assert predicate(), f"condition not met within {timeout_ms}ms"
+
+
+class TestScheduleTypeAndValue:
+    def test_schedule_type_change_updates_label_and_placeholder_without_saving(self, page: Page, agents_base_url):
+        schedule_puts = []
+        _open_board(page, agents_base_url, schedule_puts=schedule_puts)
+        type_select = page.locator('[data-field="schedule-type"]')
+        value_input = page.locator('[data-field="schedule-value"]')
+        value_label = page.locator('[data-field="schedule-value-label"]')
+        expect(type_select).to_have_value("cron")
+        expect(value_input).to_have_attribute("placeholder", "0 9 * * *")
+
+        type_select.select_option("once")
+        # Checked immediately with get_attribute() (a one-shot read, unlike
+        # expect()'s polling) so a regression that only updates the label
+        # via a save's own board refetch redraw -- rather than
+        # synchronously in the select's own event listener -- is still
+        # caught.
+        assert value_input.get_attribute("placeholder") == "2026-06-03T15:05:00"
+        assert value_label.text_content() == "When (ISO datetime)"
+        # A type change alone must never reach the server on its own --
+        # the still-cron schedule_value sitting in the field wouldn't
+        # parse as a datetime, so writing the type without a matching
+        # value would strand the schedule. Pump the event loop briefly so
+        # a save the select's own listener wrongly issued would have time
+        # to arrive.
+        page.wait_for_timeout(300)
+        assert schedule_puts == []
+
+    def test_schedule_type_conversion_saves_type_and_value_together(self, page: Page, agents_base_url):
+        """The operator can still convert a schedule from cron to once (and
+        back): selecting the new type and then entering a value that
+        parses under it sends both fields in one write, and the drawer's
+        preview reflects the real next fire time the conversion produces."""
+        schedule_puts = []
+        _open_board(page, agents_base_url, schedule_puts=schedule_puts)
+        type_select = page.locator('[data-field="schedule-type"]')
+        value_input = page.locator('[data-field="schedule-value"]')
+        preview = page.locator('[data-field="next-fire-preview"]')
+        initial_text = preview.text_content()
+
+        type_select.select_option("once")
+        value_input.fill("2026-06-03T15:05:00")
+        page.locator('[data-field="timezone"]').click()  # blur
+        _wait_for(
+            lambda: {"schedule_type": "once", "schedule_value": "2026-06-03T15:05:00"} in schedule_puts,
+            page=page,
+        )
+        # The stub advances next_fire_at to a real, distinct fire time on a
+        # successful combined save -- checked by inequality against the
+        # captured initial text, the same reasoning
+        # test_next_fire_preview_updates_from_put_response documents.
+        _wait_for(lambda: preview.text_content() != initial_text, page=page)
+
+    def test_rejected_type_conversion_reverts_both_type_and_value(self, page: Page, agents_base_url):
+        schedule_puts = []
+        _open_board(page, agents_base_url, schedule_puts=schedule_puts)
+        type_select = page.locator('[data-field="schedule-type"]')
+        value_input = page.locator('[data-field="schedule-value"]')
+
+        type_select.select_option("once")
+        value_input.fill("bad expression")
+        page.locator('[data-field="timezone"]').click()  # blur
+        error_el = page.locator('[data-field="schedule-value-error"]')
+        expect(error_el).to_be_visible(timeout=5000)
+        expect(value_input).to_have_value("0 9 * * *")
+        expect(type_select).to_have_value("cron")
+
+    def test_type_conversion_to_once_updates_the_trigger_button_label(self, page: Page, agents_base_url):
+        """Converting a `cron` entry to `once` in the open drawer must
+        flip the Trigger now button's disclosure the moment the combined
+        type/value save succeeds -- not only on a later reopen -- since
+        the drawer holding focus blocks the board's own periodic
+        redraw."""
+        schedule_puts = []
+        _open_board(page, agents_base_url, schedule_puts=schedule_puts)
+        type_select = page.locator('[data-field="schedule-type"]')
+        value_input = page.locator('[data-field="schedule-value"]')
+        button = page.locator('[data-action="trigger-now"]')
+        expect(button).to_have_text("Trigger now")
+
+        type_select.select_option("once")
+        value_input.fill("2026-06-03T15:05:00")
+        page.locator('[data-field="timezone"]').click()  # blur
+        _wait_for(
+            lambda: {"schedule_type": "once", "schedule_value": "2026-06-03T15:05:00"} in schedule_puts,
+            page=page,
+        )
+        expect(button).to_contain_text("disables")
+
+    def test_type_conversion_to_cron_updates_the_trigger_button_label(self, page: Page, agents_base_url):
+        """The reverse direction: converting a `once` entry to `cron`
+        must drop the one-off disclosure once the save succeeds, rather
+        than continuing to warn about consuming a schedule that is now
+        recurring."""
+        schedule_puts = []
+        board_state = _board_fixture()
+        board_state["lanes"]["scheduled"][0]["schedule_type"] = "once"
+        board_state["lanes"]["scheduled"][0]["schedule_value"] = "2099-01-01T09:00:00"
+        _open_board(page, agents_base_url, board_state=board_state, schedule_puts=schedule_puts)
+        type_select = page.locator('[data-field="schedule-type"]')
+        value_input = page.locator('[data-field="schedule-value"]')
+        button = page.locator('[data-action="trigger-now"]')
+        expect(button).to_contain_text("disables")
+
+        type_select.select_option("cron")
+        value_input.fill("0 10 * * *")
+        page.locator('[data-field="timezone"]').click()  # blur
+        _wait_for(
+            lambda: {"schedule_type": "cron", "schedule_value": "0 10 * * *"} in schedule_puts,
+            page=page,
+        )
+        expect(button).to_have_text("Trigger now")
+
+    def test_schedule_value_edit_saves_on_blur(self, page: Page, agents_base_url):
+        schedule_puts = []
+        _open_board(page, agents_base_url, schedule_puts=schedule_puts)
+        value_input = page.locator('[data-field="schedule-value"]')
+        value_input.fill("0 10 * * *")
+        page.locator('[data-field="timezone"]').click()  # blur
+        _wait_for(lambda: {"schedule_value": "0 10 * * *"} in schedule_puts, page=page)
+
+    def test_invalid_cron_shows_422_detail_inline_and_saves_nothing(self, page: Page, agents_base_url):
+        schedule_puts = []
+        _open_board(page, agents_base_url, schedule_puts=schedule_puts)
+        value_input = page.locator('[data-field="schedule-value"]')
+        value_input.fill("bad expression")
+        page.locator('[data-field="timezone"]').click()  # blur
+        error_el = page.locator('[data-field="schedule-value-error"]')
+        expect(error_el).to_be_visible(timeout=5000)
+        expect(error_el).to_contain_text("Invalid cron expression")
+        # The rejected value snaps back to the last value the server
+        # actually accepted, not the just-typed one.
+        expect(value_input).to_have_value("0 9 * * *")
+
+    def test_next_fire_preview_updates_from_put_response(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        preview = page.locator('[data-field="next-fire-preview"]')
+        initial_text = preview.text_content()
+        assert "2099" in initial_text  # the fixture's original next_fire_at
+
+        page.locator('[data-field="schedule-value"]').fill("0 10 * * *")
+        # Blur onto the timezone field, which stays inside the drawer -- so
+        # a subsequent board refetch's own redraw is skipped (the drawer
+        # still holds focus) and can't stand in for the direct
+        # preview-from-response update this waits on.
+        page.locator('[data-field="timezone"]').click()
+        # The stub advances next_fire_at to 2099-02-02 on a schedule_value
+        # save -- checked by inequality against the captured initial text,
+        # not by substring, since both the original and the new date
+        # contain "2099" and so wouldn't otherwise distinguish "updated"
+        # from "never touched".
+        _wait_for(lambda: preview.text_content() != initial_text, page=page)
+
+
+class TestEnabledToggle:
+    def test_disabling_refreshes_the_next_fire_preview(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        preview = page.locator('[data-field="next-fire-preview"]')
+        initial_text = preview.text_content()
+        assert "2099" in initial_text  # the fixture's original next_fire_at
+
+        # Unchecking the box keeps it focused, the same way the drawer's
+        # other in-place controls do -- so a subsequent board refetch's
+        # own redraw is skipped and can't stand in for the direct
+        # preview-from-response update this waits on.
+        page.locator('[data-field="enabled"]').uncheck()
+        _wait_for(lambda: preview.text_content() == "Not scheduled to fire again.", page=page)
+
+
+class TestTimezone:
+    def test_timezone_edit_saves_on_blur(self, page: Page, agents_base_url):
+        schedule_puts = []
+        _open_board(page, agents_base_url, schedule_puts=schedule_puts)
+        tz_input = page.locator('[data-field="timezone"]')
+        expect(tz_input).to_have_value("America/New_York")
+        tz_input.fill("Europe/Berlin")
+        page.locator('[data-field="schedule-value"]').click()  # blur
+        _wait_for(lambda: {"timezone": "Europe/Berlin"} in schedule_puts, page=page)
+
+
+class TestActionExecutorBot:
+    def test_action_change_saves_and_swaps_executor_and_bot(self, page: Page, agents_base_url):
+        schedule_puts = []
+        _open_board(page, agents_base_url, schedule_puts=schedule_puts)
+        action_select = page.locator('[data-field="action"]')
+        executor_row = page.locator('[data-row="executor"]')
+        bot_row = page.locator('[data-row="bot"]')
+        expect(executor_row).to_be_hidden()
+        expect(bot_row).to_be_visible()
+
+        action_select.select_option("agent")
+        # The swap happens synchronously in the select's own event
+        # listener, ahead of the save's network round trip -- checked with
+        # a non-auto-waiting is_visible()/is_hidden() query rather than
+        # expect()'s polling, which would also pass if the swap only
+        # happened later, via the save's own board refetch.
+        assert executor_row.is_visible()
+        assert bot_row.is_hidden()
+        _wait_for(lambda: {"action": "agent"} in schedule_puts, page=page)
+
+        action_select.select_option("notify")
+        assert executor_row.is_hidden()
+        assert bot_row.is_visible()
+
+    def test_executor_select_saves(self, page: Page, agents_base_url):
+        schedule_puts = []
+        board_state = _board_fixture()
+        board_state["lanes"]["scheduled"][0]["action"] = "agent"
+        _open_board(page, agents_base_url, board_state=board_state, schedule_puts=schedule_puts)
+        expect(page.locator('[data-row="executor"]')).to_be_visible()
+        page.locator('[data-field="executor"]').select_option("cloud")
+        _wait_for(lambda: {"executor": "cloud"} in schedule_puts, page=page)
+
+    def test_executor_select_shows_the_empty_default_route_option_when_unset(self, page: Page, agents_base_url):
+        """An `agent` schedule with executor:"" means the agent worker's own
+        default route, not `local` -- the select must show its own empty
+        option selected rather than falling through to `local`, the first
+        option in the list, the way a plain <select> does when nothing
+        carries the `selected` attribute."""
+        board_state = _board_fixture()
+        board_state["lanes"]["scheduled"][0]["action"] = "agent"
+        board_state["lanes"]["scheduled"][0]["executor"] = ""
+        _open_board(page, agents_base_url, board_state=board_state)
+        executor_select = page.locator('[data-field="executor"]')
+        expect(executor_select).to_have_value("")
+        values = executor_select.locator("option").evaluate_all("els => els.map(e => e.value)")
+        assert values[0] == ""
+        assert "local" in values
+
+    def test_bot_select_offers_only_accepted_names(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        bot_select = page.locator('[data-field="bot"]')
+        expect(bot_select).to_be_enabled()
+        values = bot_select.locator("option").evaluate_all("els => els.map(e => e.value)")
+        assert values == ["", "primary", "alerts", "ledger"]
+        # The empty option and the registry's own "primary" row must read
+        # distinguishably -- both meaning "use the primary bot" isn't a
+        # reason for them to look identical in the dropdown.
+        labels = bot_select.locator("option").evaluate_all("els => els.map(e => e.textContent)")
+        assert labels[0] == "default (primary)"
+        assert labels[1] == "primary"
+        assert labels[0] != labels[1]
+
+    def test_bot_select_shows_an_orphaned_stored_name_as_unknown(self, page: Page, agents_base_url):
+        """A bot name stored on the schedule but absent from the registry
+        response (e.g. the bot was renamed) must stay visible and selected,
+        flagged unknown, rather than the select falling to a blank
+        selection with no signal that the name is unresolvable."""
+        board_state = _board_fixture()
+        board_state["lanes"]["scheduled"][0]["bot"] = "retired-bot"
+        _open_board(page, agents_base_url, board_state=board_state)
+        bot_select = page.locator('[data-field="bot"]')
+        expect(bot_select).to_be_enabled()
+        expect(bot_select).to_have_value("retired-bot")
+        option = bot_select.locator('option[value="retired-bot"]')
+        assert option.text_content() == "retired-bot (unknown)"
+        assert option.get_attribute("data-unknown") == "true"
+
+    def test_bot_select_saves(self, page: Page, agents_base_url):
+        schedule_puts = []
+        _open_board(page, agents_base_url, schedule_puts=schedule_puts)
+        page.locator('[data-field="bot"]').select_option("ledger")
+        _wait_for(lambda: {"bot": "ledger"} in schedule_puts, page=page)
+
+    def test_bot_registry_fetch_failure_keeps_the_stored_value_and_shows_the_reason(self, page: Page, agents_base_url):
+        # The drawer's <select> ships `disabled` in the template, so
+        # to_be_disabled() alone would pass even if the failure branch
+        # below never ran. A stored, non-empty bot name and asserting it
+        # (plus the failure branch's own option list, not the template's
+        # empty default) survives the failed fetch proves the branch
+        # actually executed.
+        board_state = _board_fixture()
+        board_state["lanes"]["scheduled"][0]["bot"] = "ledger"
+        _open_board(page, agents_base_url, board_state=board_state, bots_status=500, bots_response={"detail": "boom"})
+        bot_select = page.locator('[data-field="bot"]')
+        expect(bot_select).to_be_disabled()
+        expect(bot_select).to_have_value("ledger")
+        values = bot_select.locator("option").evaluate_all("els => els.map(e => e.value)")
+        assert values == ["", "ledger"]
+        # A registry-fetch failure doesn't mean the stored name is
+        # unresolvable -- only that the registry couldn't be checked -- so
+        # the option must read the plain name, not the orphan label the
+        # "registry loaded and doesn't list it" case uses below.
+        option = bot_select.locator('option[value="ledger"]')
+        assert option.text_content() == "ledger"
+        assert option.get_attribute("data-unknown") is None
+        reason = page.locator('[data-field="bot-reason"]')
+        expect(reason).to_be_visible()
+        expect(reason).to_contain_text("unavailable")
+
+
+class TestLastRunAndTrigger:
+    def test_hasnt_run_yet_shown_when_no_last_run(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        expect(page.locator('[data-field="last-run-info"]')).to_contain_text("Hasn't run yet")
+
+    def test_trigger_now_calls_trigger_endpoint_and_refreshes_last_run(self, page: Page, agents_base_url):
+        trigger_calls = []
+        _open_board(page, agents_base_url, trigger_calls=trigger_calls)
+        page.get_by_role("button", name="Trigger now").click()
+        _wait_for(lambda: trigger_calls == ["s1"], page=page)
+        expect(page.locator('[data-field="last-run-info"]')).to_contain_text("sent", timeout=5000)
+        expect(page.locator('[data-field="last-run-info"]')).to_contain_text("delivered", timeout=5000)
+
+    def test_trigger_now_label_discloses_consumption_for_a_once_schedule(self, page: Page, agents_base_url):
+        """Firing a `once` schedule through this button consumes it (marks
+        it disabled, clears its next fire) -- the label discloses that
+        before the operator clicks, rather than the click being the first
+        the operator learns of it."""
+        board_state = _board_fixture()
+        board_state["lanes"]["scheduled"][0]["schedule_type"] = "once"
+        board_state["lanes"]["scheduled"][0]["schedule_value"] = "2099-01-01T09:00:00"
+        _open_board(page, agents_base_url, board_state=board_state)
+        button = page.locator('[data-action="trigger-now"]')
+        expect(button).to_contain_text("disables")
+
+    def test_trigger_now_label_plain_for_a_cron_schedule(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)  # fixture default schedule_type is "cron"
+        button = page.locator('[data-action="trigger-now"]')
+        expect(button).to_have_text("Trigger now")
+
+    def test_trigger_now_failure_shows_toast(self, page: Page, agents_base_url):
+        board_state = _board_fixture()
+        schedule_puts, trigger_calls = [], []
+        _stub_routes(page, board_state, schedule_puts, trigger_calls)
+
+        # Override the trigger route to fail, after the generic stub is
+        # registered -- Playwright matches the LAST-registered route first.
+        def failing_trigger(route):
+            if route.request.method == "POST" and "/trigger" in route.request.url:
+                route.fulfill(status=500, content_type="application/json", body=json.dumps({"detail": "worker unreachable"}))
+            else:
+                route.continue_()
+
+        page.route("**/api/scheduler/*/trigger", failing_trigger)
+        page.goto(f"{agents_base_url}/agents")
+        page.wait_for_selector('[data-card-id="s1"]')
+        page.locator('[data-card-id="s1"]').click()
+        page.wait_for_selector('[data-field="schedule-type"]')
+
+        page.get_by_role("button", name="Trigger now").click()
+        toast = page.locator(".toast.error")
+        expect(toast).to_be_visible(timeout=5000)
+        expect(toast).to_contain_text("worker unreachable")
+
+
+class TestPerActionSections:
+    """The drawer shows exactly the inputs the current action uses,
+    switching immediately when the Action select changes."""
+
+    def test_notify_shows_message_and_bot_only(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)  # fixture default action is "notify"
+        expect(page.locator('[data-field="message-content"]')).to_be_visible()
+        expect(page.locator('label:has-text("Message (sent as-is)")')).to_be_visible()
+        expect(page.locator('[data-row="bot"]')).to_be_visible()
+        expect(page.locator('[data-row="executor"]')).to_be_hidden()
+        expect(page.locator('[data-field="endpoint-method"]')).to_have_count(0)
+        expect(page.locator('[data-field="exec-context"]')).to_have_count(0)
+
+    def test_prompt_shows_message_bot_and_hint(self, page: Page, agents_base_url):
+        board_state = _board_fixture()
+        board_state["lanes"]["scheduled"][0]["action"] = "prompt"
+        _open_board(page, agents_base_url, board_state=board_state)
+        expect(page.locator('label:has-text("Prompt (run through chat)")')).to_be_visible()
+        expect(page.locator('[data-row="bot"]')).to_be_visible()
+        expect(page.locator('text=NO_ACTION')).to_be_visible()
+        expect(page.locator('[data-field="endpoint-method"]')).to_have_count(0)
+
+    def test_endpoint_shows_method_path_params_bot_and_note_not_message(self, page: Page, agents_base_url):
+        board_state = _board_fixture()
+        board_state["lanes"]["scheduled"][0]["action"] = "endpoint"
+        board_state["lanes"]["scheduled"][0]["endpoint_config"] = {
+            "method": "GET", "endpoint": "/api/tasks", "params": {"status": "todo"},
+        }
+        _open_board(page, agents_base_url, board_state=board_state)
+        expect(page.locator('[data-field="endpoint-method"]')).to_have_value("GET")
+        expect(page.locator('[data-field="endpoint-path"]')).to_have_value("/api/tasks")
+        assert '"status"' in page.locator('[data-field="endpoint-params"]').input_value()
+        expect(page.locator('[data-row="bot"]')).to_be_visible()
+        expect(page.locator('text=scheduler_message')).to_be_visible()
+        expect(page.locator('[data-field="message-content"]')).to_have_count(0)
+        expect(page.locator('[data-row="executor"]')).to_be_hidden()
+
+    def test_agent_shows_task_description_executor_and_exec_context_not_bot(self, page: Page, agents_base_url):
+        board_state = _board_fixture()
+        board_state["lanes"]["scheduled"][0]["action"] = "agent"
+        board_state["lanes"]["scheduled"][0]["message_content"] = "Draft the update"
+        _open_board(page, agents_base_url, board_state=board_state)
+        expect(page.locator('label:has-text("Task description")')).to_be_visible()
+        expect(page.locator('[data-field="message-content"]')).to_have_value("Draft the update")
+        expect(page.locator('[data-row="executor"]')).to_be_visible()
+        expect(page.locator('[data-field="exec-context"]')).to_have_count(1)
+        expect(page.locator('[data-row="bot"]')).to_be_hidden()
+        expect(page.locator('[data-field="endpoint-method"]')).to_have_count(0)
+
+    def test_switching_action_rebuilds_the_section_before_any_save(self, page: Page, agents_base_url):
+        schedule_puts = []
+        _open_board(page, agents_base_url, schedule_puts=schedule_puts)
+        action_select = page.locator('[data-field="action"]')
+        action_select.select_option("endpoint")
+        # Checked immediately with is_visible()/is_hidden() (a one-shot
+        # read, not expect()'s polling) so a regression that only swaps the
+        # section via the save's own board refetch -- rather than
+        # synchronously, before the PUT is even sent -- is still caught.
+        assert page.locator('[data-field="endpoint-method"]').is_visible()
+        assert page.locator('[data-field="message-content"]').count() == 0
+        # The fixture's notify card has no endpoint_config, so switching to
+        # endpoint doesn't yet have what it needs to fire -- the switch is
+        # held locally rather than written.
+        page.wait_for_timeout(200)
+        assert schedule_puts == []
+
+    def test_switching_to_endpoint_without_config_sends_nothing_until_filled(self, page: Page, agents_base_url):
+        schedule_puts = []
+        _open_board(page, agents_base_url, schedule_puts=schedule_puts)  # fixture: notify, no endpoint_config
+        page.locator('[data-field="action"]').select_option("endpoint")
+        page.wait_for_timeout(200)
+        assert schedule_puts == []
+
+        # Method stays at its default (GET, already valid) -- filling and
+        # blurring the path alone is enough to satisfy the endpoint action
+        # (params are optional), so that one blur is what fires the
+        # combined save.
+        path = page.locator('[data-field="endpoint-path"]')
+        path.fill("/api/tasks/summary")
+        path.blur()
+        _wait_for(
+            lambda: {
+                "action": "endpoint",
+                "endpoint_config": {"method": "GET", "endpoint": "/api/tasks/summary"},
+            } in schedule_puts,
+            page=page,
+        )
+        assert len(schedule_puts) == 1
+        chip = page.locator('[data-card-id="s1"] .board-chip').first
+        expect(chip).to_have_text("endpoint: GET /api/tasks/summary")
+
+    def test_choosing_method_before_a_path_holds_the_switch_and_shows_no_error(self, page: Page, agents_base_url):
+        schedule_puts = []
+        _open_board(page, agents_base_url, schedule_puts=schedule_puts)  # fixture: notify, no endpoint_config
+        page.locator('[data-field="action"]').select_option("endpoint")
+        page.wait_for_timeout(200)
+        assert schedule_puts == []
+
+        # Choosing POST alone doesn't satisfy the endpoint action -- there's
+        # still no path -- so the edit is held locally same as the switch
+        # itself: no PUT sent, and no error shown for an edit still in
+        # progress.
+        page.locator('[data-field="endpoint-method"]').select_option("POST")
+        page.wait_for_timeout(200)
+        assert schedule_puts == []
+        expect(page.locator('[data-field="action-error"]')).to_be_hidden()
+
+        path = page.locator('[data-field="endpoint-path"]')
+        path.fill("/api/tasks/summary")
+        path.blur()
+        _wait_for(
+            lambda: {
+                "action": "endpoint",
+                "endpoint_config": {"method": "POST", "endpoint": "/api/tasks/summary"},
+            } in schedule_puts,
+            page=page,
+        )
+        assert len(schedule_puts) == 1
+
+    def test_switching_to_notify_with_blank_message_sends_nothing_until_typed(self, page: Page, agents_base_url):
+        schedule_puts = []
+        board_state = _board_fixture()
+        board_state["lanes"]["scheduled"][0]["action"] = "endpoint"
+        board_state["lanes"]["scheduled"][0]["message_content"] = ""
+        board_state["lanes"]["scheduled"][0]["endpoint_config"] = {"method": "GET", "endpoint": "/api/tasks"}
+        _open_board(page, agents_base_url, board_state=board_state, schedule_puts=schedule_puts)
+        page.locator('[data-field="action"]').select_option("notify")
+        page.wait_for_timeout(200)
+        assert schedule_puts == []
+
+        page.locator('[data-field="message-content"]').fill("Good morning")
+        page.locator('[data-field="message-content"]').blur()
+        _wait_for(
+            lambda: {"action": "notify", "message_content": "Good morning"} in schedule_puts,
+            page=page,
+        )
+        assert len(schedule_puts) == 1
+
+    def test_invalid_path_holds_the_switch_locally_and_keeps_entered_inputs(self, page: Page, agents_base_url):
+        schedule_puts = []
+        board_state = _board_fixture()
+        _open_board(page, agents_base_url, board_state=board_state, schedule_puts=schedule_puts)  # notify, no endpoint_config
+        page.locator('[data-field="action"]').select_option("endpoint")
+        # Method stays at its default (GET, already valid) -- the path
+        # alone still doesn't satisfy the endpoint action (it doesn't start
+        # with "/api/"), so filling and blurring it holds the switch
+        # locally rather than sending a combined PUT the server would
+        # reject.
+        path = page.locator('[data-field="endpoint-path"]')
+        path.fill("not-a-route")
+        path.blur()
+        page.wait_for_timeout(200)
+        assert schedule_puts == []
+
+        expect(page.locator('[data-field="action-error"]')).to_be_hidden()
+        # The operator's own entry stays visible -- nothing reverts it.
+        expect(path).to_have_value("not-a-route")
+        expect(page.locator('[data-field="endpoint-params-error"]')).to_be_hidden()
+        # Nothing was ever written -- closing and reopening the drawer (a
+        # fresh render from the card's actual stored data) still shows the
+        # original action, not "endpoint".
+        assert board_state["lanes"]["scheduled"][0]["action"] == "notify"
+        page.locator('[data-action="drawer-close"]').click()
+        page.locator('[data-card-id="s1"]').click()
+        page.wait_for_selector('[data-field="action"]')
+        expect(page.locator('[data-field="action"]')).to_have_value("notify")
+        expect(page.locator('[data-field="message-content"]')).to_be_visible()
+
+    def test_server_rejection_of_a_satisfied_switch_shows_action_error_and_keeps_stored_action(self, page: Page, agents_base_url):
+        board_state = _board_fixture()  # notify, no endpoint_config
+        schedule_puts, trigger_calls = [], []
+        _stub_routes(page, board_state, schedule_puts, trigger_calls)
+
+        detail = "endpoint_config.method must be 'GET' or 'POST', got None"
+
+        def failing_put(route):
+            if route.request.method == "PUT" and "/api/scheduler/s1" in route.request.url:
+                try:
+                    body = json.loads(route.request.post_data or "{}")
+                except ValueError:
+                    body = {}
+                if "action" in body:
+                    route.fulfill(status=422, content_type="application/json", body=json.dumps({"detail": detail}))
+                    return
+            route.continue_()
+
+        page.route("**/api/scheduler/s1", failing_put)
+        page.goto(f"{agents_base_url}/agents")
+        page.wait_for_selector('[data-card-id="s1"]')
+        page.locator('[data-card-id="s1"]').click()
+        page.wait_for_selector('[data-field="action"]')
+
+        page.locator('[data-field="action"]').select_option("endpoint")
+        # Method stays at its default (GET) -- filling and blurring a valid
+        # "/api/"-prefixed path satisfies the endpoint action locally, so
+        # this blur is what fires the combined PUT the server rejects here.
+        path = page.locator('[data-field="endpoint-path"]')
+        path.fill("/api/tasks/summary")
+        path.blur()
+
+        error_el = page.locator('[data-field="action-error"]')
+        expect(error_el).to_be_visible(timeout=5000)
+        expect(error_el).to_contain_text(detail)
+        # The operator's own entry stays visible -- nothing reverts it.
+        expect(path).to_have_value("/api/tasks/summary")
+        # The rejected PUT never reached the store -- the card's stored
+        # action is unchanged.
+        assert board_state["lanes"]["scheduled"][0]["action"] == "notify"
+        page.locator('[data-action="drawer-close"]').click()
+        page.locator('[data-card-id="s1"]').click()
+        page.wait_for_selector('[data-field="action"]')
+        expect(page.locator('[data-field="action"]')).to_have_value("notify")
+        expect(page.locator('[data-field="message-content"]')).to_be_visible()
+
+
+class TestEndpointAction:
+    def test_params_invalid_json_shows_field_error_and_sends_nothing(self, page: Page, agents_base_url):
+        schedule_puts = []
+        board_state = _board_fixture()
+        board_state["lanes"]["scheduled"][0]["action"] = "endpoint"
+        board_state["lanes"]["scheduled"][0]["endpoint_config"] = {"method": "GET", "endpoint": "/api/tasks"}
+        _open_board(page, agents_base_url, board_state=board_state, schedule_puts=schedule_puts)
+        params = page.locator('[data-field="endpoint-params"]')
+        params.fill("{not json")
+        page.locator('[data-field="endpoint-path"]').click()  # blur
+        error_el = page.locator('[data-field="endpoint-params-error"]')
+        expect(error_el).to_be_visible(timeout=5000)
+        expect(error_el).to_contain_text("Invalid JSON")
+        page.wait_for_timeout(300)
+        assert schedule_puts == []
+
+    def test_params_non_object_value_shows_field_error_and_sends_nothing(self, page: Page, agents_base_url):
+        schedule_puts = []
+        board_state = _board_fixture()
+        board_state["lanes"]["scheduled"][0]["action"] = "endpoint"
+        board_state["lanes"]["scheduled"][0]["endpoint_config"] = {"method": "GET", "endpoint": "/api/tasks"}
+        _open_board(page, agents_base_url, board_state=board_state, schedule_puts=schedule_puts)
+        params = page.locator('[data-field="endpoint-params"]')
+        params.fill("[1, 2, 3]")
+        page.locator('[data-field="endpoint-path"]').click()  # blur
+        error_el = page.locator('[data-field="endpoint-params-error"]')
+        expect(error_el).to_be_visible(timeout=5000)
+        expect(error_el).to_contain_text("JSON object")
+        page.wait_for_timeout(300)
+        assert schedule_puts == []
+
+    def test_method_path_and_params_save_together_as_one_endpoint_config(self, page: Page, agents_base_url):
+        schedule_puts = []
+        board_state = _board_fixture()
+        board_state["lanes"]["scheduled"][0]["action"] = "endpoint"
+        board_state["lanes"]["scheduled"][0]["endpoint_config"] = {"method": "GET", "endpoint": "/api/tasks"}
+        _open_board(page, agents_base_url, board_state=board_state, schedule_puts=schedule_puts)
+        page.locator('[data-field="endpoint-path"]').fill("/api/tasks/summary")
+        page.locator('[data-field="endpoint-params"]').fill('{"status": "todo"}')
+        page.locator('[data-field="endpoint-method"]').select_option("POST")
+        _wait_for(
+            lambda: {"endpoint_config": {
+                "method": "POST", "endpoint": "/api/tasks/summary", "params": {"status": "todo"},
+            }} in schedule_puts,
+            page=page,
+        )
+
+    def test_server_rejection_shown_next_to_the_field_and_reverts_values(self, page: Page, agents_base_url):
+        schedule_puts = []
+        board_state = _board_fixture()
+        board_state["lanes"]["scheduled"][0]["action"] = "endpoint"
+        board_state["lanes"]["scheduled"][0]["endpoint_config"] = {"method": "GET", "endpoint": "/api/tasks"}
+        _open_board(page, agents_base_url, board_state=board_state, schedule_puts=schedule_puts)
+        page.locator('[data-field="endpoint-path"]').fill("not-a-route")
+        page.locator('[data-field="endpoint-params"]').click()  # blur path
+        error_el = page.locator('[data-field="endpoint-params-error"]')
+        expect(error_el).to_be_visible(timeout=5000)
+        expect(error_el).to_contain_text("must start with '/api/'")
+        expect(page.locator('[data-field="endpoint-path"]')).to_have_value("/api/tasks")
+
+    def test_absent_params_saves_endpoint_config_without_a_params_key(self, page: Page, agents_base_url):
+        schedule_puts = []
+        board_state = _board_fixture()
+        board_state["lanes"]["scheduled"][0]["action"] = "endpoint"
+        board_state["lanes"]["scheduled"][0]["endpoint_config"] = {"method": "GET", "endpoint": "/api/tasks"}
+        _open_board(page, agents_base_url, board_state=board_state, schedule_puts=schedule_puts)
+        page.locator('[data-field="endpoint-path"]').fill("/api/tasks/summary")
+        page.locator('[data-field="endpoint-params"]').click()  # blur path
+        _wait_for(
+            lambda: {"endpoint_config": {"method": "GET", "endpoint": "/api/tasks/summary"}} in schedule_puts,
+            page=page,
+        )
+
+
+class TestAgentExecutionContext:
+    def test_persona_and_working_dir_save_on_blur(self, page: Page, agents_base_url):
+        schedule_puts = []
+        board_state = _board_fixture()
+        board_state["lanes"]["scheduled"][0]["action"] = "agent"
+        board_state["lanes"]["scheduled"][0]["message_content"] = "Draft the update"
+        _open_board(page, agents_base_url, board_state=board_state, schedule_puts=schedule_puts)
+        page.locator('[data-field="exec-context"] summary').click()  # expand <details>
+        page.locator('[data-field="persona-id"]').fill("primary")
+        page.locator('[data-field="working-dir"]').click()  # blur persona
+        _wait_for(lambda: {"persona_id": "primary"} in schedule_puts, page=page)
+
+        page.locator('[data-field="working-dir"]').fill("/tmp/synthetic-project")
+        page.locator('[data-field="persona-id"]').click()  # blur working dir
+        _wait_for(lambda: {"working_dir": "/tmp/synthetic-project"} in schedule_puts, page=page)
+
+    def test_effort_select_saves_on_change(self, page: Page, agents_base_url):
+        schedule_puts = []
+        board_state = _board_fixture()
+        board_state["lanes"]["scheduled"][0]["action"] = "agent"
+        board_state["lanes"]["scheduled"][0]["message_content"] = "Draft the update"
+        _open_board(page, agents_base_url, board_state=board_state, schedule_puts=schedule_puts)
+        page.locator('[data-field="exec-context"] summary').click()
+        page.locator('[data-field="effort-id"]').select_option("high")
+        _wait_for(lambda: {"effort": "high"} in schedule_puts, page=page)
+
+    def test_clearing_a_field_saves_an_empty_value(self, page: Page, agents_base_url):
+        schedule_puts = []
+        board_state = _board_fixture()
+        board_state["lanes"]["scheduled"][0]["action"] = "agent"
+        board_state["lanes"]["scheduled"][0]["message_content"] = "Draft the update"
+        board_state["lanes"]["scheduled"][0]["persona_id"] = "primary"
+        _open_board(page, agents_base_url, board_state=board_state, schedule_puts=schedule_puts)
+        page.locator('[data-field="exec-context"] summary').click()
+        persona = page.locator('[data-field="persona-id"]')
+        expect(persona).to_have_value("primary")
+        persona.fill("")
+        page.locator('[data-field="working-dir"]').click()  # blur
+        _wait_for(lambda: {"persona_id": ""} in schedule_puts, page=page)
+
+    def test_task_description_save_failure_shows_toast_and_reverts(self, page: Page, agents_base_url):
+        board_state = _board_fixture()
+        board_state["lanes"]["scheduled"][0]["action"] = "agent"
+        board_state["lanes"]["scheduled"][0]["message_content"] = "Draft the update"
+        schedule_puts, trigger_calls = [], []
+        _stub_routes(page, board_state, schedule_puts, trigger_calls)
+
+        def failing_put(route):
+            if route.request.method == "PUT" and "/api/scheduler/s1" in route.request.url:
+                route.fulfill(status=422, content_type="application/json", body=json.dumps({"detail": "message_content must not be blank"}))
+            else:
+                route.continue_()
+
+        page.route("**/api/scheduler/s1", failing_put)
+        page.goto(f"{agents_base_url}/agents")
+        page.wait_for_selector('[data-card-id="s1"]')
+        page.locator('[data-card-id="s1"]').click()
+        page.wait_for_selector('[data-field="message-content"]')
+
+        msg = page.locator('[data-field="message-content"]')
+        msg.fill("")
+        page.locator('[data-field="executor"]').click()  # blur
+        toast = page.locator(".toast.error")
+        expect(toast).to_be_visible(timeout=5000)
+        expect(toast).to_contain_text("message_content must not be blank")
+        expect(msg).to_have_value("Draft the update")
+
+
+class TestActionChip:
+    def test_notify_chip(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)  # fixture default action is "notify"
+        chip = page.locator('[data-card-id="s1"] .board-chip').first
+        expect(chip).to_have_text("notify")
+
+    def test_prompt_chip(self, page: Page, agents_base_url):
+        board_state = _board_fixture()
+        board_state["lanes"]["scheduled"][0]["action"] = "prompt"
+        _stub_routes(page, board_state, [], [])
+        page.goto(f"{agents_base_url}/agents")
+        page.wait_for_selector('[data-card-id="s1"]')
+        chip = page.locator('[data-card-id="s1"] .board-chip').first
+        expect(chip).to_have_text("prompt")
+
+    def test_endpoint_chip_shows_method_and_path(self, page: Page, agents_base_url):
+        board_state = _board_fixture()
+        board_state["lanes"]["scheduled"][0]["action"] = "endpoint"
+        board_state["lanes"]["scheduled"][0]["endpoint_config"] = {"method": "POST", "endpoint": "/api/tasks"}
+        _stub_routes(page, board_state, [], [])
+        page.goto(f"{agents_base_url}/agents")
+        page.wait_for_selector('[data-card-id="s1"]')
+        chip = page.locator('[data-card-id="s1"] .board-chip').first
+        expect(chip).to_have_text("endpoint: POST /api/tasks")
+
+    def test_endpoint_chip_truncates_a_long_path_and_keeps_the_full_path_as_the_title(self, page: Page, agents_base_url):
+        long_path = "/api/" + ("x" * 50)
+        board_state = _board_fixture()
+        board_state["lanes"]["scheduled"][0]["action"] = "endpoint"
+        board_state["lanes"]["scheduled"][0]["endpoint_config"] = {"method": "GET", "endpoint": long_path}
+        _stub_routes(page, board_state, [], [])
+        page.goto(f"{agents_base_url}/agents")
+        page.wait_for_selector('[data-card-id="s1"]')
+        chip = page.locator('[data-card-id="s1"] .board-chip').first
+        text = chip.text_content()
+        assert text.startswith("endpoint: GET " + long_path[:40])
+        assert text.endswith("…")
+        assert long_path not in text
+        assert chip.get_attribute("title") == long_path
+
+    def test_agent_chip_shows_executor(self, page: Page, agents_base_url):
+        board_state = _board_fixture()
+        board_state["lanes"]["scheduled"][0]["action"] = "agent"
+        board_state["lanes"]["scheduled"][0]["executor"] = "cloud"
+        _stub_routes(page, board_state, [], [])
+        page.goto(f"{agents_base_url}/agents")
+        page.wait_for_selector('[data-card-id="s1"]')
+        chip = page.locator('[data-card-id="s1"] .board-chip').first
+        expect(chip).to_have_text("agent: cloud")
+
+    def test_agent_chip_shows_default_when_no_executor(self, page: Page, agents_base_url):
+        board_state = _board_fixture()
+        board_state["lanes"]["scheduled"][0]["action"] = "agent"
+        board_state["lanes"]["scheduled"][0]["executor"] = ""
+        _stub_routes(page, board_state, [], [])
+        page.goto(f"{agents_base_url}/agents")
+        page.wait_for_selector('[data-card-id="s1"]')
+        chip = page.locator('[data-card-id="s1"] .board-chip').first
+        expect(chip).to_have_text("agent: default")
+

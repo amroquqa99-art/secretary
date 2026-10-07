@@ -1,0 +1,388 @@
+"""
+Tests for Document Summarization (P9.4).
+
+Tests the summarizer service for generating document summaries.
+"""
+import pytest
+from unittest.mock import patch, MagicMock
+
+# Most tests in this file are fast unit tests
+pytestmark = pytest.mark.unit
+
+
+class TestGenerateSummary:
+    """Test the generate_summary function."""
+
+    def test_returns_none_for_short_content(self):
+        """Should return None for content < 100 chars."""
+        from api.services.summarizer import generate_summary
+
+        summary, success = generate_summary("Short content.", "test.md")
+        assert summary is None
+        assert success is True  # Not a failure, just skipped
+
+    def test_returns_none_for_empty_content(self):
+        """Should return None for empty content."""
+        from api.services.summarizer import generate_summary
+
+        summary, success = generate_summary("", "test.md")
+        assert summary is None
+        assert success is True  # Not a failure, just skipped
+
+    @patch("api.services.summarizer.httpx.Client")
+    def test_calls_llm_with_prompt(self, mock_client_class):
+        """Should POST a chat completion to the local LLM with the prompt."""
+        from api.services.summarizer import generate_summary
+
+        # Setup mock
+        mock_client = MagicMock()
+        mock_client_class.return_value.__enter__ = MagicMock(return_value=mock_client)
+        mock_client_class.return_value.__exit__ = MagicMock(return_value=False)
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "choices": [{
+                "message": {
+                    "content": "This is a meeting note about Q4 budget planning with Kevin and Sarah."
+                }
+            }]
+        }
+        mock_client.post.return_value = mock_response
+
+        # Call function
+        content = "Long content " * 20  # > 100 chars
+        summary, success = generate_summary(content, "test.md")
+
+        # Verify
+        assert summary is not None
+        assert "meeting note" in summary.lower() or "budget" in summary.lower()
+        mock_client.post.assert_called_once()
+        # Hits the OpenAI-compatible chat endpoint, not legacy Ollama /api/generate.
+        call_args = mock_client.post.call_args
+        url = call_args[0][0]
+        assert url.endswith("/v1/chat/completions")
+
+    @patch("api.services.summarizer.httpx.Client")
+    def test_truncates_long_content(self, mock_client_class):
+        """Should truncate content to max_content_chars."""
+        from api.services.summarizer import generate_summary
+
+        # Setup mock
+        mock_client = MagicMock()
+        mock_client_class.return_value.__enter__ = MagicMock(return_value=mock_client)
+        mock_client_class.return_value.__exit__ = MagicMock(return_value=False)
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "choices": [{"message": {"content": "A valid summary text here."}}]
+        }
+        mock_client.post.return_value = mock_response
+
+        # Call with very long content
+        long_content = "A" * 5000
+        generate_summary(long_content, "test.md", max_content_chars=2000)
+
+        # Verify the call was made with truncated content
+        call_args = mock_client.post.call_args
+        payload = call_args[1]["json"]
+        # OpenAI chat format: prompt lives inside messages[0].content
+        prompt = payload["messages"][0]["content"]
+        assert "[... content truncated ...]" in prompt
+
+    @patch("api.services.summarizer.httpx.Client")
+    def test_returns_none_on_timeout(self, mock_client_class):
+        """Should return (None, False) on LLM timeout for retry tracking."""
+        import httpx
+        from api.services.summarizer import generate_summary
+
+        # Setup mock to raise timeout
+        mock_client = MagicMock()
+        mock_client_class.return_value.__enter__ = MagicMock(return_value=mock_client)
+        mock_client_class.return_value.__exit__ = MagicMock(return_value=False)
+        mock_client.post.side_effect = httpx.TimeoutException("timeout")
+
+        # Content must be > 100 chars to avoid early return
+        content = "This is some real content about meeting notes with Kevin and Sarah. " * 3 + "\n\nMore content here."
+        summary, success = generate_summary(content, "meeting.md")
+
+        # Should return None with failure flag for retry
+        assert summary is None
+        assert success is False
+
+    @patch("api.services.summarizer.httpx.Client")
+    def test_returns_none_on_connection_error(self, mock_client_class):
+        """Should return (None, False) on connection error for retry tracking."""
+        import httpx
+        from api.services.summarizer import generate_summary
+
+        # Setup mock to raise connection error
+        mock_client = MagicMock()
+        mock_client_class.return_value.__enter__ = MagicMock(return_value=mock_client)
+        mock_client_class.return_value.__exit__ = MagicMock(return_value=False)
+        mock_client.post.side_effect = httpx.ConnectError("connection failed")
+
+        # Content must be > 100 chars to avoid early return
+        content = "Document content here with enough length to process. " * 3 + "This is important project documentation."
+        summary, success = generate_summary(content, "notes.md")
+
+        # Should return None with failure flag for retry
+        assert summary is None
+        assert success is False
+
+
+class TestFallbackSummary:
+    """Test the _fallback_summary function."""
+
+    def test_extracts_first_meaningful_line(self):
+        """Should use first non-header, non-frontmatter line."""
+        from api.services.summarizer import _fallback_summary
+
+        content = """---
+tags: [test]
+---
+
+# Header
+
+This is the first real content line that should be used for the fallback summary.
+
+More content here.
+"""
+        result = _fallback_summary(content, "test.md")
+
+        assert "test.md" in result
+        assert "first real content line" in result
+
+    def test_skips_headers(self):
+        """Should skip header lines starting with #."""
+        from api.services.summarizer import _fallback_summary
+
+        content = """# Main Header
+## Subheader
+This is the actual content.
+"""
+        result = _fallback_summary(content, "test.md")
+        assert "actual content" in result
+
+    def test_handles_only_headers(self):
+        """Should return generic fallback if only headers."""
+        from api.services.summarizer import _fallback_summary
+
+        content = """# Header
+## Subheader
+### Another header
+"""
+        result = _fallback_summary(content, "test.md")
+        assert "test.md" in result
+        assert "various notes" in result
+
+    def test_truncates_long_lines(self):
+        """Should truncate lines longer than 150 chars."""
+        from api.services.summarizer import _fallback_summary
+
+        long_line = "A" * 200
+        content = f"# Header\n\n{long_line}"
+        result = _fallback_summary(content, "test.md")
+
+        # Should have ellipsis and not the full line
+        assert "..." in result
+        assert len(result) < 200
+
+
+class TestIsSummarizerLLMAvailable:
+    """Test the is_summarizer_llm_available function."""
+
+    @patch("api.services.summarizer.httpx.Client")
+    def test_returns_true_when_available(self, mock_client_class):
+        """Should return True when the local LLM server responds."""
+        from api.services.summarizer import is_summarizer_llm_available
+
+        mock_client = MagicMock()
+        mock_client_class.return_value.__enter__ = MagicMock(return_value=mock_client)
+        mock_client_class.return_value.__exit__ = MagicMock(return_value=False)
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_client.get.return_value = mock_response
+
+        assert is_summarizer_llm_available() is True
+
+    @patch("api.services.summarizer.httpx.Client")
+    def test_returns_false_on_error(self, mock_client_class):
+        """Should return False when the local LLM server fails."""
+        from api.services.summarizer import is_summarizer_llm_available
+
+        mock_client = MagicMock()
+        mock_client_class.return_value.__enter__ = MagicMock(return_value=mock_client)
+        mock_client_class.return_value.__exit__ = MagicMock(return_value=False)
+        mock_client.get.side_effect = Exception("connection failed")
+
+        assert is_summarizer_llm_available() is False
+
+
+class TestCreateSummaryChunk:
+    """Test the create_summary_chunk function."""
+
+    def test_creates_chunk_with_correct_fields(self):
+        """Should create chunk with all required fields."""
+        from api.services.summarizer import create_summary_chunk
+
+        chunk = create_summary_chunk(
+            summary="This is a test summary.",
+            file_path="/path/to/test.md",
+            file_name="test.md",
+            metadata={"people": ["Alice"], "tags": ["test"]}
+        )
+
+        assert chunk["content"] == "Document summary for test.md: This is a test summary."
+        assert chunk["chunk_index"] == -1
+        assert chunk["is_summary"] is True
+        assert chunk["file_path"] == "/path/to/test.md"
+        assert chunk["file_name"] == "test.md"
+        assert chunk["metadata"]["is_summary"] is True
+        assert chunk["metadata"]["chunk_type"] == "summary"
+        assert chunk["metadata"]["people"] == ["Alice"]
+
+
+class TestSummarizerIntegration:
+    """Integration tests with the local LLM server (requires llama-server running)."""
+
+    @pytest.mark.slow
+    @pytest.mark.integration
+    def test_real_summary_generation(self):
+        """Test actual summary generation against the local LLM server."""
+        from api.services.summarizer import generate_summary, is_summarizer_llm_available
+
+        if not is_summarizer_llm_available():
+            pytest.skip("Local LLM server not available")
+
+        content = """# Meeting Notes - Q4 Budget Review
+
+Date: 2025-01-13
+Attendees: Kevin, Sarah, John
+
+## Summary
+We discussed the Q4 budget projections and identified cost reduction opportunities.
+
+## Key Decisions
+- Budget for 2025 increased by 15%
+- New ML infrastructure approved
+- Headcount freeze extended to Q2
+
+## Action Items
+- [ ] Kevin: Finalize budget spreadsheet
+- [ ] Sarah: Review vendor contracts
+"""
+
+        summary, success = generate_summary(content, "Q4 Budget Review.md")
+
+        # Should return a summary
+        assert summary is not None
+        assert success is True
+        assert len(summary) >= 20
+        assert len(summary) <= 500
+        # Should mention key topics
+        assert any(word in summary.lower() for word in ["budget", "meeting", "q4", "review"])
+
+
+class TestSummarizerEndpointConfig:
+    """The summarizer endpoint/model override, and its fallback.
+
+    llama-server serves one model per process and ignores the request's
+    "model" field; Ollama requires a real tag. Hosts with no llama-server
+    (Taylor's Mac mini) otherwise fail every summary with connection refused,
+    silently dropping the vault index's whole summary layer.
+    """
+
+    def _mock_post(self, mock_client_class, content="A summary that is comfortably long enough."):
+        mock_client = MagicMock()
+        mock_client_class.return_value.__enter__ = MagicMock(return_value=mock_client)
+        mock_client_class.return_value.__exit__ = MagicMock(return_value=False)
+        resp = MagicMock()
+        resp.json.return_value = {"choices": [{"message": {"content": content}}]}
+        resp.raise_for_status = MagicMock()
+        mock_client.post.return_value = resp
+        return mock_client
+
+    @patch("api.services.summarizer.httpx.Client")
+    def test_defaults_preserve_llama_server_behaviour(self, mock_client_class, monkeypatch):
+        """Unset override => local_llm_url and the 'local' placeholder model."""
+        from config.settings import settings
+        from api.services import summarizer
+
+        monkeypatch.setattr(settings, "summarizer_llm_url", "", raising=False)
+        monkeypatch.setattr(settings, "summarizer_model", "local", raising=False)
+        monkeypatch.setattr(settings, "local_llm_url", "http://localhost:8080", raising=False)
+
+        client = self._mock_post(mock_client_class)
+        summarizer.generate_summary("x" * 200, "note.md")
+
+        url, kwargs = client.post.call_args[0][0], client.post.call_args[1]
+        assert url == "http://localhost:8080/v1/chat/completions"
+        assert kwargs["json"]["model"] == "local"
+
+    @patch("api.services.summarizer.httpx.Client")
+    def test_override_redirects_endpoint_and_model(self, mock_client_class, monkeypatch):
+        from config.settings import settings
+        from api.services import summarizer
+
+        monkeypatch.setattr(settings, "summarizer_llm_url", "http://localhost:11434", raising=False)
+        monkeypatch.setattr(settings, "summarizer_model", "qwen2.5:3b-instruct", raising=False)
+        monkeypatch.setattr(settings, "local_llm_url", "http://localhost:8080", raising=False)
+
+        client = self._mock_post(mock_client_class)
+        summarizer.generate_summary("x" * 200, "note.md")
+
+        url, kwargs = client.post.call_args[0][0], client.post.call_args[1]
+        assert url == "http://localhost:11434/v1/chat/completions"
+        assert kwargs["json"]["model"] == "qwen2.5:3b-instruct"
+
+    def test_trailing_slash_does_not_double_up(self, monkeypatch):
+        from config.settings import settings
+        from api.services.summarizer import _summarizer_base_url
+
+        monkeypatch.setattr(settings, "summarizer_llm_url", "http://localhost:11434/", raising=False)
+        assert _summarizer_base_url() == "http://localhost:11434"
+
+    @patch("api.services.summarizer.httpx.Client")
+    def test_availability_accepts_ollama_via_v1_models(self, mock_client_class, monkeypatch):
+        """Ollama has no /health; probing only that would call it unavailable."""
+        from config.settings import settings
+        from api.services.summarizer import is_summarizer_llm_available
+
+        monkeypatch.setattr(settings, "summarizer_llm_url", "http://localhost:11434", raising=False)
+
+        mock_client = MagicMock()
+        mock_client_class.return_value.__enter__ = MagicMock(return_value=mock_client)
+        mock_client_class.return_value.__exit__ = MagicMock(return_value=False)
+
+        def get(url):
+            r = MagicMock()
+            r.status_code = 404 if url.endswith("/health") else 200
+            return r
+
+        mock_client.get.side_effect = get
+        assert is_summarizer_llm_available() is True
+
+    @patch("api.services.summarizer.httpx.Client")
+    def test_availability_still_accepts_llama_server_health(self, mock_client_class, monkeypatch):
+        from config.settings import settings
+        from api.services.summarizer import is_summarizer_llm_available
+
+        monkeypatch.setattr(settings, "summarizer_llm_url", "", raising=False)
+        monkeypatch.setattr(settings, "local_llm_url", "http://localhost:8080", raising=False)
+
+        mock_client = MagicMock()
+        mock_client_class.return_value.__enter__ = MagicMock(return_value=mock_client)
+        mock_client_class.return_value.__exit__ = MagicMock(return_value=False)
+        resp = MagicMock()
+        resp.status_code = 200
+        mock_client.get.return_value = resp
+
+        assert is_summarizer_llm_available() is True
+        assert mock_client.get.call_args_list[0][0][0].endswith("/health")
+
+    @patch("api.services.summarizer.httpx.Client")
+    def test_availability_false_when_neither_probe_answers(self, mock_client_class, monkeypatch):
+        from config.settings import settings
+        from api.services.summarizer import is_summarizer_llm_available
+
+        monkeypatch.setattr(settings, "summarizer_llm_url", "", raising=False)
+        mock_client_class.side_effect = Exception("connection refused")
+        assert is_summarizer_llm_available() is False

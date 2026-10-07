@@ -1,0 +1,1433 @@
+"""
+Tests for the Scheduler Store and Scheduler (renamed from the reminder store).
+
+Covers CRUD, cron computation, auto-disable, due detection, suppression,
+prompt execution, the markdown round-trip, markdown-as-source-of-truth, and
+the auto-generated dashboard.
+"""
+import multiprocessing
+import threading
+
+import pytest
+from datetime import datetime, timezone, timedelta
+from unittest.mock import patch, AsyncMock, MagicMock
+
+from api.services.scheduler_store import (
+    SchedulerStore,
+    SchedulerScheduler,
+    ScheduleEntry,
+    compute_next_trigger,
+    compute_next_n_triggers,
+    _format_entry_line,
+    _parse_entry_line,
+    _format_cron_human,
+    _format_dt_short,
+)
+
+pytestmark = pytest.mark.unit
+
+
+def _create_schedule_operation_process(vault, index, start, results, name):
+    try:
+        candidate = SchedulerStore(vault_path=vault, index_path=index)
+        start.wait()
+        entry, created = candidate.create_or_find_by_operation(
+            "pebble:process-schedule", name=name,
+            schedule_type="cron", schedule_value="0 9 * * *",
+        )
+        results.put((entry.id, created, ""))
+    except Exception as exc:  # pragma: no cover - surfaced in parent
+        results.put(("", False, repr(exc)))
+
+
+@pytest.fixture
+def store(tmp_path):
+    return SchedulerStore(
+        vault_path=tmp_path / "vault",
+        index_path=tmp_path / "scheduler_index.json",
+    )
+
+
+class TestSchedulerStoreCRUD:
+    def test_create_or_find_by_operation_survives_index_rebuild(self, store, tmp_path):
+        first, created = store.create_or_find_by_operation(
+            "pebble:synthetic-source:capture-a:1",
+            name="Synthetic reminder",
+            schedule_type="cron",
+            schedule_value="0 9 * * *",
+            message_content="Synthetic reminder",
+        )
+        assert created is True
+
+        rebuilt = SchedulerStore(
+            vault_path=tmp_path / "vault", index_path=tmp_path / "scheduler_index.json"
+        )
+        second, created = rebuilt.create_or_find_by_operation(
+            "pebble:synthetic-source:capture-a:1",
+            name="Should not be used",
+            schedule_type="cron",
+            schedule_value="0 10 * * *",
+        )
+        assert created is False
+        assert second.id == first.id
+
+    def test_operation_retry_reconciles_markdown_after_pre_cache_crash(
+        self, store, monkeypatch
+    ):
+        original = store._insert_block_at_top
+
+        def commit_then_crash(*args, **kwargs):
+            original(*args, **kwargs)
+            raise RuntimeError("synthetic post-markdown pre-cache crash")
+
+        monkeypatch.setattr(store, "_insert_block_at_top", commit_then_crash)
+        with pytest.raises(RuntimeError, match="post-markdown"):
+            store.create_or_find_by_operation(
+                "pebble:synthetic:crash:schedule",
+                name="Synthetic reminder",
+                schedule_type="cron",
+                schedule_value="0 9 * * *",
+            )
+        monkeypatch.setattr(store, "_insert_block_at_top", original)
+
+        entry, created = store.create_or_find_by_operation(
+            "pebble:synthetic:crash:schedule",
+            name="Duplicate",
+            schedule_type="cron",
+            schedule_value="0 10 * * *",
+        )
+        assert created is False
+        assert entry.name == "Synthetic reminder"
+
+    def test_operation_create_is_atomic_across_independent_stores(self, tmp_path):
+        vault = tmp_path / "vault"
+        index = tmp_path / "scheduler.json"
+        stores = [
+            SchedulerStore(vault_path=vault, index_path=index),
+            SchedulerStore(vault_path=vault, index_path=index),
+        ]
+        barrier = threading.Barrier(2)
+        results = []
+        errors = []
+
+        def create(candidate, name):
+            try:
+                barrier.wait()
+                results.append(candidate.create_or_find_by_operation(
+                    "pebble:atomic-schedule",
+                    name=name,
+                    schedule_type="cron",
+                    schedule_value="0 9 * * *",
+                ))
+            except Exception as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=create, args=(stores[0], "Synthetic A")),
+            threading.Thread(target=create, args=(stores[1], "Synthetic B")),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert errors == []
+        assert sum(created for _entry, created in results) == 1
+        assert len({entry.id for entry, _created in results}) == 1
+        rebuilt = SchedulerStore(vault_path=vault, index_path=index)
+        assert len(rebuilt.list_all()) == 1
+
+    def test_operation_create_is_atomic_across_processes(self, tmp_path):
+        context = multiprocessing.get_context("spawn")
+        vault = tmp_path / "vault"
+        index = tmp_path / "scheduler.json"
+        start = context.Event()
+        results = context.Queue()
+        processes = [
+            context.Process(
+                target=_create_schedule_operation_process,
+                args=(str(vault), str(index), start, results, f"Synthetic {number}"),
+            )
+            for number in range(2)
+        ]
+        for process in processes:
+            process.start()
+        start.set()
+        observed = [results.get(timeout=10) for _ in processes]
+        for process in processes:
+            process.join(timeout=10)
+            assert process.exitcode == 0
+        assert [error for _id, _created, error in observed if error] == []
+        assert sum(created for _id, created, _error in observed) == 1
+        assert len({entry_id for entry_id, _created, _error in observed}) == 1
+        rebuilt = SchedulerStore(vault_path=vault, index_path=index)
+        assert len(rebuilt.list_all()) == 1
+
+    def test_create_schedule(self, store):
+        entry = store.create(
+            name="Test Schedule",
+            schedule_type="cron",
+            schedule_value="0 9 * * *",
+            message_type="static",
+            message_content="Hello!",
+        )
+        assert entry.id
+        assert entry.name == "Test Schedule"
+        assert entry.enabled is True
+        assert entry.created_at
+        assert entry.action == "notify"  # mapped from static
+
+    def test_create_with_explicit_action(self, store):
+        entry = store.create(
+            name="Agent job",
+            schedule_type="cron",
+            schedule_value="0 9 * * 6",
+            action="agent",
+            executor="cloud",
+            message_content="Draft my weekly review",
+        )
+        assert entry.action == "agent"
+        assert entry.executor == "cloud"
+
+    def test_get(self, store):
+        created = store.create(
+            name="Test", schedule_type="once",
+            schedule_value=(datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+            message_type="static", message_content="Hi",
+        )
+        found = store.get(created.id)
+        assert found is not None and found.name == "Test"
+
+    def test_get_nonexistent(self, store):
+        assert store.get("nope") is None
+
+    def test_list_all(self, store):
+        store.create(name="A", schedule_type="cron", schedule_value="0 9 * * *",
+                     message_type="static", message_content="a")
+        store.create(name="B", schedule_type="cron", schedule_value="0 10 * * *",
+                     message_type="static", message_content="b")
+        assert len(store.list_all()) == 2
+
+    def test_update(self, store):
+        created = store.create(name="Original", schedule_type="cron",
+                               schedule_value="0 9 * * *", message_type="static",
+                               message_content="Hello")
+        updated = store.update(created.id, name="Updated", message_content="Bye")
+        assert updated.name == "Updated"
+        assert updated.message_content == "Bye"
+
+    def test_update_nonexistent(self, store):
+        assert store.update("nope", name="X") is None
+
+    def test_delete(self, store):
+        created = store.create(name="Delete Me", schedule_type="once",
+                               schedule_value=(datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+                               message_type="static", message_content="Hi")
+        assert store.delete(created.id) is True
+        assert store.get(created.id) is None
+
+    def test_delete_nonexistent(self, store):
+        assert store.delete("nope") is False
+
+
+class TestMarkdownSourceOfTruth:
+    """Markdown (Inbox.md) is the source of truth; the index is a cache."""
+
+    def test_create_writes_inbox_line(self, store):
+        entry = store.create(name="Water plants", schedule_type="cron",
+                             schedule_value="0 18 * * *", message_type="static",
+                             message_content="hydrate")
+        content = store.inbox_path.read_text(encoding="utf-8")
+        assert f"<!-- id:{entry.id} -->" in content
+        assert "Water plants" in content
+        assert "[cron:: 0 18 * * *]" in content
+
+    def test_external_edit_reflected_on_reindex(self, store):
+        entry = store.create(name="Daily", schedule_type="cron",
+                             schedule_value="0 9 * * *", message_type="static",
+                             message_content="x")
+        # Externally edit the cron value in the markdown line.
+        content = store.inbox_path.read_text(encoding="utf-8")
+        patched = content.replace("[cron:: 0 9 * * *]", "[cron:: 0 10 * * *]")
+        store.inbox_path.write_text(patched, encoding="utf-8")
+
+        store.reindex_file(str(store.inbox_path))
+        assert store.get(entry.id).schedule_value == "0 10 * * *"
+
+    def test_external_checkbox_toggle_disables(self, store):
+        entry = store.create(name="Toggle", schedule_type="cron",
+                             schedule_value="0 9 * * *", message_type="static",
+                             message_content="x")
+        content = store.inbox_path.read_text(encoding="utf-8")
+        patched = content.replace("- [ ] Toggle", "- [x] Toggle")
+        store.inbox_path.write_text(patched, encoding="utf-8")
+
+        store.reindex_file(str(store.inbox_path))
+        assert store.get(entry.id).enabled is False
+
+    def test_reindex_preserves_message_content(self, store):
+        """An edit to a definition field leaves the instruction body intact."""
+        entry = store.create(name="Briefing", schedule_type="cron",
+                             schedule_value="0 9 * * *", message_type="prompt",
+                             message_content="What's on my calendar?")
+        # Editing only the cron field (body untouched) must not wipe the content.
+        content = store.inbox_path.read_text(encoding="utf-8")
+        patched = content.replace("[cron:: 0 9 * * *]", "[cron:: 30 9 * * *]")
+        store.inbox_path.write_text(patched, encoding="utf-8")
+
+        store.reindex_file(str(store.inbox_path))
+        refreshed = store.get(entry.id)
+        assert refreshed.schedule_value == "30 9 * * *"
+        assert refreshed.message_content == "What's on my calendar?"
+
+    def test_create_writes_message_content_to_markdown(self, store):
+        """The instruction text is human-readable in Inbox.md, not just the cache."""
+        store.create(name="Briefing", schedule_type="cron", schedule_value="0 9 * * *",
+                     message_type="prompt", message_content="What's on my calendar?")
+        content = store.inbox_path.read_text(encoding="utf-8")
+        assert "> What's on my calendar?" in content
+
+    def test_external_edit_message_content_round_trips(self, store):
+        """Hand-editing the instruction body in markdown updates the cache on reindex."""
+        entry = store.create(name="Briefing", schedule_type="cron",
+                             schedule_value="0 9 * * *", message_type="prompt",
+                             message_content="old instruction")
+        content = store.inbox_path.read_text(encoding="utf-8")
+        patched = content.replace("> old instruction", "> new instruction")
+        assert patched != content  # sanity: the body line was present to edit
+        store.inbox_path.write_text(patched, encoding="utf-8")
+
+        store.reindex_file(str(store.inbox_path))
+        assert store.get(entry.id).message_content == "new instruction"
+
+    def test_multiline_message_content_round_trips(self, store, tmp_path):
+        """Multi-line instructions survive a full rebuild from markdown."""
+        multiline = "Line one.\n\nLine three after a blank."
+        store.create(name="Multi", schedule_type="cron", schedule_value="0 9 * * *",
+                     message_type="prompt", message_content=multiline)
+        # A fresh store rebuilds purely from the vault markdown.
+        store2 = SchedulerStore(
+            vault_path=tmp_path / "vault",
+            index_path=tmp_path / "scheduler_index_multi.json",
+        )
+        names = {e.name: e for e in store2.list_all()}
+        assert names["Multi"].message_content == multiline
+
+    def test_delete_removes_body_lines(self, store):
+        """Deleting a schedule removes its body block, not just the checkbox line."""
+        entry = store.create(name="Doomed", schedule_type="cron", schedule_value="0 9 * * *",
+                             message_type="prompt", message_content="erase me")
+        store.delete(entry.id)
+        content = store.inbox_path.read_text(encoding="utf-8")
+        assert "erase me" not in content
+        assert entry.id not in content
+
+    def test_rebuild_index_from_markdown(self, store, tmp_path):
+        store.create(name="Persist", schedule_type="cron", schedule_value="0 9 * * *",
+                     message_type="static", message_content="hi")
+        # A fresh store over the same vault reads the markdown back.
+        store2 = SchedulerStore(
+            vault_path=tmp_path / "vault",
+            index_path=tmp_path / "scheduler_index2.json",
+        )
+        names = {e.name for e in store2.list_all()}
+        assert "Persist" in names
+
+
+class TestEndpointConfigVaultRoundTrip:
+    """The endpoint route, method, and params round-trip through the vault line."""
+
+    def test_create_writes_endpoint_and_params_fields(self, store):
+        store.create(
+            name="Pause internet", schedule_type="cron", schedule_value="0 22 * * *",
+            message_type="endpoint",
+            endpoint_config={
+                "endpoint": "/api/home/eero/Kid-iPad/pause", "method": "POST",
+                "params": {"scheduled": True},
+            },
+        )
+        content = store.inbox_path.read_text(encoding="utf-8")
+        assert "[endpoint:: POST /api/home/eero/Kid-iPad/pause]" in content
+        assert '[params:: {"scheduled":true}]' in content
+
+    def test_empty_params_omits_params_field(self, store):
+        store.create(
+            name="Status poll", schedule_type="cron", schedule_value="0 * * * *",
+            message_type="endpoint",
+            endpoint_config={"endpoint": "/health", "method": "GET", "params": {}},
+        )
+        content = store.inbox_path.read_text(encoding="utf-8")
+        assert "[endpoint:: GET /health]" in content
+        assert "[params::" not in content
+
+    def test_non_endpoint_schedule_has_no_endpoint_or_params_fields(self, store):
+        store.create(name="Water plants", schedule_type="cron", schedule_value="0 18 * * *",
+                     message_type="static", message_content="hydrate")
+        content = store.inbox_path.read_text(encoding="utf-8")
+        assert "[endpoint::" not in content
+        assert "[params::" not in content
+
+    def test_update_rewrites_endpoint_fields(self, store):
+        entry = store.create(
+            name="Poll", schedule_type="cron", schedule_value="0 * * * *",
+            message_type="endpoint",
+            endpoint_config={"endpoint": "/health", "method": "GET", "params": {}},
+        )
+        store.update(entry.id, endpoint_config={
+            "endpoint": "/api/other", "method": "POST", "params": {"x": 1},
+        })
+        content = store.inbox_path.read_text(encoding="utf-8")
+        assert "[endpoint:: POST /api/other]" in content
+        assert '[params:: {"x":1}]' in content
+        assert "/health" not in content
+
+    def test_endpoint_config_survives_deleted_cache(self, store, tmp_path):
+        """No cache is needed to recover endpoint_config from the vault line."""
+        entry = store.create(
+            name="Nightly pause", schedule_type="cron", schedule_value="0 22 * * *",
+            message_type="endpoint",
+            endpoint_config={
+                "endpoint": "/api/home/eero/Kid-iPad/pause", "method": "POST",
+                "params": {"scheduled": True},
+            },
+        )
+        # A fresh store over the same vault with a brand-new (nonexistent)
+        # index path rebuilds purely from Inbox.md.
+        rebuilt = SchedulerStore(
+            vault_path=tmp_path / "vault", index_path=tmp_path / "fresh_index.json",
+        )
+        assert rebuilt.get(entry.id).endpoint_config == {
+            "endpoint": "/api/home/eero/Kid-iPad/pause", "method": "POST",
+            "params": {"scheduled": True},
+        }
+
+    def test_params_with_bracket_falls_back_to_base64_and_round_trips(self, store, tmp_path):
+        params = {"targets": ["Kid-iPad", "Kid-Laptop"]}
+        entry = store.create(
+            name="Pause multiple", schedule_type="cron", schedule_value="0 22 * * *",
+            message_type="endpoint",
+            endpoint_config={"endpoint": "/api/home/eero/pause", "method": "POST", "params": params},
+        )
+        content = store.inbox_path.read_text(encoding="utf-8")
+        assert "[params:: b64:" in content
+
+        rebuilt = SchedulerStore(
+            vault_path=tmp_path / "vault", index_path=tmp_path / "fresh_index2.json",
+        )
+        assert rebuilt.get(entry.id).endpoint_config["params"] == params
+
+    def test_vault_endpoint_fields_win_over_stale_cache(self, store):
+        entry = store.create(
+            name="Poll", schedule_type="cron", schedule_value="0 * * * *",
+            message_type="endpoint",
+            endpoint_config={"endpoint": "/health", "method": "GET", "params": {"v": 1}},
+        )
+        # self._entries (the in-memory cache) still holds the original config;
+        # hand-edit the vault line directly to a different endpoint/params.
+        content = store.inbox_path.read_text(encoding="utf-8")
+        patched = content.replace(
+            '[endpoint:: GET /health] [params:: {"v":1}]',
+            '[endpoint:: POST /api/changed] [params:: {"v":2}]',
+        )
+        assert patched != content
+        store.inbox_path.write_text(patched, encoding="utf-8")
+
+        store.reindex_file(str(store.inbox_path))
+        refreshed = store.get(entry.id)
+        assert refreshed.endpoint_config == {
+            "endpoint": "/api/changed", "method": "POST", "params": {"v": 2},
+        }
+
+    def test_legacy_line_without_endpoint_fields_migrates_once(self, store):
+        entry = store.create(
+            name="Legacy poll", schedule_type="cron", schedule_value="0 * * * *",
+            message_type="endpoint",
+            endpoint_config={"endpoint": "/health", "method": "GET", "params": {"v": 1}},
+        )
+        # Simulate a pre-existing line written before the endpoint fields
+        # existed: strip them from the vault, leaving the cache populated.
+        content = store.inbox_path.read_text(encoding="utf-8")
+        patched = content.replace(' [endpoint:: GET /health] [params:: {"v":1}]', "")
+        assert patched != content
+        store.inbox_path.write_text(patched, encoding="utf-8")
+
+        store.reindex_file(str(store.inbox_path))
+        migrated = store.inbox_path.read_text(encoding="utf-8")
+        assert "[endpoint:: GET /health]" in migrated
+        assert '[params:: {"v":1}]' in migrated
+        assert store.get(entry.id).endpoint_config == {
+            "endpoint": "/health", "method": "GET", "params": {"v": 1},
+        }
+
+        # A second reindex over the now-complete line must not rewrite again.
+        store.reindex_file(str(store.inbox_path))
+        assert store.inbox_path.read_text(encoding="utf-8") == migrated
+
+    def test_malformed_params_falls_back_to_cached_params(self, store, caplog):
+        entry = store.create(
+            name="Poll", schedule_type="cron", schedule_value="0 * * * *",
+            message_type="endpoint",
+            endpoint_config={"endpoint": "/health", "method": "GET", "params": {"v": 1}},
+        )
+        content = store.inbox_path.read_text(encoding="utf-8")
+        patched = content.replace('[params:: {"v":1}]', '[params:: {"v":}]')
+        assert patched != content
+        store.inbox_path.write_text(patched, encoding="utf-8")
+
+        with caplog.at_level("WARNING"):
+            store.reindex_file(str(store.inbox_path))
+        refreshed = store.get(entry.id)
+        assert refreshed.endpoint_config == {
+            "endpoint": "/health", "method": "GET", "params": {"v": 1},
+        }
+        assert entry.id in caplog.text
+
+    def test_malformed_params_without_cache_falls_back_to_empty_dict(self, tmp_path):
+        raw_store = SchedulerStore(
+            vault_path=tmp_path / "vault2", index_path=tmp_path / "fresh_index3.json",
+        )
+        line = ('- [ ] Legacy [cron:: 0 * * * *] [action:: endpoint] [mtype:: endpoint] '
+                '[endpoint:: GET /health] [params:: {"v":}] <!-- id:deadbeef -->')
+        raw_store.inbox_path.write_text(
+            "---\ntype: scheduler\n---\n# Scheduler Inbox\n\n" + line + "\n",
+            encoding="utf-8",
+        )
+        raw_store.reindex_file(str(raw_store.inbox_path))
+        entry = raw_store.get("deadbeef")
+        assert entry is not None
+        assert entry.endpoint_config == {"endpoint": "/health", "method": "GET", "params": {}}
+
+
+class TestRoundTrip:
+    """parse → format → parse is lossless for the markdown definition fields."""
+
+    def test_cron_round_trip(self):
+        line = ("- [ ] Weekly review [cron:: 0 9 * * 6] [tz:: America/New_York] "
+                "[action:: agent] [mtype:: prompt] #cloud "
+                "[created:: 2026-05-28T12:00:00+00:00] <!-- id:abc123 -->")
+        entry = _parse_entry_line(line)
+        assert entry is not None
+        assert entry.name == "Weekly review"
+        assert entry.schedule_type == "cron"
+        assert entry.schedule_value == "0 9 * * 6"
+        assert entry.timezone == "America/New_York"
+        assert entry.action == "agent"
+        assert entry.message_type == "prompt"
+        assert entry.executor == "cloud"
+        assert entry.enabled is True
+        assert entry.id == "abc123"
+        # Round-trip: re-formatting the parsed entry reproduces the line.
+        assert _format_entry_line(entry) == line
+
+    def test_once_round_trip(self):
+        entry = ScheduleEntry(
+            id="s2", name="One off", schedule_type="once",
+            schedule_value="2026-06-03T15:05:00", action="notify",
+            message_type="static", enabled=True,
+            created_at="2026-05-28T12:00:00+00:00",
+        )
+        line = _format_entry_line(entry)
+        reparsed = _parse_entry_line(line)
+        assert reparsed.schedule_type == "once"
+        assert reparsed.schedule_value == "2026-06-03T15:05:00"
+        assert _format_entry_line(reparsed) == line
+
+    def test_disabled_checkbox_round_trip(self):
+        entry = ScheduleEntry(
+            id="s3", name="Paused", schedule_type="cron", schedule_value="0 9 * * *",
+            enabled=False, created_at="2026-05-28T12:00:00+00:00",
+        )
+        line = _format_entry_line(entry)
+        assert line.startswith("- [x] Paused")
+        assert _parse_entry_line(line).enabled is False
+
+    def test_non_schedule_line_returns_none(self):
+        assert _parse_entry_line("# A heading") is None
+        assert _parse_entry_line("- [ ] just a task with no trigger") is None
+        assert _parse_entry_line("plain text") is None
+
+    def test_endpoint_with_params_round_trip(self):
+        entry = ScheduleEntry(
+            id="ep1", name="Pause", schedule_type="cron", schedule_value="0 22 * * *",
+            action="endpoint", message_type="endpoint",
+            endpoint_config={
+                "endpoint": "/api/home/eero/pause", "method": "POST",
+                "params": {"scheduled": True},
+            },
+            created_at="2026-05-28T12:00:00+00:00",
+        )
+        line = _format_entry_line(entry)
+        assert "[endpoint:: POST /api/home/eero/pause]" in line
+        assert '[params:: {"scheduled":true}]' in line
+        reparsed = _parse_entry_line(line)
+        assert reparsed.endpoint_config == entry.endpoint_config
+        assert _format_entry_line(reparsed) == line
+
+    def test_endpoint_params_bracket_uses_base64_fallback(self):
+        entry = ScheduleEntry(
+            id="ep2", name="Pause multi", schedule_type="cron", schedule_value="0 22 * * *",
+            action="endpoint", message_type="endpoint",
+            endpoint_config={
+                "endpoint": "/api/home/eero/pause", "method": "POST",
+                "params": {"targets": ["a", "b"]},
+            },
+            created_at="2026-05-28T12:00:00+00:00",
+        )
+        line = _format_entry_line(entry)
+        assert "[params:: b64:" in line
+        reparsed = _parse_entry_line(line)
+        assert reparsed.endpoint_config["params"] == {"targets": ["a", "b"]}
+        assert _format_entry_line(reparsed) == line
+
+    def test_endpoint_path_with_spaces_round_trips(self):
+        """The method is the first whitespace-delimited token; the path is the remainder."""
+        entry = ScheduleEntry(
+            id="ep3", name="Pause target", schedule_type="cron", schedule_value="0 22 * * *",
+            action="endpoint", message_type="endpoint",
+            endpoint_config={
+                "endpoint": "/api/home/eero/Kid iPad/pause", "method": "POST", "params": {},
+            },
+            created_at="2026-05-28T12:00:00+00:00",
+        )
+        line = _format_entry_line(entry)
+        assert "[endpoint:: POST /api/home/eero/Kid iPad/pause]" in line
+        reparsed = _parse_entry_line(line)
+        assert reparsed.endpoint_config == {
+            "endpoint": "/api/home/eero/Kid iPad/pause", "method": "POST", "params": {},
+        }
+        assert _format_entry_line(reparsed) == line
+
+    def test_hash_in_endpoint_params_and_path_not_treated_as_tag(self):
+        """A `#` inside a field value (params or path) is never mistaken for an executor tag."""
+        entry = ScheduleEntry(
+            id="ep4", name="Notify channel", schedule_type="cron", schedule_value="0 9 * * *",
+            action="endpoint", message_type="endpoint",
+            endpoint_config={
+                "endpoint": "/api/x#frag", "method": "POST",
+                "params": {"channel": "#general"},
+            },
+            created_at="2026-05-28T12:00:00+00:00",
+        )
+        line = _format_entry_line(entry)
+        reparsed = _parse_entry_line(line)
+        assert reparsed.executor == ""
+        assert reparsed.endpoint_config == entry.endpoint_config
+        assert _format_entry_line(reparsed) == line
+
+    def test_real_executor_tag_survives_hash_in_endpoint_params(self):
+        entry = ScheduleEntry(
+            id="ep5", name="Notify channel", schedule_type="cron", schedule_value="0 9 * * *",
+            action="endpoint", message_type="endpoint", executor="cloud",
+            endpoint_config={
+                "endpoint": "/api/x", "method": "POST",
+                "params": {"channel": "#general"},
+            },
+            created_at="2026-05-28T12:00:00+00:00",
+        )
+        line = _format_entry_line(entry)
+        reparsed = _parse_entry_line(line)
+        assert reparsed.executor == "cloud"
+        assert reparsed.endpoint_config == entry.endpoint_config
+        assert _format_entry_line(reparsed) == line
+
+
+class TestScheduleBudget:
+    """`[budget:: …]` / `[wall:: …]` — an `action:: agent` schedule's own
+    dollar/wall-clock budget, round-tripped through Markdown."""
+
+    @pytest.mark.parametrize("raw,expected", [("$2", 2.0), ("2", 2.0), ("2.50", 2.5)])
+    def test_budget_field_accepts_dollar_sign_bare_and_decimal(self, raw, expected):
+        line = (
+            f"- [ ] Weekly review [cron:: 0 9 * * 6] [action:: agent] "
+            f"[budget:: {raw}] <!-- id:bud1 -->"
+        )
+        entry = _parse_entry_line(line)
+        assert entry is not None
+        assert entry.budget_dollars == pytest.approx(expected)
+
+    @pytest.mark.parametrize("raw,expected_seconds", [
+        ("30m", 1800), ("2h", 7200), ("90 min", 5400), ("3600s", 3600),
+    ])
+    def test_wall_field_accepts_minutes_hours_and_seconds(self, raw, expected_seconds):
+        line = (
+            f"- [ ] Weekly review [cron:: 0 9 * * 6] [action:: agent] "
+            f"[wall:: {raw}] <!-- id:wal1 -->"
+        )
+        entry = _parse_entry_line(line)
+        assert entry is not None
+        assert entry.wall_seconds == expected_seconds
+
+    def test_missing_budget_and_wall_fields_stay_none(self):
+        line = "- [ ] Weekly review [cron:: 0 9 * * 6] [action:: agent] <!-- id:none1 -->"
+        entry = _parse_entry_line(line)
+        assert entry is not None
+        assert entry.budget_dollars is None
+        assert entry.wall_seconds is None
+
+    def test_malformed_budget_field_leaves_it_none(self, caplog):
+        line = (
+            "- [ ] Weekly review [cron:: 0 9 * * 6] [action:: agent] "
+            "[budget:: not-a-number] <!-- id:bud2 -->"
+        )
+        with caplog.at_level("WARNING"):
+            entry = _parse_entry_line(line)
+        assert entry is not None
+        assert entry.budget_dollars is None
+        assert "bud2" in caplog.text
+
+    def test_malformed_wall_field_leaves_it_none(self, caplog):
+        line = (
+            "- [ ] Weekly review [cron:: 0 9 * * 6] [action:: agent] "
+            "[wall:: not-a-duration] <!-- id:wal2 -->"
+        )
+        with caplog.at_level("WARNING"):
+            entry = _parse_entry_line(line)
+        assert entry is not None
+        assert entry.wall_seconds is None
+        assert "wal2" in caplog.text
+
+    def test_format_emits_budget_and_wall_only_when_set(self):
+        entry = ScheduleEntry(
+            id="bw1", name="Weekly review", schedule_type="cron", schedule_value="0 9 * * 6",
+            action="agent", message_content="Draft it",
+            budget_dollars=2.0, wall_seconds=1800,
+        )
+        line = _format_entry_line(entry)
+        assert "[budget:: $2]" in line
+        assert "[wall:: 30m]" in line
+
+        entry_unset = ScheduleEntry(
+            id="bw2", name="Weekly review", schedule_type="cron", schedule_value="0 9 * * 6",
+            action="agent", message_content="Draft it",
+        )
+        line_unset = _format_entry_line(entry_unset)
+        assert "[budget::" not in line_unset
+        assert "[wall::" not in line_unset
+
+    @pytest.mark.parametrize("budget_dollars,wall_seconds", [
+        (2.0, 1800), (0.5, 90), (2.55, 3600), (None, 1800), (2.0, None), (None, None),
+    ])
+    def test_budget_and_wall_round_trip(self, budget_dollars, wall_seconds):
+        entry = ScheduleEntry(
+            id="rt1", name="Weekly review", schedule_type="cron", schedule_value="0 9 * * 6",
+            action="agent", message_content="Draft it",
+            budget_dollars=budget_dollars, wall_seconds=wall_seconds,
+        )
+        line = _format_entry_line(entry)
+        reparsed = _parse_entry_line(line)
+        assert reparsed.budget_dollars == budget_dollars
+        assert reparsed.wall_seconds == wall_seconds
+        # A second parse -> format round trip is a no-op — the canonical
+        # spelling written back is stable under re-parsing.
+        assert _format_entry_line(reparsed) == line
+
+
+class TestCronComputation:
+    def test_cron_next_trigger(self):
+        entry = ScheduleEntry(id="t", name="T", schedule_type="cron",
+                              schedule_value="0 9 * * *")
+        nxt = compute_next_trigger(entry)
+        assert nxt is not None
+        assert datetime.fromisoformat(nxt) > datetime.now(timezone.utc)
+
+    def test_once_future_trigger(self):
+        future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        entry = ScheduleEntry(id="t", name="T", schedule_type="once", schedule_value=future)
+        assert compute_next_trigger(entry) is not None
+
+    def test_once_past_trigger(self):
+        past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        entry = ScheduleEntry(id="t", name="T", schedule_type="once", schedule_value=past)
+        assert compute_next_trigger(entry) is None
+
+    def test_invalid_cron(self):
+        entry = ScheduleEntry(id="t", name="T", schedule_type="cron",
+                              schedule_value="invalid cron")
+        assert compute_next_trigger(entry) is None
+
+
+class TestComputeNextNTriggers:
+    """`compute_next_n_triggers` is the pure helper `compute_next_trigger`
+    shares — covered directly here for the multi-trigger case the
+    single-trigger helper never exercises, plus the once/invalid cases
+    `compute_next_trigger`'s own tests above already cover for count=1."""
+
+    def test_cron_returns_count_ascending_utc_times(self):
+        triggers = compute_next_n_triggers("cron", "0 9 * * *", "UTC", count=3)
+        assert len(triggers) == 3
+        parsed = [datetime.fromisoformat(t) for t in triggers]
+        assert parsed == sorted(parsed)
+        assert all(p > datetime.now(timezone.utc) for p in parsed)
+        assert all(p.tzinfo == timezone.utc for p in parsed)
+
+    def test_once_future_returns_single_time(self):
+        future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        triggers = compute_next_n_triggers("once", future, "UTC", count=3)
+        assert len(triggers) == 1
+
+    def test_once_past_returns_empty(self):
+        past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        assert compute_next_n_triggers("once", past, "UTC", count=3) == []
+
+    def test_invalid_cron_returns_empty(self):
+        assert compute_next_n_triggers("cron", "invalid cron", "UTC", count=3) == []
+
+    def test_invalid_timezone_returns_empty(self):
+        assert compute_next_n_triggers("cron", "0 9 * * *", "Nowhere/Fake", count=3) == []
+
+    def test_unknown_schedule_type_returns_empty(self):
+        assert compute_next_n_triggers("weekly", "0 9 * * *", "UTC", count=3) == []
+
+    def test_zero_count_returns_empty_for_cron(self):
+        assert compute_next_n_triggers("cron", "0 9 * * *", "UTC", count=0) == []
+
+    def test_compute_next_trigger_matches_first_of_n(self):
+        """`compute_next_trigger` must keep returning exactly the first
+        element `compute_next_n_triggers` would — the refactor shares logic
+        without changing either function's observable behavior."""
+        entry = ScheduleEntry(id="t", name="T", schedule_type="cron", schedule_value="0 9 * * *",
+                              timezone="America/New_York")
+        single = compute_next_trigger(entry)
+        many = compute_next_n_triggers("cron", "0 9 * * *", "America/New_York", count=1, label="t")
+        assert single == many[0]
+
+
+class TestDueChecking:
+    def test_due_detected(self, store):
+        past = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+        entry = store.create(name="Due", schedule_type="once", schedule_value=past,
+                             message_type="static", message_content="Hi")
+        entry.next_trigger_at = past
+        entry.enabled = True
+        due = store.get_due_reminders()
+        assert len(due) == 1 and due[0].id == entry.id
+
+    def test_disabled_not_due(self, store):
+        past = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+        store.create(name="Disabled", schedule_type="once", schedule_value=past,
+                     message_type="static", message_content="Hi", enabled=False)
+        assert store.get_due_reminders() == []
+
+    def test_cooldown_skips_recent(self, store):
+        past = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+        entry = store.create(name="Cooldown", schedule_type="cron",
+                             schedule_value="* * * * *", message_type="static",
+                             message_content="Hi")
+        entry.next_trigger_at = past
+        entry.last_triggered_at = datetime.now(timezone.utc).isoformat()  # just fired
+        assert store.get_due_reminders() == []
+
+
+class TestIndexSwapAtomicity:
+    """The index must never be observable half-rebuilt.
+
+    ``get`` / ``list_all`` / ``get_due_reminders`` read without the lock, so
+    every write has to swap in a complete map rather than mutate the live one.
+    """
+
+    def test_reader_midway_through_reindex_sees_the_whole_index(self, store, monkeypatch):
+        """A read pinned to the middle of a reindex still sees every schedule."""
+        import api.services.scheduler_store as mod
+
+        ids = [
+            store.create(name=f"Job {n}", schedule_type="cron",
+                         schedule_value="0 9 * * *", message_type="static",
+                         message_content=f"body {n}").id
+            for n in range(3)
+        ]
+        # Make one schedule due. A reader that misses it mid-reindex loses the
+        # fire for good — the reindex recomputes next_trigger_at to the future.
+        store.get(ids[0]).next_trigger_at = (
+            datetime.now(timezone.utc) - timedelta(minutes=5)
+        ).isoformat()
+
+        writer_inside = threading.Event()
+        reader_done = threading.Event()
+        observed = {}
+        real_merge_prior = mod.SchedulerStore._merge_prior
+
+        def hooked_merge_prior(entry, prior):
+            # Runs inside the reindex loop — the exact point at which the old
+            # code had already torn the index down and not yet refilled it.
+            if not writer_inside.is_set():
+                writer_inside.set()
+                reader_done.wait(timeout=10)
+            real_merge_prior(entry, prior)
+
+        monkeypatch.setattr(mod.SchedulerStore, "_merge_prior",
+                            staticmethod(hooked_merge_prior))
+
+        def read_midway():
+            try:
+                if not writer_inside.wait(timeout=10):
+                    return
+                observed["get"] = store.get(ids[1])
+                observed["list_all"] = store.list_all()
+                observed["due"] = store.get_due_reminders()
+            finally:
+                reader_done.set()
+
+        reader = threading.Thread(target=read_midway, name="scheduler-race-reader")
+        reader.start()
+        try:
+            store.reindex_file(str(store.inbox_path))
+        finally:
+            reader_done.set()
+            reader.join(timeout=10)
+
+        assert not reader.is_alive()
+        assert writer_inside.is_set(), "reindex never entered the merge loop"
+        assert observed["get"] is not None, "get() returned None for a live schedule"
+        assert len(observed["list_all"]) == 3, "list_all() saw a partial index"
+        assert [e.id for e in observed["due"]] == [ids[0]], "a due schedule was missed"
+
+    def test_create_and_delete_swap_the_index_instead_of_mutating_it(self, store):
+        """An in-flight scan of the index survives a concurrent create/delete.
+
+        Reaches into ``_entries`` because there is no public way to pause a
+        reader partway through its scan; the property under test is that the
+        dict a reader is iterating is never the one a writer touches.
+        """
+        keep = store.create(name="Keep", schedule_type="cron", schedule_value="0 9 * * *",
+                            message_type="static", message_content="a")
+        doomed = store.create(name="Doomed", schedule_type="cron", schedule_value="0 9 * * *",
+                              message_type="static", message_content="b")
+
+        scan = iter(store._entries.values())
+        assert next(scan).id == keep.id
+        added = store.create(name="Added", schedule_type="cron", schedule_value="0 9 * * *",
+                             message_type="static", message_content="c")
+        assert [e.id for e in scan] == [doomed.id]  # no "changed size during iteration"
+
+        scan = iter(store._entries.values())
+        assert next(scan).id == keep.id
+        store.delete(doomed.id)
+        assert [e.id for e in scan] == [doomed.id, added.id]
+
+
+class TestAutoDisable:
+    def test_once_disables_after_trigger(self, store):
+        future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        entry = store.create(name="One-time", schedule_type="once", schedule_value=future,
+                             message_type="static", message_content="Hi")
+        assert entry.enabled is True
+        store.mark_triggered(entry.id)
+        updated = store.get(entry.id)
+        assert updated.enabled is False
+        assert updated.next_trigger_at is None
+        assert updated.last_triggered_at is not None
+
+    def test_cron_stays_enabled_after_trigger(self, store):
+        entry = store.create(name="Recurring", schedule_type="cron",
+                             schedule_value="0 9 * * *", message_type="static",
+                             message_content="Hi")
+        store.mark_triggered(entry.id)
+        updated = store.get(entry.id)
+        assert updated.enabled is True
+        assert updated.next_trigger_at is not None
+        assert updated.last_triggered_at is not None
+
+
+class TestManualScheduleType:
+    """A manual schedule (no cron/at) never fires on its own and is fired
+    only via the trigger path — it stays enabled and repeatable."""
+
+    def test_parses_trigger_less_line_with_action_field(self):
+        line = "- [ ] Deploy runbook [action:: agent] [mtype:: prompt] #cloud <!-- id:m1a2b3 -->"
+        entry = _parse_entry_line(line)
+        assert entry is not None
+        assert entry.schedule_type == "manual"
+        assert entry.schedule_value == ""
+        assert entry.action == "agent"
+        assert entry.executor == "cloud"
+
+    def test_format_emits_no_trigger_field(self):
+        entry = ScheduleEntry(
+            id="m1", name="Deploy runbook", schedule_type="manual", schedule_value="",
+            action="agent", message_type="prompt", executor="cloud",
+            created_at="2026-05-28T12:00:00+00:00",
+        )
+        line = _format_entry_line(entry)
+        assert "[cron::" not in line
+        assert "[at::" not in line
+        reparsed = _parse_entry_line(line)
+        assert reparsed.schedule_type == "manual"
+        assert _format_entry_line(reparsed) == line
+
+    def test_create_via_store_has_no_next_fire(self, store):
+        entry = store.create(
+            name="Deploy runbook", schedule_type="manual", schedule_value="",
+            action="notify", message_type="static", message_content="go",
+        )
+        assert entry.schedule_type == "manual"
+        assert entry.next_trigger_at is None
+        assert entry.enabled is True
+
+    def test_update_clears_cron_to_manual(self, store):
+        entry = store.create(
+            name="Weekly review", schedule_type="cron", schedule_value="0 9 * * 6",
+            action="notify", message_type="static", message_content="go",
+        )
+        assert entry.next_trigger_at is not None
+        updated = store.update(entry.id, schedule_type="manual", schedule_value="")
+        assert updated.schedule_type == "manual"
+        assert updated.next_trigger_at is None
+        assert updated.enabled is True
+        # The markdown line carries no trigger field either.
+        line = next(
+            ln for ln in store._read_inbox_lines() if f"id:{entry.id}" in ln
+        )
+        assert "[cron::" not in line
+        assert "[at::" not in line
+
+    def test_tick_skips_manual(self, store):
+        store.create(
+            name="Deploy runbook", schedule_type="manual", schedule_value="",
+            action="notify", message_type="static", message_content="go",
+        )
+        assert store.get_due_reminders() == []
+
+    def test_rebuild_index_skips_manual_without_error(self, store):
+        store.create(
+            name="Deploy runbook", schedule_type="manual", schedule_value="",
+            action="notify", message_type="static", message_content="go",
+        )
+        store.rebuild_index()
+        entries = store.list_all()
+        assert len(entries) == 1
+        assert entries[0].schedule_type == "manual"
+        assert entries[0].next_trigger_at is None
+
+    @pytest.mark.asyncio
+    async def test_trigger_fires_and_stays_enabled_and_repeatable(self, store):
+        entry = store.create(
+            name="Deploy runbook", schedule_type="manual", schedule_value="",
+            action="notify", message_type="static", message_content="ship it",
+        )
+        scheduler = SchedulerScheduler(store)
+        with patch("api.services.telegram.send_message_async",
+                   new_callable=AsyncMock, return_value=True) as mock_send:
+            await scheduler._fire_entry(entry, manual=True)
+        refreshed = store.get(entry.id)
+        assert refreshed.enabled is True
+        assert refreshed.next_trigger_at is None
+        assert refreshed.last_triggered_at is not None
+        assert mock_send.call_count == 1
+
+        # Triggering again fires a second time — a manual schedule is never
+        # consumed the way a `once` schedule is.
+        with patch("api.services.telegram.send_message_async",
+                   new_callable=AsyncMock, return_value=True) as mock_send2:
+            await scheduler._fire_entry(refreshed, manual=True)
+        refreshed_again = store.get(entry.id)
+        assert refreshed_again.enabled is True
+        assert mock_send2.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_once_schedule_is_still_consumed_by_trigger(self, store):
+        """Existing behavior preserved: triggering a `once` schedule still
+        disables it and clears its next fire, exactly like an unattended
+        fire would."""
+        future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        entry = store.create(
+            name="One-off", schedule_type="once", schedule_value=future,
+            action="notify", message_type="static", message_content="hi",
+        )
+        scheduler = SchedulerScheduler(store)
+        with patch("api.services.telegram.send_message_async",
+                   new_callable=AsyncMock, return_value=True):
+            await scheduler._fire_entry(entry, manual=True)
+        refreshed = store.get(entry.id)
+        assert refreshed.enabled is False
+        assert refreshed.next_trigger_at is None
+
+
+class TestDashboard:
+    def test_dashboard_has_three_sections(self, store):
+        store.create(name="Recurring one", schedule_type="cron", schedule_value="0 9 * * *",
+                     message_type="static", message_content="x")
+        store.create(name="Upcoming one", schedule_type="once",
+                     schedule_value=(datetime.now(timezone.utc) + timedelta(hours=2)).isoformat(),
+                     message_type="static", message_content="y")
+        dashboard = (store.scheduler_dir / "Dashboard.md").read_text(encoding="utf-8")
+        assert "## Recurring" in dashboard
+        assert "## Upcoming" in dashboard
+        assert "## Recently Fired" in dashboard
+        assert "Recurring one" in dashboard
+        assert "Upcoming one" in dashboard
+
+    def test_fired_entry_appears_in_recently_fired(self, store):
+        entry = store.create(name="Fires", schedule_type="cron", schedule_value="0 9 * * *",
+                             message_type="static", message_content="x")
+        store.mark_triggered(entry.id)
+        dashboard = (store.scheduler_dir / "Dashboard.md").read_text(encoding="utf-8")
+        # The fired schedule shows up under Recently Fired with its name.
+        rf = dashboard.split("## Recently Fired", 1)[1]
+        assert "Fires" in rf
+
+    def test_dashboard_not_parsed_as_schedule_source(self, store):
+        store.create(name="X", schedule_type="cron", schedule_value="0 9 * * *",
+                     message_type="static", message_content="x")
+        before = len(store.list_all())
+        store.reindex_file(str(store.scheduler_dir / "Dashboard.md"))
+        assert len(store.list_all()) == before
+
+
+class TestSuppression:
+    def test_sentinels_suppressed(self):
+        for s in ("NO_MEETING", "NO_MEETINGS", "NOTHING_TO_REPORT", "NO_ACTION"):
+            assert SchedulerScheduler._should_suppress(s) is True
+            assert SchedulerScheduler._should_suppress(s.lower()) is True
+            assert SchedulerScheduler._should_suppress(f"  {s}  ") is True
+
+    def test_normal_not_suppressed(self):
+        assert SchedulerScheduler._should_suppress("Here is your briefing") is False
+        assert SchedulerScheduler._should_suppress("") is False
+        assert SchedulerScheduler._should_suppress("NO_MEETING but here's news") is False
+
+    def test_sentinel_with_punctuation(self):
+        assert SchedulerScheduler._should_suppress("NO_MEETING.") is True
+        assert SchedulerScheduler._should_suppress("NO_MEETING—nothing scheduled") is True
+
+
+class TestPromptExecution:
+    @pytest.fixture
+    def scheduler(self, store):
+        return SchedulerScheduler(store)
+
+    @pytest.fixture
+    def prompt_entry(self, scheduler):
+        return scheduler.store.create(
+            name="Test Prompt", schedule_type="cron", schedule_value="0 9 * * *",
+            message_type="prompt", message_content="What meetings do I have today?",
+        )
+
+    @pytest.mark.asyncio
+    async def test_successful_prompt(self, scheduler, prompt_entry):
+        mock_result = {
+            "answer": "You have 3 meetings today.", "tool_statuses": ["Searching calendar..."],
+            "cost_usd": 0.015, "model": "claude", "input_tokens": 500, "output_tokens": 100,
+        }
+        with patch("api.services.telegram.chat_via_api_with_log",
+                   new_callable=AsyncMock, return_value=mock_result) as mock_chat:
+            answer, exec_log = await scheduler._execute_prompt_reminder(prompt_entry)
+        assert answer == "You have 3 meetings today."
+        assert exec_log["tool_calls"] == 1
+        assert exec_log["attempt"] == 1
+        mock_chat.assert_called_once_with("What meetings do I have today?")
+
+    @pytest.mark.asyncio
+    async def test_retry_on_empty(self, scheduler, prompt_entry):
+        results = [
+            {"answer": "", "tool_statuses": [], "cost_usd": 0, "model": "", "input_tokens": 0, "output_tokens": 0},
+            {"answer": "Retry worked!", "tool_statuses": ["Searching..."], "cost_usd": 0.01,
+             "model": "claude", "input_tokens": 100, "output_tokens": 50},
+        ]
+        with patch("api.services.telegram.chat_via_api_with_log",
+                   new_callable=AsyncMock, side_effect=results):
+            answer, exec_log = await scheduler._execute_prompt_reminder(prompt_entry)
+        assert answer == "Retry worked!"
+        assert exec_log["attempt"] == 2
+
+    @pytest.mark.asyncio
+    async def test_all_retries_exhausted(self, scheduler, prompt_entry):
+        with patch("api.services.telegram.chat_via_api_with_log",
+                   new_callable=AsyncMock, side_effect=Exception("Persistent error")):
+            answer, exec_log = await scheduler._execute_prompt_reminder(prompt_entry)
+        assert "failed after 2 attempts" in answer
+        assert exec_log["error"] == "Persistent error"
+
+    @pytest.mark.asyncio
+    async def test_fire_sends_telegram(self, scheduler, prompt_entry):
+        mock_result = {
+            "answer": "Your morning briefing...", "tool_statuses": [], "cost_usd": 0.01,
+            "model": "claude", "input_tokens": 100, "output_tokens": 50,
+        }
+        with patch("api.services.telegram.chat_via_api_with_log",
+                   new_callable=AsyncMock, return_value=mock_result):
+            with patch("api.services.telegram.send_message_async",
+                       new_callable=AsyncMock, return_value=True) as mock_send:
+                await scheduler._fire_reminder(prompt_entry)
+        mock_send.assert_called_once()
+        sent = mock_send.call_args[0][0]
+        assert "Test Prompt" in sent and "Your morning briefing..." in sent
+
+    @pytest.mark.asyncio
+    async def test_fire_suppresses_no_meeting(self, scheduler, prompt_entry):
+        mock_result = {
+            "answer": "NO_MEETING", "tool_statuses": [], "cost_usd": 0.005,
+            "model": "claude", "input_tokens": 50, "output_tokens": 5,
+        }
+        with patch("api.services.telegram.chat_via_api_with_log",
+                   new_callable=AsyncMock, return_value=mock_result):
+            with patch("api.services.telegram.send_message_async",
+                       new_callable=AsyncMock) as mock_send:
+                await scheduler._fire_reminder(prompt_entry)
+        mock_send.assert_not_called()
+
+
+class TestFormatHelpers:
+    def test_format_cron_human(self):
+        assert "ET" in _format_cron_human("0 9 * * *", "America/New_York")
+
+    def test_format_dt_short_handles_garbage(self):
+        assert _format_dt_short("not-a-date") == "not-a-date"
+
+
+class TestActionDispatch:
+    """_fire_entry dispatches on action, records run history, hands off agents."""
+
+    @pytest.fixture
+    def scheduler(self, store):
+        return SchedulerScheduler(store)
+
+    @pytest.mark.asyncio
+    async def test_notify_sends_static_message(self, scheduler):
+        entry = scheduler.store.create(
+            name="Water plants", schedule_type="cron", schedule_value="0 18 * * *",
+            action="notify", message_type="static", message_content="hydrate the ferns",
+        )
+        with patch("api.services.telegram.send_message_async",
+                   new_callable=AsyncMock, return_value=True) as mock_send:
+            await scheduler._fire_entry(entry)
+        mock_send.assert_called_once()
+        assert "hydrate the ferns" in mock_send.call_args[0][0]
+        assert scheduler.store.get(entry.id).last_status == "sent"
+
+    @pytest.mark.asyncio
+    async def test_external_operation_firing_logs_and_history_omit_content(
+        self, scheduler, caplog
+    ):
+        secret_name = "Synthetic private schedule title"
+        secret_body = "Synthetic private transcript body"
+        entry, created = scheduler.store.create_or_find_by_operation(
+            "pebble:opaque-schedule",
+            name=secret_name,
+            schedule_type="cron",
+            schedule_value="0 18 * * *",
+            action="notify",
+            message_type="static",
+            message_content=secret_body,
+        )
+        assert created
+        caplog.clear()
+        with caplog.at_level("INFO"):
+            with patch(
+                "api.services.telegram.send_message_async",
+                new_callable=AsyncMock,
+                return_value=True,
+            ):
+                await scheduler._fire_entry(entry)
+        assert secret_name not in caplog.text
+        assert secret_body not in caplog.text
+        assert scheduler.store.get(entry.id).last_result == ""
+
+    @pytest.mark.asyncio
+    async def test_notify_suppressed_when_empty(self, scheduler):
+        entry = scheduler.store.create(
+            name="Empty", schedule_type="cron", schedule_value="0 9 * * *",
+            action="notify", message_type="static", message_content="",
+        )
+        with patch("api.services.telegram.send_message_async",
+                   new_callable=AsyncMock) as mock_send:
+            await scheduler._fire_entry(entry)
+        mock_send.assert_not_called()
+        assert scheduler.store.get(entry.id).last_status == "suppressed"
+
+    @pytest.mark.asyncio
+    async def test_prompt_suppressed_on_sentinel(self, scheduler):
+        entry = scheduler.store.create(
+            name="Meeting prep", schedule_type="cron", schedule_value="0 9 * * *",
+            action="prompt", message_type="prompt", message_content="check calendar",
+        )
+        mock_result = {"answer": "NO_MEETING", "tool_statuses": [], "cost_usd": 0,
+                       "model": "claude", "input_tokens": 1, "output_tokens": 1}
+        with patch("api.services.telegram.chat_via_api_with_log",
+                   new_callable=AsyncMock, return_value=mock_result):
+            with patch("api.services.telegram.send_message_async",
+                       new_callable=AsyncMock) as mock_send:
+                await scheduler._fire_entry(entry)
+        mock_send.assert_not_called()
+        assert scheduler.store.get(entry.id).last_status == "suppressed"
+
+    @pytest.mark.asyncio
+    async def test_agent_action_creates_tagged_task(self, scheduler):
+        entry = scheduler.store.create(
+            name="Weekly review", schedule_type="cron", schedule_value="0 9 * * 6",
+            action="agent", executor="cloud", message_content="Draft my weekly review",
+        )
+        fake_task = MagicMock(id="task42")
+        fake_tm = MagicMock()
+        fake_tm.create.return_value = fake_task
+        with patch("api.services.task_manager.get_task_manager", return_value=fake_tm):
+            with patch("api.services.telegram.send_message_async",
+                       new_callable=AsyncMock) as mock_send:
+                await scheduler._fire_entry(entry)
+        # The agent worker claims engine-assignee tags on the handed-off task.
+        fake_tm.create.assert_called_once()
+        kwargs = fake_tm.create.call_args.kwargs
+        assert kwargs["description"] == "Draft my weekly review"
+        # Cron (recurring) schedules carry a sched-<id> tag so the worker
+        # appends each fire's output to one shared note per schedule.
+        assert kwargs["tags"] == ["cloud", f"sched-{entry.id}"]
+        # No Telegram for an agent hand-off; the worker reports through its channel.
+        mock_send.assert_not_called()
+        refreshed = scheduler.store.get(entry.id)
+        assert refreshed.last_status == "handed-off"
+        assert "task42" in refreshed.last_result
+
+    @pytest.mark.asyncio
+    async def test_agent_action_renders_its_own_budget_into_the_task_title(self, scheduler):
+        """A schedule carrying its own `budget_dollars`/`wall_seconds`
+        renders both into the created task's title in the hint grammar the
+        agent worker's preflight parses ("max $X.XX", "Y min"), so the
+        card's budget equals the schedule's on every fire."""
+        entry = scheduler.store.create(
+            name="Weekly review", schedule_type="cron", schedule_value="0 9 * * 6",
+            action="agent", executor="cloud", message_content="Draft my weekly review",
+            budget_dollars=2.0, wall_seconds=1800,
+        )
+        fake_tm = MagicMock()
+        fake_tm.create.return_value = MagicMock(id="task-budget")
+        with patch("api.services.task_manager.get_task_manager", return_value=fake_tm):
+            await scheduler._fire_entry(entry)
+        kwargs = fake_tm.create.call_args.kwargs
+        assert kwargs["description"] == "Draft my weekly review (max $2.00, 30 min)"
+
+    @pytest.mark.asyncio
+    async def test_agent_action_without_budget_leaves_the_task_title_unchanged(self, scheduler):
+        entry = scheduler.store.create(
+            name="Weekly review", schedule_type="cron", schedule_value="0 9 * * 6",
+            action="agent", executor="cloud", message_content="Draft my weekly review",
+        )
+        fake_tm = MagicMock()
+        fake_tm.create.return_value = MagicMock(id="task-no-budget")
+        with patch("api.services.task_manager.get_task_manager", return_value=fake_tm):
+            await scheduler._fire_entry(entry)
+        assert fake_tm.create.call_args.kwargs["description"] == "Draft my weekly review"
+
+    @pytest.mark.asyncio
+    async def test_agent_action_local_executor_tag(self, scheduler):
+        entry = scheduler.store.create(
+            name="Local job", schedule_type="cron", schedule_value="0 9 * * *",
+            action="agent", executor="local", message_content="summarize inbox",
+        )
+        fake_tm = MagicMock()
+        fake_tm.create.return_value = MagicMock(id="t1")
+        with patch("api.services.task_manager.get_task_manager", return_value=fake_tm):
+            await scheduler._fire_entry(entry)
+        assert fake_tm.create.call_args.kwargs["tags"] == ["local", f"sched-{entry.id}"]
+
+    @pytest.mark.asyncio
+    async def test_once_agent_action_has_no_sched_tag(self, scheduler):
+        """One-time schedules are stand-alone; they get no sched-<id> tag, so
+        the worker treats each as a one-off task with its own output note."""
+        entry = scheduler.store.create(
+            name="One shot", schedule_type="once",
+            schedule_value="2999-01-01T09:00:00",
+            action="agent", executor="local", message_content="do it once",
+        )
+        fake_tm = MagicMock()
+        fake_tm.create.return_value = MagicMock(id="t9")
+        with patch("api.services.task_manager.get_task_manager", return_value=fake_tm):
+            await scheduler._fire_entry(entry)
+        assert fake_tm.create.call_args.kwargs["tags"] == ["local"]
+
+    @pytest.mark.asyncio
+    async def test_agent_action_without_executor_uses_legacy_default_route_handoff(self, scheduler):
+        entry = scheduler.store.create(
+            name="No executor", schedule_type="once",
+            schedule_value="2999-01-01T09:00:00",
+            action="agent", executor="", message_content="do it",
+        )
+        fake_tm = MagicMock()
+        fake_tm.create.return_value = MagicMock(id="legacy-task")
+        with patch("api.services.task_manager.get_task_manager", return_value=fake_tm):
+            await scheduler._fire_entry(entry)
+        assert fake_tm.create.call_args.kwargs["tags"] == ["agent"]
+
+    @pytest.mark.asyncio
+    async def test_manual_agent_request_key_is_idempotent(self, scheduler):
+        entry = scheduler.store.create(
+            name="Manual", schedule_type="cron", schedule_value="0 9 * * *",
+            action="agent", executor="local", message_content="do it",
+        )
+        fake_tm = MagicMock()
+        fake_tm.create.return_value = MagicMock(id="manual-task")
+        with patch("api.services.task_manager.get_task_manager", return_value=fake_tm):
+            await scheduler._fire_entry(entry, manual=True, request_key="req-1")
+            await scheduler._fire_entry(entry, manual=True, request_key="req-1")
+        fake_tm.create.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_dispatched_occurrence_reconciles_and_advances_schedule(self, scheduler):
+        """Recovery of a linked handoff must not return before mark_triggered."""
+        entry = scheduler.store.create(
+            name="Recover once", schedule_type="once",
+            schedule_value="2999-01-01T09:00:00",
+            action="agent", executor="local", message_content="recover me",
+        )
+        scheduled_for = entry.next_trigger_at or entry.schedule_value
+        key = scheduler.session_store.occurrence_key_for(entry.id, scheduled_for)
+        scheduler.session_store.ensure_occurrence(entry.id, scheduled_for, occurrence_key=key)
+        scheduler.session_store.link_occurrence(key, task_id="recovered-task")
+
+        await scheduler._fire_entry(entry)
+
+        refreshed = scheduler.store.get(entry.id)
+        assert refreshed.enabled is False
+        assert refreshed.next_trigger_at is None
+        assert refreshed.last_status == "handed-off"
+        assert "recovered-task" in refreshed.last_result
+
+    @pytest.mark.asyncio
+    async def test_run_history_surfaced_in_dashboard(self, scheduler):
+        entry = scheduler.store.create(
+            name="Briefing", schedule_type="cron", schedule_value="0 9 * * *",
+            action="notify", message_type="static", message_content="Good morning",
+        )
+        with patch("api.services.telegram.send_message_async",
+                   new_callable=AsyncMock, return_value=True):
+            await scheduler._fire_entry(entry)
+        dashboard = (scheduler.store.scheduler_dir / "Dashboard.md").read_text(encoding="utf-8")
+        rf = dashboard.split("## Recently Fired", 1)[1]
+        assert "Briefing" in rf
+        assert "sent" in rf  # outcome column
+
+    @pytest.mark.asyncio
+    async def test_failed_fire_records_failure(self, scheduler):
+        entry = scheduler.store.create(
+            name="Breaks", schedule_type="cron", schedule_value="0 9 * * *",
+            action="prompt", message_type="prompt", message_content="x",
+        )
+        with patch.object(scheduler, "_generate_message",
+                          new_callable=AsyncMock, side_effect=RuntimeError("boom")):
+            with patch("api.services.telegram.send_message_async",
+                       new_callable=AsyncMock, return_value=True) as mock_send:
+                await scheduler._fire_entry(entry)
+        assert scheduler.store.get(entry.id).last_status == "failed"
+        assert "(failed)" in mock_send.call_args[0][0]
+
+    def test_fire_reminder_alias_exists(self, scheduler):
+        # Back-compat: the HTTP trigger route still calls _fire_reminder.
+        assert scheduler._fire_reminder == scheduler._fire_entry
+
+
+class TestMissedFire:
+    """Run-once catch-up: a missed trigger fires once, then advances."""
+
+    def test_missed_cron_is_due_once_then_advances(self, store):
+        past = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        entry = store.create(name="Missed", schedule_type="cron", schedule_value="0 9 * * *",
+                             action="notify", message_type="static", message_content="x")
+        entry.next_trigger_at = past  # simulate a window missed while down
+        # First tick after startup: due exactly once.
+        due = store.get_due_reminders()
+        assert [e.id for e in due] == [entry.id]
+        # Firing advances the trigger into the future and stamps last_triggered.
+        store.mark_triggered(entry.id)
+        refreshed = store.get(entry.id)
+        assert refreshed.next_trigger_at is not None
+        assert datetime.fromisoformat(refreshed.next_trigger_at) > datetime.now(timezone.utc)
+        # No duplicate catch-up: not due again (advanced + within cooldown).
+        assert store.get_due_reminders() == []

@@ -1,0 +1,891 @@
+"""Browser test for the /agents host filter + side panel fields.
+
+Serves `web/` itself on an ephemeral port and stubs every `/api/` call, the
+same server-free pattern as `tests/test_voice_mic_block_ui_browser.py` —
+the assertions are about the JS in *this* checkout, and `/api/agents/snapshot`
+is the only response that matters, so a live LifeOS API isn't needed. That is
+why this carries no `requires_server` marker and runs at pre-push
+(`browser and not requires_server`).
+
+`/agents` loads d3 from a CDN (`https://d3js.org/d3.v7.min.js`) — only
+`/api/**` is intercepted here (same as the voice test), so that request goes
+to the real network like it does for every other browser test against this
+page family.
+
+The Kanban board is the default /agents view; this graph lives behind a
+Graph tab, lazily initialized on first open — so every scenario here clicks
+into the Graph tab before touching graph-specific elements like
+`#filter-host` or `.node`, which live in initially-hidden markup and
+aren't wired up until `initGraph()` runs.
+
+`TestRecentChipAndRouteFilterAndNodeLabels` covers the "recent" chip
+(completed + ended), the route filter's `hermes`/`ask` options, and that no
+rendered node label is a literal '?' — using a second synthetic snapshot
+(`SNAPSHOT2`) on a single host so the host filter doesn't interfere.
+
+`TestSearchDropdownRawIdGuard` exercises the search dropdown's raw-id guard
+using a third synthetic snapshot (`SNAPSHOT3`) of sessions whose labels are
+raw identifiers under each of the ways `isRawIdValue` recognizes one.
+`TestSearchDropdownLabelSourcePrecedence` covers `custom_label` precedence
+and the `short_label`/summary match tiers, including a stubbed summary
+search response, using a fourth synthetic snapshot (`SNAPSHOT4`).
+"""
+import http.server
+import json
+import threading
+from pathlib import Path
+
+import pytest
+from playwright.sync_api import Page, expect
+
+pytestmark = [pytest.mark.browser, pytest.mark.slow]
+
+WEB_DIR = Path(__file__).resolve().parent.parent / "web"
+
+
+class _AgentsHandler(http.server.SimpleHTTPRequestHandler):
+    """Serves agents.html the way api/main.py does: `/agents` is agents.html
+    and the web/agents/*.js modules hang off `/static/`."""
+
+    def translate_path(self, path):
+        path = path.split("?", 1)[0].split("#", 1)[0]
+        if path in ("/agents", "/"):
+            return str(WEB_DIR / "agents.html")
+        if path.startswith("/static/"):
+            return str(WEB_DIR / path[len("/static/"):])
+        return str(WEB_DIR / path.lstrip("/"))
+
+    def log_message(self, *args):  # keep pytest output clean
+        pass
+
+
+@pytest.fixture(scope="module")
+def agents_base_url():
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _AgentsHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+# Two sessions on two different hosts — one carries branch + prompt_preview
+# (a cli_sessions row merged onto/registered without a local transcript),
+# the other is a bare local session so the "single host" collapse case
+# (host filter hidden) isn't accidentally exercised by every test.
+SNAPSHOT = {
+    "sessions": [
+        {
+            "session_id": "cc:host-filter-target",
+            "task_id": "t1",
+            "status": "running",
+            "status_inferred": False,
+            "routing": "claude_code",
+            "source": "claude_code",
+            "host": "laptop-a",
+            "branch": "feat/synthetic-branch",
+            "prompt_preview": "refactor the synthetic widget",
+            "started_at": 1000,
+            "last_activity_at": 2000,
+            "total_input_tokens": 10,
+            "total_output_tokens": 20,
+            "total_dollars": 0.01,
+            "spawn_depth": 0,
+            "label": "hosttest-alpha-session",
+            "model_label": "Sonnet",
+            "decoded_cwd": "/home/synthetic/proj-a",
+        },
+        {
+            "session_id": "sess_worker_on_apihost",
+            "task_id": "t2",
+            "status": "running",
+            "status_inferred": False,
+            "routing": "local",
+            "source": "lifeos_agent",
+            "host": "api-host",
+            "started_at": 1000,
+            "last_activity_at": 2000,
+            "total_input_tokens": 5,
+            "total_output_tokens": 5,
+            "total_dollars": 0.0,
+            "spawn_depth": 0,
+            "label": "hosttest-beta-session",
+            "model_label": "Local",
+            "decoded_cwd": "/home/synthetic/proj-b",
+        },
+        # A cli_sessions row whose SessionEnd event already fired — must be
+        # treated as terminal (hidden by default, shown with "include
+        # finished" on) rather than staying in the live view forever.
+        {
+            "session_id": "cc:host-filter-ended",
+            "task_id": "t3",
+            "status": "ended",
+            "status_inferred": False,
+            "routing": "claude_code",
+            "source": "claude_code",
+            "host": "laptop-a",
+            "branch": "feat/synthetic-branch",
+            "prompt_preview": "wrap up the synthetic widget",
+            "started_at": 1000,
+            "last_activity_at": 2000,
+            "total_input_tokens": 10,
+            "total_output_tokens": 20,
+            "total_dollars": 0.01,
+            "spawn_depth": 0,
+            "label": "hosttest-gamma-session",
+            "model_label": "Sonnet",
+            "decoded_cwd": "/home/synthetic/proj-a",
+        },
+    ],
+    "edges": [],
+    "generated_at": 1234567890,
+}
+
+
+def _open_agents(page: Page, base_url):
+    def handler(route):
+        if "/api/agents/snapshot" in route.request.url:
+            body = SNAPSHOT
+        elif "/api/agents/board" in route.request.url:
+            body = {"lanes": {}, "generated_at": 0}
+        else:
+            body = {}
+        route.fulfill(status=200, content_type="application/json",
+                      body=json.dumps(body))
+
+    page.route("**/api/**", handler)
+    page.goto(f"{base_url}/agents")
+    # The board is the default tab; the graph (and its filters) live
+    # behind the Graph tab and only initialize once it's opened.
+    page.click('[data-tab="graph"]')
+    # The host select ships with only its `all` option; the per-host options
+    # are appended once `GET /api/agents/snapshot` resolves and the graph
+    # applies it, so wait for those options rather than for the select
+    # itself, which exists in the markup before any data arrives.
+    page.wait_for_function(
+        "document.querySelector('#filter-host').options.length > 1"
+    )
+
+
+class TestHostFilter:
+    def test_filter_host_lists_every_host_from_the_snapshot(self, page: Page, agents_base_url):
+        _open_agents(page, agents_base_url)
+        select = page.locator("#filter-host")
+        options = select.locator("option").all_inner_texts()
+        assert "all" in options
+        assert "laptop-a" in options
+        assert "api-host" in options
+
+    def test_selecting_a_host_hides_sessions_from_other_hosts(self, page: Page, agents_base_url):
+        _open_agents(page, agents_base_url)
+        # Both sessions are recent enough to be visible under the default
+        # 30-minute recency filter only if last_activity_at is "now" — the
+        # fixture's timestamps are fixed epoch seconds well before now, so
+        # widen recency to "all time" first.
+        page.select_option("#filter-recency", "all")
+        page.select_option("#filter-host", "laptop-a")
+        nodes = page.locator(".node")
+        expect(nodes).to_have_count(1)
+
+
+class TestEndedStatus:
+    # The fixture has 3 sessions total: two 'running' and one 'ended'
+    # (cc:host-filter-ended). 'ended' must be treated as terminal — hidden
+    # by default and only shown once "include finished" is checked —
+    # otherwise a closed CLI session would stay in the live view
+    # indefinitely.
+    def test_ended_session_hidden_by_default(self, page: Page, agents_base_url):
+        _open_agents(page, agents_base_url)
+        page.select_option("#filter-recency", "all")
+        expect(page.locator(".node")).to_have_count(2)
+
+    def test_ended_session_shown_when_include_finished_is_checked(self, page: Page, agents_base_url):
+        _open_agents(page, agents_base_url)
+        page.select_option("#filter-recency", "all")
+        page.locator("#filter-terminal").check()
+        expect(page.locator(".node")).to_have_count(3)
+
+
+class TestPanelFields:
+    def test_panel_shows_host_branch_and_prompt_preview(self, page: Page, agents_base_url):
+        _open_agents(page, agents_base_url)
+        page.select_option("#filter-recency", "all")
+        page.locator("#search-input").fill("hosttest-alpha-session")
+        result = page.locator(".search-result", has_text="hosttest-alpha-session")
+        expect(result).to_be_visible()
+        result.click()
+
+        panel = page.locator("#panel")
+        expect(panel.locator('[data-field="host"]')).to_have_text("laptop-a")
+        expect(panel.locator('[data-field="branch-hint"]')).to_contain_text("feat/synthetic-branch")
+        expect(panel.locator('[data-field="prompt-preview-hint"]')).to_contain_text(
+            "refactor the synthetic widget")
+
+    def test_panel_omits_branch_and_prompt_fields_when_absent(self, page: Page, agents_base_url):
+        _open_agents(page, agents_base_url)
+        page.select_option("#filter-recency", "all")
+        page.locator("#search-input").fill("hosttest-beta-session")
+        result = page.locator(".search-result", has_text="hosttest-beta-session")
+        expect(result).to_be_visible()
+        result.click()
+
+        panel = page.locator("#panel")
+        expect(panel.locator('[data-field="host"]')).to_have_text("api-host")
+        expect(panel.locator('[data-field="branch-hint"]')).to_have_count(0)
+        expect(panel.locator('[data-field="prompt-preview-hint"]')).to_have_count(0)
+
+
+# ---------------------------------------------------------------------------
+# Covers: the recent chip (completed + ended), the route filter's hermes/ask
+# options, and the graph's node label precedence (never a literal '?').
+# Same server-free pattern as above: everything on one host so the host
+# filter doesn't interfere with these assertions, a mix of routing/status
+# values, and a CLI row with no label/short_label/prompt_preview at all —
+# the shape that would otherwise render a literal '?'.
+# ---------------------------------------------------------------------------
+
+SNAPSHOT2 = {
+    "sessions": [
+        {
+            "session_id": "sess_label_completed",
+            "task_id": "t-completed",
+            "status": "completed",
+            "status_inferred": False,
+            "routing": "local",
+            "source": "lifeos_agent",
+            "host": "host-1",
+            "started_at": 1000,
+            "last_activity_at": 2000,
+            "total_input_tokens": 5,
+            "total_output_tokens": 5,
+            "total_dollars": 0.0,
+            "spawn_depth": 0,
+            "label": "labeltest-alpha-completed",
+            "model_label": "Local",
+            "decoded_cwd": "/home/synthetic/proj-a",
+        },
+        {
+            # Shape a locally-scanned CC session actually ingests as: no
+            # custom title / AI title / user text / cwd basename, so
+            # `claude_code/session_ingest.py` falls `meta.label` back to the
+            # bare raw session id, while `session_id` carries the "cc:"
+            # prefix (`CC_PREFIX + raw_id`); the ingest always supplies a
+            # `label`, never omits it. This row also has a real
+            # `prompt_preview` — the node label must prefer that over the
+            # raw-id `label` (leak shape 1 below), and with neither present
+            # it must still never fall through to a literal '?'.
+            #
+            # `short_label` also carries the raw id here — exactly what
+            # `_fallback_label` caches when a terminal CLI session has no
+            # real content — to prove `short_label` gets the same raw-id
+            # guard as `label` rather than leaking through one precedence
+            # slot higher.
+            "session_id": "cc:0e6b2c14-9f77-4a1e-8b55-3c2f9d10aa42",
+            "task_id": None,
+            "status": "ended",
+            "status_inferred": False,
+            "routing": "claude_code",
+            "source": "claude_code",
+            "host": "host-1",
+            "started_at": 1000,
+            "last_activity_at": 2000,
+            "total_input_tokens": 10,
+            "total_output_tokens": 20,
+            "total_dollars": 0.01,
+            "spawn_depth": 0,
+            "label": "0e6b2c14-9f77-4a1e-8b55-3c2f9d10aa42",
+            "short_label": "0e6b2c14-9f77-4a1e-8b55-3c2f9d10aa42",
+            "prompt_preview": "fix the synthetic widget parser",
+            "model_label": "Claude Code",
+            "decoded_cwd": "/home/synthetic/proj-a",
+        },
+        {
+            # An orphaned worker row: `_label_for_session` falls back
+            # to `s.task_id` when the task lookup finds no description (e.g.
+            # the vault task file was deleted while the `sessions` row
+            # survived), so `label` equals `task_id` verbatim. That raw id
+            # must not render as the node label (leak shape 2 below).
+            #
+            # `short_label` also equals `task_id` here, proving the guard
+            # catches `short_label` == task_id, not just
+            # `short_label` == session_id.
+            "session_id": "sess_label_orphan",
+            "task_id": "t-orphan-deleted",
+            "status": "running",
+            "status_inferred": False,
+            "routing": "local",
+            "source": "lifeos_agent",
+            "host": "host-1",
+            "started_at": 1000,
+            "last_activity_at": 2000,
+            "total_input_tokens": 0,
+            "total_output_tokens": 0,
+            "total_dollars": 0.0,
+            "spawn_depth": 0,
+            "label": "t-orphan-deleted",
+            "short_label": "t-orphan-deleted",
+            "model_label": "Local",
+            "decoded_cwd": "/home/synthetic/proj-a",
+        },
+        {
+            "session_id": "sess_label_ask",
+            "task_id": "t-ask",
+            "status": "running",
+            "status_inferred": False,
+            "routing": "ask",
+            "source": "lifeos_agent",
+            "host": "host-1",
+            "started_at": 1000,
+            "last_activity_at": 2000,
+            "total_input_tokens": 0,
+            "total_output_tokens": 0,
+            "total_dollars": 0.0,
+            "spawn_depth": 0,
+            "label": "labeltest-ask",
+            "model_label": "Waiting on you",
+            "decoded_cwd": "/home/synthetic/proj-a",
+        },
+        {
+            "session_id": "sess_label_hermes",
+            "task_id": "t-hermes",
+            "status": "running",
+            "status_inferred": False,
+            "routing": "hermes",
+            "source": "lifeos_agent",
+            "host": "host-1",
+            "started_at": 1000,
+            "last_activity_at": 2000,
+            "total_input_tokens": 1,
+            "total_output_tokens": 1,
+            "total_dollars": 0.001,
+            "spawn_depth": 0,
+            "label": "labeltest-hermes",
+            "model_label": "Hermes",
+            "decoded_cwd": "/home/synthetic/proj-a",
+        },
+        {
+            "session_id": "sess_label_remote",
+            "task_id": "t-remote",
+            "status": "running",
+            "status_inferred": False,
+            "routing": "remote",
+            "source": "lifeos_agent",
+            "host": "host-1",
+            "started_at": 1000,
+            "last_activity_at": 2000,
+            "total_input_tokens": 1,
+            "total_output_tokens": 1,
+            "total_dollars": 0.002,
+            "spawn_depth": 0,
+            "label": "labeltest-remote",
+            "model_label": "Remote",
+            "decoded_cwd": "/home/synthetic/proj-a",
+        },
+        {
+            # A CLI row whose real title is non-Latin (CJK here).
+            # `_fallback_label` returns "" for a genuinely non-empty title
+            # that tokenizes to zero ASCII words — returning "Untitled"
+            # instead would sit ABOVE `label` in `nodeLabel`'s precedence
+            # and clobber the real title on screen for every non-Latin
+            # session. This row models the correct shape — empty
+            # `short_label`, the real title in `label` — end to end through
+            # the browser: the node must render the title, never
+            # "Untitled" and never blank.
+            "session_id": "cc:nonlatin-title-session",
+            "task_id": None,
+            "status": "running",
+            "status_inferred": False,
+            "routing": "claude_code",
+            "source": "claude_code",
+            "host": "host-1",
+            "started_at": 1000,
+            "last_activity_at": 2000,
+            "total_input_tokens": 3,
+            "total_output_tokens": 6,
+            "total_dollars": 0.001,
+            "spawn_depth": 0,
+            "label": "検索インデックスをリファクタリングする",
+            "short_label": "",
+            "model_label": "Claude Code",
+            "decoded_cwd": "/home/synthetic/proj-a",
+        },
+    ],
+    "edges": [],
+    "generated_at": 1234567890,
+}
+
+
+def _open_agents2(page: Page, base_url):
+    def handler(route):
+        if "/stream" in route.request.url:
+            # graph.js opens an EventSource against /api/agents/stream — a
+            # plain JSON stub response makes the browser log a real MIME-type
+            # console error unrelated to anything under test here.
+            route.fulfill(status=200, content_type="text/event-stream", body="")
+            return
+        if "/api/agents/snapshot" in route.request.url:
+            body = SNAPSHOT2
+        elif "/api/agents/board" in route.request.url:
+            body = {"lanes": {}, "generated_at": 0}
+        else:
+            body = {}
+        route.fulfill(status=200, content_type="application/json",
+                      body=json.dumps(body))
+
+    page.route("**/api/**", handler)
+    page.goto(f"{base_url}/agents")
+    page.click('[data-tab="graph"]')
+    page.wait_for_selector("#filter-route")
+    page.select_option("#filter-recency", "all")
+    page.locator("#filter-terminal").check()
+    # Nodes render synchronously once the filters above are applied — wait
+    # for the first one rather than for a fixed delay.
+    page.wait_for_selector(".node")
+
+
+class TestRecentChipAndRouteFilterAndNodeLabels:
+    def test_recent_chip_counts_completed_and_ended(self, page: Page, agents_base_url):
+        _open_agents2(page, agents_base_url)
+        expect(page.locator("#chip-recent")).to_have_text("2")
+
+    def test_route_filter_lists_hermes_remote_and_ask(self, page: Page, agents_base_url):
+        _open_agents2(page, agents_base_url)
+        options = page.locator("#filter-route option").all_inner_texts()
+        assert "hermes" in options
+        assert "remote" in options
+        assert "ask" in options
+
+    def test_route_filter_selecting_hermes_shows_only_hermes_node(self, page: Page, agents_base_url):
+        _open_agents2(page, agents_base_url)
+        page.select_option("#filter-route", "hermes")
+        expect(page.locator(".node")).to_have_count(1)
+
+    def test_route_filter_selecting_ask_shows_only_ask_node(self, page: Page, agents_base_url):
+        _open_agents2(page, agents_base_url)
+        page.select_option("#filter-route", "ask")
+        expect(page.locator(".node")).to_have_count(1)
+
+    def test_no_node_label_is_a_literal_question_mark(self, page: Page, agents_base_url):
+        """The node label is an SVG `<text class="node-label">` whose text
+        lives in appended `<tspan>` children (graph.js's `renderNodeLabel`).
+        SVG `<text>` has no `innerText`, so Playwright's `all_inner_texts()`
+        (which reads `innerText`) returns `None` for every element here,
+        which would make this assertion vacuously true even against a
+        `nodeLabel` that really does render a literal '?'.
+        Read `textContent` instead, which SVG supports."""
+        errors = []
+        page.on("console", lambda msg: errors.append(msg.text) if msg.type == "error" else None)
+
+        _open_agents2(page, agents_base_url)
+        expect(page.locator(".node")).to_have_count(7)
+        labels = page.eval_on_selector_all(
+            "text.node-label", "els => els.map(e => e.textContent)"
+        )
+        assert len(labels) == 7
+        assert all((label or "").strip() != "?" for label in labels)
+        assert all((label or "").strip() != "" for label in labels)
+        # Never a bare "Untitled" clobbering a real (non-Latin) title.
+        assert all((label or "").strip() != "Untitled" for label in labels)
+        assert errors == []
+
+    def test_node_label_renders_a_non_latin_title_not_untitled(self, page: Page, agents_base_url):
+        """`_fallback_label` must not return "Untitled" for a title that
+        tokenizes to zero ASCII words — that fires for every non-Latin
+        (CJK/Cyrillic/Greek/Arabic) or emoji-only title, not just a
+        genuinely empty one, and since "Untitled" sits ABOVE `label` in
+        `nodeLabel`'s precedence it would clobber the real title on screen.
+        It returns "" instead, so the node falls through to `label` exactly
+        as it already does for a raw-id `short_label`."""
+        _open_agents2(page, agents_base_url)
+        expect(page.locator(".node")).to_have_count(7)
+        rows = page.evaluate(
+            "() => Array.from(document.querySelectorAll('.node')).map(el => ({"
+            "session_id: el.__data__.session_id,"
+            "label: el.querySelector('text.node-label').textContent,"
+            "}))"
+        )
+        by_id = {r["session_id"]: r["label"] for r in rows}
+        rendered = (by_id["cc:nonlatin-title-session"] or "").replace(" ", "")
+        assert rendered == "検索インデックスをリファクタリングする".replace(" ", "")
+
+    def test_node_label_prefers_prompt_preview_over_a_raw_id_label(self, page: Page, agents_base_url):
+        """`nodeLabel`'s precedence guard compares equality against the
+        session id with its "cc:"/"cx:" prefix stripped, rather than
+        `session_id.startsWith(label)` — the latter never matches a
+        prefixed CLI session id ("cc:<uuid>".startsWith("<uuid>") is false),
+        which would let the raw id `label` the ingest falls back to shadow
+        the far more useful `prompt_preview`."""
+        _open_agents2(page, agents_base_url)
+        expect(page.locator(".node")).to_have_count(7)
+        rows = page.evaluate(
+            "() => Array.from(document.querySelectorAll('.node')).map(el => ({"
+            "session_id: el.__data__.session_id,"
+            "label: el.querySelector('text.node-label').textContent,"
+            "}))"
+        )
+        by_id = {r["session_id"]: r["label"] for r in rows}
+        # Long labels wrap across multiple <tspan> children (renderNodeLabel
+        # in graph.js) without preserving the inter-word space, so compare
+        # with whitespace collapsed rather than the raw textContent.
+        rendered = (by_id["cc:0e6b2c14-9f77-4a1e-8b55-3c2f9d10aa42"] or "").replace(" ", "")
+        assert rendered == "fix the synthetic widget parser".replace(" ", "")
+
+    def test_node_label_suppresses_a_worker_label_that_equals_its_task_id(self, page: Page, agents_base_url):
+        """An orphaned worker row's `label` falls back to its bare
+        `task_id` in `_label_for_session`; the node label must not render
+        that raw id and must fall through to the next real candidate
+        (`model_label` here, since there's no `prompt_preview`)."""
+        _open_agents2(page, agents_base_url)
+        expect(page.locator(".node")).to_have_count(7)
+        rows = page.evaluate(
+            "() => Array.from(document.querySelectorAll('.node')).map(el => ({"
+            "session_id: el.__data__.session_id,"
+            "label: el.querySelector('text.node-label').textContent,"
+            "}))"
+        )
+        by_id = {r["session_id"]: r["label"] for r in rows}
+        assert by_id["sess_label_orphan"] == "Local"
+
+    def test_panel_routing_badge_says_ask_not_a_model_name(self, page: Page, agents_base_url):
+        """panel.js's routingLabel() has an `ask` arm — the side
+        panel's Routing badge must say "Ask", never fall through to the
+        default "Claude"."""
+        _open_agents2(page, agents_base_url)
+        page.locator("#search-input").fill("labeltest-ask")
+        result = page.locator(".search-result", has_text="labeltest-ask")
+        expect(result).to_be_visible()
+        result.click()
+        expect(page.locator("#panel [data-field=\"routing\"]")).to_have_text("Ask")
+
+    def test_panel_routing_badge_says_hermes(self, page: Page, agents_base_url):
+        _open_agents2(page, agents_base_url)
+        page.locator("#search-input").fill("labeltest-hermes")
+        result = page.locator(".search-result", has_text="labeltest-hermes")
+        expect(result).to_be_visible()
+        result.click()
+        expect(page.locator("#panel [data-field=\"routing\"]")).to_have_text("Hermes")
+
+
+# ---------------------------------------------------------------------------
+# Search-dropdown title guard: the dropdown must never render a raw id
+# (session id, a "cc:"/"cx:"-stripped session id, or task_id) as a result
+# title, on any match tier. Same server-free pattern as above, one host.
+# ---------------------------------------------------------------------------
+
+SNAPSHOT3 = {
+    "sessions": [
+        {
+            "session_id": "sess_rawid_exact",
+            "task_id": "t-exact",
+            "status": "running",
+            "status_inferred": False,
+            "routing": "local",
+            "source": "lifeos_agent",
+            "host": "host-1",
+            "started_at": 1000,
+            "last_activity_at": 2000,
+            "total_input_tokens": 5,
+            "total_output_tokens": 5,
+            "total_dollars": 0.0,
+            "spawn_depth": 0,
+            "label": "sess_rawid_exact",
+            "short_label": "sess_rawid_exact",
+            "model_label": "Local",
+            "decoded_cwd": "/home/synthetic/proj-a",
+        },
+        {
+            "session_id": "sess_rawid_task",
+            "task_id": "t-orphan-deleted",
+            "status": "running",
+            "status_inferred": False,
+            "routing": "local",
+            "source": "lifeos_agent",
+            "host": "host-1",
+            "started_at": 1000,
+            "last_activity_at": 2000,
+            "total_input_tokens": 5,
+            "total_output_tokens": 5,
+            "total_dollars": 0.0,
+            "spawn_depth": 0,
+            "label": "t-orphan-deleted",
+            "short_label": "t-orphan-deleted",
+            "model_label": "Local",
+            "decoded_cwd": "/home/synthetic/proj-a",
+        },
+        {
+            "session_id": "cc:0e6b2c14-9f77-4a1e-8b55-3c2f9d10aa42",
+            "task_id": None,
+            "status": "running",
+            "status_inferred": False,
+            "routing": "claude_code",
+            "source": "claude_code",
+            "host": "host-1",
+            "started_at": 1000,
+            "last_activity_at": 2000,
+            "total_input_tokens": 10,
+            "total_output_tokens": 20,
+            "total_dollars": 0.01,
+            "spawn_depth": 0,
+            "label": "0e6b2c14-9f77-4a1e-8b55-3c2f9d10aa42",
+            "short_label": "0e6b2c14-9f77-4a1e-8b55-3c2f9d10aa42",
+            "prompt_preview": "fix the synthetic widget parser",
+            "model_label": "Claude Code",
+            "decoded_cwd": "/home/synthetic/proj-a",
+        },
+        {
+            "session_id": "sess_rawid_human",
+            "task_id": "t-human",
+            "status": "running",
+            "status_inferred": False,
+            "routing": "local",
+            "source": "lifeos_agent",
+            "host": "host-1",
+            "started_at": 1000,
+            "last_activity_at": 2000,
+            "total_input_tokens": 5,
+            "total_output_tokens": 5,
+            "total_dollars": 0.0,
+            "spawn_depth": 0,
+            "label": "dropdowntest-real-title",
+            "short_label": "",
+            "model_label": "Local",
+            "decoded_cwd": "/home/synthetic/proj-a",
+        },
+    ],
+    "edges": [],
+    "generated_at": 1234567890,
+}
+
+
+def _open_agents3(page: Page, base_url):
+    def handler(route):
+        if "/stream" in route.request.url:
+            route.fulfill(status=200, content_type="text/event-stream", body="")
+            return
+        if "/api/agents/snapshot" in route.request.url:
+            body = SNAPSHOT3
+        elif "/api/agents/board" in route.request.url:
+            body = {"lanes": {}, "generated_at": 0}
+        else:
+            body = {}
+        route.fulfill(status=200, content_type="application/json",
+                      body=json.dumps(body))
+
+    page.route("**/api/**", handler)
+    page.goto(f"{base_url}/agents")
+    page.click('[data-tab="graph"]')
+    page.wait_for_selector("#filter-route")
+    page.select_option("#filter-recency", "all")
+    page.locator("#filter-terminal").check()
+    # Nodes render synchronously once the filters above are applied — wait
+    # for the first one rather than for a fixed delay.
+    page.wait_for_selector(".node")
+
+
+class TestSearchDropdownRawIdGuard:
+    """The search dropdown's title goes through the same raw-id guard as the
+    graph node: the label tier is the path a stubbed snapshot reaches through
+    `buildSearchResults`, and `nodeLabel` is the single precedence chain."""
+
+    def test_exact_session_id_label_never_titles_the_result(self, page: Page, agents_base_url):
+        _open_agents3(page, agents_base_url)
+        page.locator("#search-input").fill("sess_rawid_exact")
+        result = page.locator(".search-result", has_text="Local")
+        expect(result).to_be_visible()
+        title = result.locator(".sr-name").inner_text()
+        assert title == "Local"
+        assert "sess_rawid_exact" not in title
+
+    def test_task_id_label_never_titles_the_result(self, page: Page, agents_base_url):
+        _open_agents3(page, agents_base_url)
+        page.locator("#search-input").fill("t-orphan")
+        result = page.locator(".search-result", has_text="Local")
+        expect(result).to_be_visible()
+        title = result.locator(".sr-name").inner_text()
+        assert title == "Local"
+        assert "t-orphan-deleted" not in title
+
+    def test_prefix_stripped_id_label_falls_through_to_prompt_preview(self, page: Page, agents_base_url):
+        _open_agents3(page, agents_base_url)
+        page.locator("#search-input").fill("0e6b2c14")
+        result = page.locator(".search-result", has_text="fix the synthetic widget parser")
+        expect(result).to_be_visible()
+        title = result.locator(".sr-name").inner_text()
+        assert title == "fix the synthetic widget parser"
+        assert "0e6b2c14" not in title
+
+    def test_real_label_still_titles_the_result(self, page: Page, agents_base_url):
+        _open_agents3(page, agents_base_url)
+        page.locator("#search-input").fill("dropdowntest-real")
+        result = page.locator(".search-result", has_text="dropdowntest-real-title")
+        expect(result).to_be_visible()
+        title = result.locator(".sr-name").inner_text()
+        assert title == "dropdowntest-real-title"
+
+    def test_no_result_title_is_ever_id_shaped(self, page: Page, agents_base_url):
+        _open_agents3(page, agents_base_url)
+        page.locator("#search-input").fill("e")
+        results = page.locator(".search-result")
+        expect(results).to_have_count(4)
+        titles = results.locator(".sr-name").all_inner_texts()
+
+        raw_ids = {
+            "sess_rawid_exact", "sess_rawid_task",
+            "cc:0e6b2c14-9f77-4a1e-8b55-3c2f9d10aa42",
+            "0e6b2c14-9f77-4a1e-8b55-3c2f9d10aa42",
+            "sess_rawid_human",
+            "t-exact", "t-orphan-deleted", "t-human",
+        }
+        assert all(title not in raw_ids for title in titles)
+        assert set(titles) == {"Local", "fix the synthetic widget parser", "dropdowntest-real-title"}
+
+
+def _bare_session(session_id, task_id, **overrides):
+    base = {
+        "session_id": session_id,
+        "task_id": task_id,
+        "status": "running",
+        "status_inferred": False,
+        "routing": "local",
+        "source": "lifeos_agent",
+        "host": "host-1",
+        "started_at": 1000,
+        "last_activity_at": 2000,
+        "total_input_tokens": 5,
+        "total_output_tokens": 5,
+        "total_dollars": 0.0,
+        "spawn_depth": 0,
+        "label": "",
+        "short_label": "",
+        "model_label": "Local",
+        "decoded_cwd": "/home/synthetic/proj-a",
+    }
+    base.update(overrides)
+    return base
+
+
+SNAPSHOT4 = {
+    "sessions": [
+        _bare_session(
+            "custlblid-001", "task-001",
+            custom_label="custlblid-001",
+        ),
+        _bare_session(
+            "sess-custom-real", "task-002",
+            custom_label="dropdowntest-custom-name",
+            label="dropdowntest-stale-label",
+        ),
+        _bare_session(
+            "sess-shortlabel-distinct", "task-003",
+            label="dropdowntest-long-label",
+            short_label="dropdowntest-short",
+        ),
+        _bare_session(
+            "sess-rawid-shortlabel-only", "task-004",
+            short_label="sess-rawid-shortlabel-only",
+        ),
+        _bare_session(
+            "sess-summary-match-only", "task-005",
+        ),
+        _bare_session(
+            "sess-shortlabel-vs-custom", "task-006",
+            custom_label="dropdowntest-operator-name",
+            label="dropdowntest-ingest-name",
+            short_label="dropdowntest-llm-short",
+        ),
+    ],
+    "edges": [],
+    "generated_at": 1234567890,
+}
+
+
+def _open_agents4(page: Page, base_url, search_matches=None):
+    def handler(route):
+        if "/stream" in route.request.url:
+            route.fulfill(status=200, content_type="text/event-stream", body="")
+            return
+        if "/api/agents/snapshot" in route.request.url:
+            body = SNAPSHOT4
+        elif "/api/agents/board" in route.request.url:
+            body = {"lanes": {}, "generated_at": 0}
+        elif "/api/agents/search" in route.request.url:
+            body = {"matches": search_matches or []}
+        else:
+            body = {}
+        route.fulfill(status=200, content_type="application/json",
+                      body=json.dumps(body))
+
+    page.route("**/api/**", handler)
+    page.goto(f"{base_url}/agents")
+    page.click('[data-tab="graph"]')
+    page.wait_for_selector("#filter-route")
+    page.select_option("#filter-recency", "all")
+    page.locator("#filter-terminal").check()
+    # Nodes render synchronously once the filters above are applied — wait
+    # for the first one rather than for a fixed delay.
+    page.wait_for_selector(".node")
+
+
+class TestSearchDropdownLabelSourcePrecedence:
+    """The label-tier title comes from the matched field's own value
+    (`custom_label || label`), guarded by `isRawIdValue` the same way the
+    node's `custom_label` slot is, and distinct from `sessionDisplayName`
+    (`nodeLabel`)'s separate precedence order — using a fourth synthetic
+    snapshot (`SNAPSHOT4`) built for these cases specifically."""
+
+    def test_custom_label_equal_to_session_id_never_titles_the_result(self, page: Page, agents_base_url):
+        _open_agents4(page, agents_base_url)
+        page.locator("#search-input").fill("custlblid-001")
+        result = page.locator(".search-result", has_text="Local")
+        expect(result).to_be_visible()
+        title = result.locator(".sr-name").inner_text()
+        assert title == "Local"
+        assert "custlblid-001" not in title
+
+    def test_custom_label_wins_over_stale_label_in_label_tier_title(self, page: Page, agents_base_url):
+        _open_agents4(page, agents_base_url)
+        page.locator("#search-input").fill("dropdowntest-custom")
+        result = page.locator(".search-result", has_text="dropdowntest-custom-name")
+        expect(result).to_be_visible()
+        name_el = result.locator(".sr-name")
+        assert name_el.inner_text() == "dropdowntest-custom-name"
+        assert "dropdowntest-stale-label" not in name_el.inner_text()
+        assert name_el.locator("mark").count() > 0
+
+    def test_label_tier_title_uses_matched_fields_own_value_not_short_label(self, page: Page, agents_base_url):
+        _open_agents4(page, agents_base_url)
+        page.locator("#search-input").fill("dropdowntest-long")
+        result = page.locator(".search-result", has_text="dropdowntest-long-label")
+        expect(result).to_be_visible()
+        title = result.locator(".sr-name").inner_text()
+        assert title == "dropdowntest-long-label"
+        assert title != "dropdowntest-short"
+
+    def test_short_label_and_summary_tier_titles_are_guarded_via_stubbed_search(self, page: Page, agents_base_url):
+        matches = [
+            {"session_id": "sess-rawid-shortlabel-only", "field": "short_label", "snippet": "rawid short label match"},
+            {"session_id": "sess-summary-match-only", "field": "summary", "snippet": "a synthetic summary match"},
+        ]
+        _open_agents4(page, agents_base_url, search_matches=matches)
+        page.locator("#search-input").fill("zz")
+        results = page.locator(".search-result")
+        expect(results).to_have_count(2)
+        titles = results.locator(".sr-name").all_inner_texts()
+        badges = results.locator(".sr-badge").all_inner_texts()
+        assert all(title == "Local" for title in titles)
+        assert "sess-rawid-shortlabel-only" not in titles
+        assert {b.lower() for b in badges} == {"label", "summary"}
+
+    def test_short_label_tier_title_uses_short_label_not_display_name(self, page: Page, agents_base_url):
+        matches = [
+            {"session_id": "sess-shortlabel-vs-custom", "field": "short_label", "snippet": "llm short label match"},
+        ]
+        _open_agents4(page, agents_base_url, search_matches=matches)
+        page.locator("#search-input").fill("llm-short")
+        result = page.locator(".search-result", has_text="dropdowntest-llm-short")
+        expect(result).to_be_visible()
+        name_el = result.locator(".sr-name")
+        assert name_el.inner_text() == "dropdowntest-llm-short"
+        assert name_el.inner_text() != "dropdowntest-operator-name"
+        assert name_el.locator("mark").count() > 0

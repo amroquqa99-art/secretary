@@ -1,0 +1,577 @@
+// web/agents/assignment.js
+//
+// Card-assignment pickers: engine, model, effort, and host — for a
+// board card's drawer. Isolated module, imported by board.js's
+// `renderDrawer()` via `renderAssignmentPickers`. Matches
+// board.js's card/drawer shapes exactly:
+//   - card: {id, title, notes, tags, assignee, fields, session, ...}
+//     `fields` is the task's `[key:: value]` inline-field map;
+//     `session` (when a session exists) carries `host`/`model`/`effort`
+//     — "what actually ran", read-only, distinct from the assignment.
+//   - `PUT /api/tasks/{id}` with `{fields: {...}}` patches inline fields;
+//     a field value of `null` clears it.
+//   - `GET /api/agents/models` returns
+//     `{engines: {claude: [...], codex: [...], local: [...], hermes: [...],
+//     remote: [...]}, defaults: {claude, codex, remote}, refreshed_at,
+//     stale}`, each entry `{id, label, pricing}` — the source for the
+//     model picker's options. `defaults` names the id each of
+//     claude/codex/remote currently runs on absent a board model
+//     override — `null` when none is known. The board's `cloud` engine
+//     reads the catalog's `remote` key (see `_catalogEngineKey` below).
+//   - `GET /api/agents/hosts` returns
+//     `{hosts: [{name, ssh_target, online, is_api_host}], refreshed_at}`
+//     — the source for the host picker's options; `online` is
+//     `true`/`false`/`null` (null = unknown, never guessed).
+//
+// No build step, no framework — plain DOM, matching every other file in
+// this directory.
+
+const ENGINES = ['claude', 'codex', 'local', 'hermes', 'cloud'];
+// Exported so web/agents/schedule_sections.js's execution-context group can
+// offer the same effort vocabulary for a schedule's `agent` action, which
+// stores it as a top-level schedule field rather than a task inline field.
+export const EFFORTS = ['low', 'medium', 'high', 'max'];
+
+// Engines whose executor actually reads a `model` field (claude_code_executor
+// / codex_executor's `--model` flag, and the #cloud route's LocalExecutor
+// forced onto the configured remote provider — see api/services/agent_worker/
+// local_executor.py's `session.execution_spec["model_id"]` pin). Local and
+// Hermes never take a board model override: local always runs the on-box
+// model, Hermes reports whatever model its provider served rather than
+// accepting a picker value.
+const ENGINES_WITH_MODEL_PICKER = new Set(['claude', 'codex', 'cloud']);
+// Engines whose executor reads an `effort` field. Hermes/cloud have no
+// effort override (see assignment.py's module docstring).
+const ENGINES_WITH_EFFORT_PICKER = new Set(['claude', 'codex', 'local']);
+// Engines a `host` field can steer over ssh (api/services/agent_worker/
+// remote_spawn.py) — local/Hermes/cloud always run wherever the API process does.
+const ENGINES_WITH_HOST_PICKER = new Set(['claude', 'codex']);
+
+// The board's `cloud` assignee runs on the worker's `remote` route (the
+// `#cloud` tag) — the one place mapping the board engine name to the
+// model catalog's engine key, since the catalog calls it `remote` (see
+// `model_catalog.py`), not `cloud`.
+function _catalogEngineKey(engine) {
+  return engine === 'cloud' ? 'remote' : engine;
+}
+
+function escapeHtml(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]));
+}
+
+function fieldValue(card, key) {
+  return (card && card.fields && card.fields[key]) || '';
+}
+
+// Fetches the model catalog once per page load and caches it — every card
+// drawer opened afterward reuses the same list rather than re-fetching.
+// A fetch failure degrades to an empty catalog (the model picker still
+// renders, just with no options besides "let the engine choose").
+let _catalogPromise = null;
+// Exported so web/agents/schedule_sections.js can offer the same model
+// catalog for a schedule's `agent` action — reusing the option source
+// rather than fetching it a second way.
+export function loadModelCatalog(fetchImpl = fetch) {
+  if (!_catalogPromise) {
+    _catalogPromise = fetchImpl('/api/agents/models')
+      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
+      .catch(() => ({ engines: { claude: [], codex: [], local: [], hermes: [], remote: [] }, defaults: {} }));
+  }
+  return _catalogPromise;
+}
+
+// Fetches the host registry — mostly mirrors loadModelCatalog above, but
+// differs in two ways the model catalog doesn't need (#901 round 1,
+// findings R1/R2):
+//   - a short client-side TTL (`_HOSTS_CLIENT_TTL_MS`, matched to
+//     host_catalog.py's own `_HOST_CATALOG_TTL_SECONDS`) instead of a
+//     once-per-page-load cache — reachability drifts minute to minute,
+//     unlike a 24h model list, so an operator who leaves /agents open
+//     needs the markers to actually refresh on a later drawer open.
+//   - a fetch failure is NOT cached: the caller for that one call gets
+//     `null` back, but the cache itself is cleared immediately so the
+//     NEXT drawer open retries instead of being stuck with an empty
+//     catalog (and thus no way to pick a host at all) for the rest of
+//     the page session. `populateHostOptions` below treats a `null`
+//     result as "leave the synchronous seed alone" — distinct from a
+//     catalog that resolved with a genuinely empty `hosts` list.
+//   - (#901 round 2, finding R6) a permanently failing endpoint must not
+//     be retried once per drawer open forever — after the SECOND
+//     consecutive failure, a short cooldown (`_HOSTS_FAILURE_COOLDOWN_MS`)
+//     suppresses further fetches so a dead endpoint costs one request per
+//     cooldown window rather than one per drawer open. A single transient
+//     blip (round 1's R1 territory) still retries on the very next drawer
+//     open — the cooldown only arms after a SECOND failure in a row.
+let _hostsCache = null; // { at: number (Date.now() ms), promise: Promise }
+const _HOSTS_CLIENT_TTL_MS = 30_000;
+let _hostsConsecutiveFailures = 0;
+let _hostsCooldownUntil = 0;
+const _HOSTS_FAILURE_COOLDOWN_MS = 10_000;
+// Exported so web/agents/schedule_sections.js can offer the same host
+// catalog for a schedule's `agent` action, reusing this module's TTL/
+// cooldown behavior rather than a second fetch path.
+export function loadHostCatalog(fetchImpl = fetch) {
+  const now = Date.now();
+  if (_hostsCache && (now - _hostsCache.at) < _HOSTS_CLIENT_TTL_MS) {
+    return _hostsCache.promise;
+  }
+  if (_hostsConsecutiveFailures >= 2 && now < _hostsCooldownUntil) {
+    return Promise.resolve(null); // still cooling down -- skip the fetch entirely
+  }
+  const promise = fetchImpl('/api/agents/hosts')
+    .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
+    .then(data => {
+      _hostsConsecutiveFailures = 0;
+      return data;
+    })
+    .catch(() => {
+      // (#901 round 2, finding M6) Only clear the cache if we're still the
+      // CURRENT entry — a slow fetch that fails after the TTL rolled and a
+      // newer fetch already cached a success must not clobber that newer
+      // entry.
+      // (#901 round 3, finding M13) Guard the failure counter the same
+      // way the cache clear above is guarded — a fetch that's no longer
+      // the CURRENT entry (a newer one already succeeded and replaced it)
+      // must not arm the cooldown against a healthy endpoint either.
+      if (_hostsCache === mine) {
+        _hostsCache = null;
+        _hostsConsecutiveFailures += 1;
+        if (_hostsConsecutiveFailures >= 2) {
+          _hostsCooldownUntil = Date.now() + _HOSTS_FAILURE_COOLDOWN_MS;
+        }
+      }
+      return null;
+    });
+  const mine = { at: now, promise };
+  _hostsCache = mine;
+  return promise;
+}
+
+/**
+ * Render the four assignment pickers into `container` for `card`.
+ *
+ * @param {HTMLElement} container - emptied and populated with the pickers.
+ * @param {object} card - the board card (see this file's header comment).
+ * @param {object} [opts]
+ * @param {(id: string, patch: object) => Promise} [opts.putTask] - PUT
+ *   /api/tasks/{id} caller; defaults to a real fetch. Tests inject a fake.
+ * @param {(fetchImpl?: Function) => Promise} [opts.loadCatalog] - override
+ *   for tests; defaults to the module's cached `loadModelCatalog`.
+ * @param {(fetchImpl?: Function) => Promise} [opts.loadHosts] - override
+ *   for tests; defaults to the module's cached `loadHostCatalog`.
+ * @param {Function} [opts.fetchImpl] - fetch override for the default
+ *   catalog/host loaders, when `opts.loadCatalog`/`opts.loadHosts` isn't
+ *   given.
+ * @param {() => void} [opts.onSaved] - called after a successful PUT.
+ * @param {(message: string) => void} [opts.onError] - called with an error
+ *   message on a failed PUT; defaults to a no-op (the caller — board.js's
+ *   showToast in the eventual hookup — decides how to surface it).
+ */
+export function renderAssignmentPickers(container, card, opts = {}) {
+  const putTask = opts.putTask || defaultPutTask;
+  const loadCatalog = opts.loadCatalog || (() => loadModelCatalog(opts.fetchImpl));
+  const loadHosts = opts.loadHosts || (() => loadHostCatalog(opts.fetchImpl));
+  const onSaved = opts.onSaved || (() => {});
+  const onError = opts.onError || (() => {});
+
+  const currentEngine = (card.assignee || '').toLowerCase();
+  const currentModel = fieldValue(card, 'model');
+  const currentEffort = fieldValue(card, 'effort');
+  const currentHost = fieldValue(card, 'host');
+  const ran = card.session || null;
+
+  // `card.policy` is the server's own decision (see _card_policy in
+  // api/routes/agents.py) — this module never re-derives the rule, it just
+  // disables-and-explains. A card with no `policy` at all (a schedule card
+  // never reaches this module) defaults to allowed, matching every other
+  // policy read in the board UI.
+  const fieldsPolicy = (card.policy && card.policy.fields) || { allowed: true, reason: null };
+  const fieldsDisabled = fieldsPolicy.allowed === false;
+
+  // (#901 round 2, finding A3) Last-known-good values for the three
+  // fields every save() sends, seeded from the card and updated on each
+  // SUCCESSFUL save. A rejected save reverts the controls to these —
+  // mirroring how every other drawer control (title, notes, tags, the
+  // Assignee select in board.js) already snaps back on failure
+  // — so a host/effort/model change the server REJECTS can never ride
+  // along, silently, on the next unrelated save.
+  //
+  // (#901 round 3, finding A5/M11) These are set from exactly what the
+  // succeeding save SENT (captured before its `await`), never re-read
+  // from the live controls at some other save's resolution time — with
+  // two saves in flight, the live controls can already reflect a THIRD,
+  // still-pending change, which would make an unrelated revert clobber a
+  // committed value or leave a rejected one in place. See save()'s
+  // serialization below for how "two saves in flight" is made impossible
+  // in the first place.
+  let lastSavedEffort = currentEffort;
+  let lastSavedHost = currentHost;
+  let lastSavedModel = currentModel;
+
+  container.innerHTML = `
+    <div class="assignment-row" data-row="engine">
+      <label class="assignment-label">Engine</label>
+      <select class="assignment-engine" data-field="engine" ${fieldsDisabled ? 'disabled' : ''}>
+        <option value="">unassigned</option>
+        ${ENGINES.map(e => `<option value="${e}" ${currentEngine === e ? 'selected' : ''}>${e}</option>`).join('')}
+      </select>
+    </div>
+    <div class="assignment-row" data-row="model" hidden>
+      <label class="assignment-label">Model</label>
+      <select class="assignment-model" data-field="model" ${fieldsDisabled ? 'disabled' : ''}>
+        <option value="">engine default</option>
+      </select>
+    </div>
+    <div class="assignment-row" data-row="effort" hidden>
+      <label class="assignment-label">Effort</label>
+      <select class="assignment-effort" data-field="effort" ${fieldsDisabled ? 'disabled' : ''}>
+        <option value="">default</option>
+        ${EFFORTS.map(e => `<option value="${e}" ${currentEffort === e ? 'selected' : ''}>${e}</option>`).join('')}
+      </select>
+    </div>
+    <div class="assignment-row" data-row="host" hidden>
+      <label class="assignment-label">Host</label>
+      <select class="assignment-host" data-field="host" ${fieldsDisabled ? 'disabled' : ''}></select>
+    </div>
+    <div class="assignment-ran" data-field="ran"></div>
+    <div class="drawer-field-reason" data-field="fields-reason" ${fieldsDisabled ? '' : 'hidden'}>${fieldsDisabled ? escapeHtml(fieldsPolicy.reason || "This card's fields can't be changed right now.") : ''}</div>
+    <div class="assignment-error" data-field="error" hidden></div>
+  `;
+
+  const engineEl = container.querySelector('[data-field="engine"]');
+  const modelRow = container.querySelector('[data-row="model"]');
+  const modelEl = container.querySelector('[data-field="model"]');
+  const effortRow = container.querySelector('[data-row="effort"]');
+  const effortEl = container.querySelector('[data-field="effort"]');
+  const hostRow = container.querySelector('[data-row="host"]');
+  const hostEl = container.querySelector('[data-field="host"]');
+  const ranEl = container.querySelector('[data-field="ran"]');
+  const errorEl = container.querySelector('[data-field="error"]');
+
+  function renderRan() {
+    if (!ran || (!ran.model && !ran.effort && !ran.host)) {
+      ranEl.textContent = '';
+      return;
+    }
+    const parts = [];
+    if (ran.model) parts.push(`model ${ran.model}`);
+    if (ran.effort) parts.push(`effort ${ran.effort}`);
+    if (ran.host) parts.push(`host ${ran.host}`);
+    ranEl.textContent = `Actually ran: ${parts.join(', ')}`;
+  }
+  renderRan();
+
+  function updateVisibility() {
+    const engine = engineEl.value;
+    modelRow.hidden = !ENGINES_WITH_MODEL_PICKER.has(engine);
+    effortRow.hidden = !ENGINES_WITH_EFFORT_PICKER.has(engine);
+    hostRow.hidden = !ENGINES_WITH_HOST_PICKER.has(engine);
+  }
+  updateVisibility();
+
+  // Model select: the saved model is seeded as a selected option
+  // SYNCHRONOUSLY, before `GET /api/agents/models` has even been
+  // requested, so `modelEl.value` is correct from the very first render
+  // — mirroring the host select immediately below. Once the real catalog
+  // resolves, populateModelOptions() rebuilds the options list against it
+  // and the LIVE select value, classifying that value three ways (see its
+  // own comment below): a model the current engine's catalog lists keeps
+  // its normal label; one only another engine's catalog lists drops to
+  // "engine default"; one no engine's catalog lists stays as the same
+  // flagged-unknown option (`data-unknown="true"`) rather than
+  // disappearing.
+  function seedModelOptions() {
+    const optionsHtml = ['<option value="">engine default</option>'];
+    if (currentModel) {
+      optionsHtml.push(`<option value="${escapeHtml(currentModel)}" selected data-unknown="true">${escapeHtml(currentModel)} (unknown)</option>`);
+    }
+    modelEl.innerHTML = optionsHtml.join('');
+  }
+  seedModelOptions();
+
+  function populateModelOptions(catalog) {
+    // Read the LIVE selection, not `currentModel` (the render-time
+    // snapshot) — the operator may have already changed the model, or
+    // switched engines, while this fetch was in flight, and that live
+    // choice wins over the catalog landing. `modelEl.value` still equals
+    // the seeded `currentModel` when nothing has changed, so the
+    // synchronous-seed behavior above is unaffected. This also runs on
+    // every mount — including a full remount driven by board.js's own
+    // Assignee select, which replaces this module's engine picker as the
+    // one way an operator actually changes a card's engine — so the
+    // engine-ownership decision below has to live here rather than in a
+    // change handler on this module's own (board-hidden) engine select.
+    const engine = engineEl.value;
+    const catalogEngine = _catalogEngineKey(engine);
+    const engines = catalog.engines || {};
+    const models = engines[catalogEngine] || [];
+    const current = modelEl.value;
+    const known = models.some(m => m.id === current);
+    // A live selection absent from the CURRENT engine's catalog but
+    // listed by some OTHER engine's catalog belongs to that other
+    // engine — a model id is only valid for the catalog it came from,
+    // and carrying it onto this engine's CLI invocation fails there. A
+    // selection absent from EVERY engine's catalog is genuinely unknown
+    // and stays selected, flagged `data-unknown="true"`.
+    const foreign = current && !known && Object.keys(engines)
+      .some(other => other !== catalogEngine && (engines[other] || []).some(m => m.id === current));
+    const defaultId = (catalog.defaults || {})[catalogEngine];
+    const defaultLabel = defaultId ? `engine default (${escapeHtml(defaultId)})` : 'engine default';
+    const optionsHtml = [`<option value="">${defaultLabel}</option>`];
+    for (const m of models) {
+      const selected = !foreign && current === m.id ? 'selected' : '';
+      optionsHtml.push(`<option value="${escapeHtml(m.id)}" ${selected}>${escapeHtml(m.label || m.id)}</option>`);
+    }
+    if (current && !known && !foreign) {
+      optionsHtml.push(`<option value="${escapeHtml(current)}" selected data-unknown="true">${escapeHtml(current)} (unknown)</option>`);
+    }
+    modelEl.innerHTML = optionsHtml.join('');
+    if (foreign) {
+      // Drop the foreign selection back to "engine default", and reset
+      // the failed-save revert target to match — otherwise a later
+      // rejected save could restore the dropped model into the picker.
+      modelEl.value = '';
+      lastSavedModel = '';
+    }
+  }
+  loadCatalog().then(populateModelOptions);
+
+  // Host select: the saved host is seeded as a selected option
+  // SYNCHRONOUSLY, before `GET /api/agents/hosts` has even been
+  // requested, so hostEl.value is correct from the very first render.
+  // Once the real host list resolves, populateHostOptions() rebuilds the
+  // options list against it — a saved host that IS in the registry gets
+  // its real online marker; a saved host that ISN'T stays as the same
+  // flagged-unknown option (`data-unknown="true"`) rather than
+  // disappearing.
+  function seedHostOptions() {
+    const optionsHtml = ['<option value="">this machine</option>'];
+    if (currentHost) {
+      optionsHtml.push(`<option value="${escapeHtml(currentHost)}" selected data-unknown="true">${escapeHtml(currentHost)} (unknown)</option>`);
+    }
+    hostEl.innerHTML = optionsHtml.join('');
+  }
+  seedHostOptions();
+
+  function hostLabel(host) {
+    if (host.online === false) return `${host.name} (offline)`;
+    if (host.online === null || host.online === undefined) return `${host.name} (unknown)`;
+    return host.name;
+  }
+  function populateHostOptions(catalog) {
+    // `null` means the fetch failed, or was skipped by the R6 cooldown
+    // below (see loadHostCatalog) — leave the synchronous seed exactly as
+    // seedHostOptions() rendered it rather than collapsing it to just
+    // "this machine", but tell the operator the REGISTRY failed to load
+    // (#901 round 2, finding R7) — otherwise a card with no saved host
+    // shows exactly one option and reads as "no hosts are registered",
+    // not "the registry couldn't be loaded". The marker option is
+    // `disabled` so it can never become the selected value, and thus
+    // never rides along as `fields.host` on a later save.
+    if (!catalog) {
+      const unavailable = document.createElement('option');
+      unavailable.value = '__hosts_unavailable__';
+      unavailable.disabled = true;
+      unavailable.textContent = 'hosts unavailable — reopen to retry';
+      hostEl.appendChild(unavailable);
+      return;
+    }
+    // Read the LIVE selection, not `currentHost` (the render-time
+    // snapshot) — the operator may have already changed the host while
+    // this fetch was in flight, and that live choice must win over the
+    // catalog landing (#901 round 1, finding A1). `hostEl.value` still
+    // equals the seeded `currentHost` when nothing has changed, so the
+    // synchronous-seed behavior above is unaffected.
+    const current = hostEl.value;
+    const hosts = (catalog.hosts) || [];
+    const known = hosts.some(h => h.name === current);
+    const optionsHtml = ['<option value="">this machine</option>'];
+    for (const h of hosts) {
+      const selected = current === h.name ? 'selected' : '';
+      optionsHtml.push(`<option value="${escapeHtml(h.name)}" ${selected}>${escapeHtml(hostLabel(h))}</option>`);
+    }
+    if (current && !known) {
+      optionsHtml.push(`<option value="${escapeHtml(current)}" selected data-unknown="true">${escapeHtml(current)} (unknown)</option>`);
+    }
+    hostEl.innerHTML = optionsHtml.join('');
+  }
+  loadHosts().then(populateHostOptions);
+
+  function showError(message) {
+    errorEl.textContent = message;
+    errorEl.hidden = false;
+    onError(message);
+  }
+
+  function clearError() {
+    errorEl.hidden = true;
+    errorEl.textContent = '';
+  }
+
+  // (#901 round 3, finding R9) Assign `value` to `el`, and if the option
+  // that held it has since been removed from the DOM — the DOM silently
+  // sets `selectedIndex = -1` and `value = ""`, which for host/effort/
+  // model is a REAL, different value ("this machine" / "default" /
+  // "engine default"), not "unset" — re-append it as a flagged-unknown
+  // option and assign again. Reachable for the host select in particular:
+  // round 1's A1 live-value read rebuilds the option list around
+  // whatever is currently selected, which can drop the very option a
+  // later revert wants to restore.
+  function restoreSelect(el, value) {
+    el.value = value;
+    if (value && el.value !== value) {
+      const opt = document.createElement('option');
+      opt.value = value;
+      opt.dataset.unknown = 'true';
+      opt.textContent = `${value} (unknown)`;
+      el.appendChild(opt);
+      el.value = value;
+    }
+  }
+
+  // Every picker writes the SAME shape: the assignee tag (if it's the
+  // engine picker changing) plus the three inline fields — model, effort,
+  // host — always stamping `assigned_by: "board"` — that's what keeps
+  // preflight's routing corroboration from ever second-guessing a board
+  // assignment (see api/services/agent_worker/preflight.py's
+  // `_apply_route_corroboration` and assignment.py's module docstring).
+  // The model select's synchronous seed (see seedModelOptions above)
+  // means `modelEl.value` already equals the card's saved model before
+  // the catalog resolves, so sending it on the very first effort/host
+  // change of a page load carries the saved value forward instead of
+  // clearing it.
+  //
+  // Saves are serialized through a single in-flight chain (`saveChain`
+  // below) rather than fired independently: without it, whichever of two
+  // in-flight saves finishes LAST would decide what "last known good"
+  // means for BOTH, so an accepted change could be reverted by an
+  // unrelated later rejection, and a rejected change could be "confirmed"
+  // by an unrelated earlier acceptance — both silent, no toast. Chaining
+  // each save onto the previous one's settlement means at
+  // most one PUT is ever outstanding, so there is no "other save's
+  // resolution time" left to read from: `runSave` reads the controls
+  // fresh, at the moment it actually starts, and every `lastSaved*`
+  // update reflects exactly what THAT save sent.
+  async function runSave(extra) {
+    const { tags, ...extraFields } = extra;  // `tags` is a top-level PUT key, not a field
+    // Capture what's actually being sent BEFORE the await —
+    // `lastSaved*` must reflect the payload this save
+    // sent, not whatever the controls happen to hold once the PUT
+    // resolves (a later change may already have moved them, even with
+    // saves serialized — the operator can still edit while a PUT is in
+    // flight).
+    const sentEffort = effortEl.value;
+    const sentHost = hostEl.value.trim();
+    const sentModel = modelEl.value;
+    const fields = {
+      model: sentModel || null,
+      effort: sentEffort || null,
+      host: sentHost || null,
+      assigned_by: 'board',
+      ...extraFields,
+    };
+    const patch = { fields };
+    if (tags) patch.tags = tags;
+    try {
+      await putTask(card.id, patch);
+      // Record what actually stuck, so a LATER
+      // failed save has something correct to revert to.
+      lastSavedEffort = sentEffort;
+      lastSavedHost = sentHost;
+      lastSavedModel = sentModel;
+      clearError();
+      onSaved();
+    } catch (err) {
+      // The server REJECTED the update — revert the controls to their
+      // last-known-good values BEFORE surfacing the error, so the rejected
+      // choice can't ride along on the next unrelated save with no toast
+      // at all. Every other drawer control already does this on failure
+      // (board.js's title/notes/tags fields and the Assignee select);
+      // the assignment pickers behave the same way. The engine
+      // select is deliberately NOT reverted here — board.js owns the
+      // Assignee select and hides this module's engine row, so there's
+      // no user-reachable path that leaves it stale.
+      // Only snap a control back when it still holds exactly what THIS
+      // save sent. A control the operator has already moved on to
+      // something newer keeps that newer value here -- the operator's
+      // later edit already queued its own save through the chain below,
+      // so it reaches the server on its own turn rather than getting
+      // overwritten by this revert.
+      if (effortEl.value === sentEffort) restoreSelect(effortEl, lastSavedEffort);
+      if (hostEl.value.trim() === sentHost) restoreSelect(hostEl, lastSavedHost);
+      if (modelEl.value === sentModel) restoreSelect(modelEl, lastSavedModel);
+      showError(err && err.message ? err.message : String(err));
+    }
+  }
+
+  // A promise chain, not a boolean flag — each call appends its
+  // `runSave` onto whatever the previous call is still doing, so calls
+  // made back-to-back (a rapid succession of picker changes) run their
+  // PUTs one at a time, in order, and `saveChain` always represents "the
+  // most recent save, whether or not it has settled yet." `runSave`
+  // never rethrows (matching the original, unserialized behavior), so
+  // the chain itself never rejects and a failed save can't break saving
+  // for subsequent changes.
+  let saveChain = Promise.resolve();
+  // Counts saves that have been queued but haven't settled yet -- a
+  // caller (board.js) reads `isSaving()` below to know whether a card
+  // snapshot it holds could predate a save still in flight through this
+  // chain, before using that snapshot to rebuild these pickers.
+  let pendingSaves = 0;
+  function save(extra = {}) {
+    pendingSaves += 1;
+    const task = saveChain.then(() => runSave(extra)).finally(() => { pendingSaves -= 1; });
+    saveChain = task;
+    return task;
+  }
+
+  engineEl.addEventListener('change', () => {
+    updateVisibility();
+    const engine = engineEl.value;
+    const nonAssigneeTags = (card.tags || []).filter(t => !ENGINES.includes((t || '').toLowerCase()));
+    const tags = engine ? [engine, ...nonAssigneeTags] : nonAssigneeTags;
+    // `populateModelOptions` decides whether the live model selection
+    // belongs to this engine, another engine, or no engine's catalog at
+    // all (see its own comment above) — chained onto the same catalog
+    // fetch as `save`, one after the other, so the PUT this engine
+    // switch fires always carries the value that decision just settled
+    // on rather than racing it.
+    loadCatalog().then(catalog => {
+      populateModelOptions(catalog);
+      save({ tags });
+    });
+  });
+  modelEl.addEventListener('change', () => save());
+  effortEl.addEventListener('change', () => save());
+  hostEl.addEventListener('change', () => save());
+
+  return {
+    engineEl, modelEl, effortEl, hostEl,
+    // Whether a save queued through `save()` above hasn't settled yet --
+    // a card snapshot taken while this is true is not safe to rebuild
+    // these pickers from.
+    isSaving: () => pendingSaves > 0,
+    // Resolves once every save queued through `save()` so far has settled
+    // (accepted or reverted) -- a caller that needs to rebuild these
+    // pickers while `isSaving()` is true can chain onto this instead of
+    // re-seeding them from a pre-save snapshot.
+    whenIdle: () => saveChain,
+  };
+}
+
+async function defaultPutTask(taskId, patch) {
+  const r = await fetch(`/api/tasks/${encodeURIComponent(taskId)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch),
+  });
+  if (!r.ok) {
+    const text = await r.text();
+    let msg = text;
+    try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) { /* not JSON */ }
+    throw new Error(msg || `HTTP ${r.status}`);
+  }
+  return r.json();
+}

@@ -1,0 +1,1590 @@
+"""
+SourceEntity - Raw observation records from various data sources.
+
+Part of the two-tier CRM data model:
+- SourceEntity: Immutable raw observations (this file)
+- CanonicalPerson: Unified person records (person_entity.py)
+
+SourceEntities preserve the original data from each source and track
+their linkage to canonical person records with confidence scores.
+"""
+import sqlite3
+import json
+import threading
+import uuid
+import logging
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone, timedelta
+from typing import Optional
+
+from api.utils.datetime_utils import make_aware as _make_aware
+from api.utils.db_paths import get_crm_db_path
+from config.marketing_patterns import is_blocklisted_domain
+
+logger = logging.getLogger(__name__)
+
+
+# Valid source types
+SOURCE_TYPES = {
+    "gmail",
+    "calendar",
+    "slack",
+    "imessage",
+    "whatsapp",
+    "signal",
+    "contacts",
+    "phone_contacts",
+    "linkedin",
+    "vault",
+    "granola",
+    "phone_call",
+    "phone",
+    "photos",
+}
+
+
+def _is_blocklisted_entity(entity: "SourceEntity") -> bool:
+    """
+    True if this entity's observed email is on a marketing blocklist.
+
+    Such entities can never resolve to a person, so re-attempting them is pure
+    waste — and because the linking script recorded a match attempt on every
+    skip, they were re-queued under backoff forever and permanently inflated
+    the reported capped backlog. Entities with no observed_email are
+    never blocklisted; they may still be matchable by name or phone.
+    """
+    return bool(entity.observed_email) and is_blocklisted_domain(entity.observed_email)
+
+
+# Link status values
+LINK_STATUS_AUTO = "auto"  # Automatically linked
+LINK_STATUS_CONFIRMED = "confirmed"  # User confirmed the link
+LINK_STATUS_REJECTED = "rejected"  # User rejected the link
+
+
+@dataclass
+class SourceEntity:
+    """
+    A raw observation from a data source.
+
+    Represents a single instance where we observed information about a person
+    from a specific source. Multiple SourceEntities may link to the same
+    CanonicalPerson.
+    """
+
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    source_type: str = ""  # gmail, calendar, slack, imessage, etc.
+    source_id: Optional[str] = None  # Unique ID within the source
+
+    # Observed data (may be partial/incomplete)
+    observed_name: Optional[str] = None
+    observed_email: Optional[str] = None
+    observed_phone: Optional[str] = None
+
+    # Additional source-specific metadata (JSON)
+    metadata: dict = field(default_factory=dict)
+
+    # Link to canonical person
+    canonical_person_id: Optional[str] = None
+    link_confidence: float = 0.0  # 0.0-1.0
+    link_status: str = LINK_STATUS_AUTO  # auto, confirmed, rejected
+    link_method: Optional[str] = None  # Resolution method (email_exact, phone_exact, name_fuzzy, etc.)
+    linked_at: Optional[datetime] = None
+
+    # Timestamps
+    observed_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+    # Re-matching bookkeeping (see get_unlinked_for_rematching / record_match_attempt)
+    match_attempted_at: Optional[datetime] = None
+    match_attempt_count: int = 0
+
+    def __post_init__(self):
+        """Validate source type."""
+        if self.source_type and self.source_type not in SOURCE_TYPES:
+            logger.warning(f"Unknown source type: {self.source_type}")
+
+    def to_dict(self) -> dict:
+        """Convert to dict for JSON serialization."""
+        data = asdict(self)
+        # Convert datetime to ISO format strings
+        if self.observed_at:
+            data["observed_at"] = self.observed_at.isoformat()
+        if self.created_at:
+            data["created_at"] = self.created_at.isoformat()
+        if self.linked_at:
+            data["linked_at"] = self.linked_at.isoformat()
+        if self.match_attempted_at:
+            data["match_attempted_at"] = self.match_attempted_at.isoformat()
+        return data
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "SourceEntity":
+        """Create SourceEntity from dict."""
+        # Parse datetime strings
+        if data.get("observed_at") and isinstance(data["observed_at"], str):
+            data["observed_at"] = _make_aware(datetime.fromisoformat(data["observed_at"]))
+        if data.get("created_at") and isinstance(data["created_at"], str):
+            data["created_at"] = _make_aware(datetime.fromisoformat(data["created_at"]))
+        if data.get("linked_at") and isinstance(data["linked_at"], str):
+            data["linked_at"] = _make_aware(datetime.fromisoformat(data["linked_at"]))
+        if data.get("match_attempted_at") and isinstance(data["match_attempted_at"], str):
+            data["match_attempted_at"] = _make_aware(datetime.fromisoformat(data["match_attempted_at"]))
+        return cls(**data)
+
+    @classmethod
+    def from_row(cls, row: tuple) -> "SourceEntity":
+        """Create SourceEntity from SQLite row."""
+        # Row order: id, source_type, source_id, observed_name, observed_email,
+        #            observed_phone, metadata, canonical_person_id, link_confidence,
+        #            link_status, linked_at, observed_at, created_at,
+        #            match_attempted_at[13], match_attempt_count[14], link_method[15]
+
+        observed_at = datetime.fromisoformat(row[11]) if row[11] else datetime.now(timezone.utc)
+        created_at = datetime.fromisoformat(row[12]) if row[12] else datetime.now(timezone.utc)
+        linked_at = datetime.fromisoformat(row[10]) if row[10] else None
+        match_attempted_at = (
+            datetime.fromisoformat(row[13]) if len(row) > 13 and row[13] else None
+        )
+        match_attempt_count = row[14] if len(row) > 14 and row[14] is not None else 0
+        link_method = row[15] if len(row) > 15 else None
+
+        return cls(
+            id=row[0],
+            source_type=row[1],
+            source_id=row[2],
+            observed_name=row[3],
+            observed_email=row[4],
+            observed_phone=row[5],
+            metadata=json.loads(row[6]) if row[6] else {},
+            canonical_person_id=row[7],
+            link_confidence=row[8] or 0.0,
+            link_status=row[9] or LINK_STATUS_AUTO,
+            link_method=link_method,
+            linked_at=_make_aware(linked_at),
+            observed_at=_make_aware(observed_at),
+            created_at=_make_aware(created_at),
+            match_attempted_at=_make_aware(match_attempted_at),
+            match_attempt_count=match_attempt_count,
+        )
+
+    @property
+    def source_badge(self) -> str:
+        """Get emoji badge for source type."""
+        badges = {
+            "gmail": "📧",
+            "calendar": "📅",
+            "slack": "💬",
+            "imessage": "💬",
+            "whatsapp": "💬",
+            "signal": "💬",
+            "contacts": "📱",
+            "linkedin": "💼",
+            "vault": "📝",
+            "granola": "📝",
+            "phone_call": "📞",
+            "photos": "📷",
+        }
+        return badges.get(self.source_type, "📄")
+
+    @property
+    def is_linked(self) -> bool:
+        """Check if this entity is linked to a canonical person."""
+        return self.canonical_person_id is not None and self.link_status != LINK_STATUS_REJECTED
+
+    @property
+    def is_confirmed(self) -> bool:
+        """Check if the link has been user-confirmed."""
+        return self.link_status == LINK_STATUS_CONFIRMED
+
+
+class SourceEntityStore:
+    """
+    SQLite-backed storage for SourceEntity records.
+
+    Provides efficient queries for:
+    - Finding entities by source type and ID
+    - Finding all entities linked to a canonical person
+    - Finding unlinked/pending entities
+    """
+
+    def __init__(self, db_path: Optional[str] = None):
+        """
+        Initialize the source entity store.
+
+        Args:
+            db_path: Path to SQLite database (default from settings)
+        """
+        self.db_path = db_path or get_crm_db_path()
+        self._init_db()
+
+    def _init_db(self):
+        """Create database tables if they don't exist."""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS source_entities (
+                    id TEXT PRIMARY KEY,
+                    source_type TEXT NOT NULL,
+                    source_id TEXT,
+                    observed_name TEXT,
+                    observed_email TEXT,
+                    observed_phone TEXT,
+                    metadata TEXT,
+                    canonical_person_id TEXT,
+                    link_confidence REAL DEFAULT 0.0,
+                    link_status TEXT DEFAULT 'auto',
+                    linked_at TIMESTAMP,
+                    observed_at TIMESTAMP NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(source_type, source_id)
+                )
+            """)
+
+            # Index for finding entities by canonical person
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_source_entities_canonical
+                ON source_entities(canonical_person_id)
+            """)
+
+            # Index for finding entities by source type
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_source_entities_source_type
+                ON source_entities(source_type)
+            """)
+
+            # Index for finding unlinked entities
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_source_entities_unlinked
+                ON source_entities(canonical_person_id) WHERE canonical_person_id IS NULL
+            """)
+
+            # Index for finding entities by email
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_source_entities_email
+                ON source_entities(observed_email)
+            """)
+
+            # Index for finding entities by phone
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_source_entities_phone
+                ON source_entities(observed_phone)
+            """)
+
+            # Index for time-based queries
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_source_entities_observed_at
+                ON source_entities(observed_at DESC)
+            """)
+
+            # Add match_attempted_at and match_attempt_count columns for tracking
+            # entities that failed resolution attempts (migration for existing DBs)
+            try:
+                conn.execute("""
+                    ALTER TABLE source_entities
+                    ADD COLUMN match_attempted_at TIMESTAMP
+                """)
+                logger.info("Added match_attempted_at column")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+
+            try:
+                conn.execute("""
+                    ALTER TABLE source_entities
+                    ADD COLUMN match_attempt_count INTEGER DEFAULT 0
+                """)
+                logger.info("Added match_attempt_count column")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+
+            # Migration: add link_method column for provenance tracking
+            try:
+                conn.execute("""
+                    ALTER TABLE source_entities
+                    ADD COLUMN link_method TEXT
+                """)
+                logger.info("Added link_method column")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+
+            # Index for finding entities that need re-matching
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_source_entities_match_attempts
+                ON source_entities(match_attempted_at, match_attempt_count)
+                WHERE canonical_person_id IS NULL
+            """)
+
+            conn.commit()
+            logger.info(f"Initialized source entity database at {self.db_path}")
+        finally:
+            conn.close()
+
+    def _get_connection(self) -> sqlite3.Connection:
+        """Get a database connection."""
+        return sqlite3.connect(self.db_path)
+
+    def add(self, entity: SourceEntity, validate_person: bool = True) -> SourceEntity:
+        """
+        Add a new source entity.
+
+        If entity has a canonical_person_id, validates the person exists and
+        follows any merge chain to the canonical ID. This prevents orphaned
+        source entities pointing to deleted or merged person IDs.
+
+        Args:
+            entity: SourceEntity to add
+            validate_person: If True, validate and resolve person ID (default True)
+
+        Returns:
+            The added entity
+        """
+        # Validate and resolve person ID to prevent orphans
+        if validate_person and entity.canonical_person_id:
+            from api.services.person_entity import get_person_entity_store
+            person_store = get_person_entity_store()
+
+            # Follow merge chain to get canonical ID
+            resolved_id = person_store.get_canonical_id(entity.canonical_person_id)
+
+            # Verify the person actually exists
+            person = person_store.get_by_id(resolved_id)
+            if not person:
+                logger.warning(
+                    f"Cannot add source entity {entity.source_type}:{entity.source_id} - "
+                    f"person {entity.canonical_person_id} not found (resolved: {resolved_id})"
+                )
+                # Clear the person link rather than creating an orphan
+                entity.canonical_person_id = None
+                entity.link_confidence = 0.0
+                entity.linked_at = None
+            else:
+                # Use the resolved ID
+                entity.canonical_person_id = resolved_id
+
+        conn = self._get_connection()
+        try:
+            conn.execute("""
+                INSERT INTO source_entities
+                (id, source_type, source_id, observed_name, observed_email,
+                 observed_phone, metadata, canonical_person_id, link_confidence,
+                 link_status, link_method, linked_at, observed_at, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                entity.id,
+                entity.source_type,
+                entity.source_id,
+                entity.observed_name,
+                entity.observed_email,
+                entity.observed_phone,
+                json.dumps(entity.metadata) if entity.metadata else None,
+                entity.canonical_person_id,
+                entity.link_confidence,
+                entity.link_status,
+                entity.link_method,
+                entity.linked_at.isoformat() if entity.linked_at else None,
+                entity.observed_at.isoformat(),
+                entity.created_at.isoformat(),
+            ))
+            conn.commit()
+            return entity
+        finally:
+            conn.close()
+
+    def add_or_update(self, entity: SourceEntity, validate_person: bool = True) -> tuple[SourceEntity, bool]:
+        """
+        Add entity or update if source_type+source_id already exists.
+
+        If entity has a canonical_person_id, validates the person exists and
+        follows any merge chain to the canonical ID. This prevents orphaned
+        source entities pointing to deleted or merged person IDs.
+
+        Args:
+            entity: SourceEntity to add/update
+            validate_person: If True, validate and resolve person ID (default True)
+
+        Returns:
+            Tuple of (entity, was_created)
+        """
+        # Validate and resolve person ID to prevent orphans
+        if validate_person and entity.canonical_person_id:
+            from api.services.person_entity import get_person_entity_store
+            person_store = get_person_entity_store()
+
+            # Follow merge chain to get canonical ID
+            resolved_id = person_store.get_canonical_id(entity.canonical_person_id)
+
+            # Verify the person actually exists
+            person = person_store.get_by_id(resolved_id)
+            if not person:
+                logger.warning(
+                    f"Skipping source entity {entity.source_type}:{entity.source_id} - "
+                    f"person {entity.canonical_person_id} not found (resolved: {resolved_id})"
+                )
+                # Don't create orphan - return existing if any, or a dummy result
+                existing = self.get_by_source(entity.source_type, entity.source_id)
+                if existing:
+                    return existing, False
+                # Clear the person link rather than creating an orphan
+                entity.canonical_person_id = None
+                entity.link_confidence = 0.0
+                entity.linked_at = None
+            else:
+                # Use the resolved ID
+                entity.canonical_person_id = resolved_id
+
+        existing = self.get_by_source(entity.source_type, entity.source_id)
+        if existing:
+            # Update existing - preserve ID and creation timestamp
+            entity.id = existing.id
+            entity.created_at = existing.created_at
+            self.update(entity)
+            return entity, False
+
+        return self.add(entity), True
+
+    def update(self, entity: SourceEntity) -> SourceEntity:
+        """
+        Update an existing source entity.
+
+        Args:
+            entity: SourceEntity with updated data
+
+        Returns:
+            The updated entity
+        """
+        conn = self._get_connection()
+        try:
+            conn.execute("""
+                UPDATE source_entities SET
+                    source_type = ?,
+                    source_id = ?,
+                    observed_name = ?,
+                    observed_email = ?,
+                    observed_phone = ?,
+                    metadata = ?,
+                    canonical_person_id = ?,
+                    link_confidence = ?,
+                    link_status = ?,
+                    link_method = ?,
+                    linked_at = ?,
+                    observed_at = ?
+                WHERE id = ?
+            """, (
+                entity.source_type,
+                entity.source_id,
+                entity.observed_name,
+                entity.observed_email,
+                entity.observed_phone,
+                json.dumps(entity.metadata) if entity.metadata else None,
+                entity.canonical_person_id,
+                entity.link_confidence,
+                entity.link_status,
+                entity.link_method,
+                entity.linked_at.isoformat() if entity.linked_at else None,
+                entity.observed_at.isoformat(),
+                entity.id,
+            ))
+            conn.commit()
+            return entity
+        finally:
+            conn.close()
+
+    def link_to_person(
+        self,
+        entity_id: str,
+        canonical_person_id: str,
+        confidence: float = 1.0,
+        status: str = LINK_STATUS_AUTO,
+        method: Optional[str] = None,
+    ) -> bool:
+        """
+        Link a source entity to a canonical person.
+
+        Automatically follows merge chain - if the person_id was merged into
+        another person, links to the surviving primary instead.
+
+        IMPORTANT: Confirmed links are protected from being overwritten by auto
+        resolution. This prevents sync scripts from undoing explicit user actions
+        like split operations. To update a confirmed link, pass status='confirmed'.
+
+        Args:
+            entity_id: Source entity ID
+            canonical_person_id: Canonical person ID (will be resolved through merge chain)
+            confidence: Link confidence (0.0-1.0)
+            status: Link status (auto, confirmed, rejected)
+
+        Returns:
+            True if updated, False if entity not found or link is protected
+        """
+        # Follow merge chain to get the canonical ID
+        from api.services.person_entity import get_person_entity_store
+        person_store = get_person_entity_store()
+        resolved_person_id = person_store.get_canonical_id(canonical_person_id)
+
+        conn = self._get_connection()
+        try:
+            # Check if existing link is confirmed (protected from auto re-linking)
+            if status != LINK_STATUS_CONFIRMED:
+                cursor = conn.execute(
+                    "SELECT link_status, canonical_person_id FROM source_entities WHERE id = ?",
+                    (entity_id,)
+                )
+                row = cursor.fetchone()
+                if row and row[0] == LINK_STATUS_CONFIRMED:
+                    # Don't overwrite confirmed links with auto links
+                    logger.debug(
+                        f"Skipping link update for {entity_id}: existing confirmed link "
+                        f"to {row[1][:8]}... protected from auto re-linking"
+                    )
+                    return False
+
+            cursor = conn.execute("""
+                UPDATE source_entities SET
+                    canonical_person_id = ?,
+                    link_confidence = ?,
+                    link_status = ?,
+                    link_method = COALESCE(?, link_method),
+                    linked_at = ?
+                WHERE id = ?
+            """, (
+                resolved_person_id,
+                confidence,
+                status,
+                method,
+                datetime.now(timezone.utc).isoformat(),
+                entity_id,
+            ))
+            conn.commit()
+            return cursor.rowcount > 0
+        finally:
+            conn.close()
+
+    def unlink(self, entity_id: str) -> bool:
+        """
+        Remove link from a source entity.
+
+        Args:
+            entity_id: Source entity ID
+
+        Returns:
+            True if updated, False if entity not found
+        """
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute("""
+                UPDATE source_entities SET
+                    canonical_person_id = NULL,
+                    link_confidence = 0.0,
+                    link_status = 'auto',
+                    linked_at = NULL
+                WHERE id = ?
+            """, (entity_id,))
+            conn.commit()
+            return cursor.rowcount > 0
+        finally:
+            conn.close()
+
+    def get_by_id(self, entity_id: str) -> Optional[SourceEntity]:
+        """Get entity by ID."""
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                "SELECT * FROM source_entities WHERE id = ?",
+                (entity_id,)
+            )
+            row = cursor.fetchone()
+            if row:
+                return SourceEntity.from_row(row)
+            return None
+        finally:
+            conn.close()
+
+    def get_by_source(self, source_type: str, source_id: str) -> Optional[SourceEntity]:
+        """Get entity by source type and ID."""
+        if not source_id:
+            return None
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                "SELECT * FROM source_entities WHERE source_type = ? AND source_id = ?",
+                (source_type, source_id)
+            )
+            row = cursor.fetchone()
+            if row:
+                return SourceEntity.from_row(row)
+            return None
+        finally:
+            conn.close()
+
+    def get_for_person(
+        self,
+        canonical_person_id: str,
+        source_type: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> list[SourceEntity]:
+        """
+        Get source entities linked to a canonical person.
+
+        Args:
+            canonical_person_id: Canonical person ID
+            source_type: Optional filter by source type
+            limit: Maximum number of entities to return (None for all)
+
+        Returns:
+            List of source entities, most recent first
+        """
+        conn = self._get_connection()
+        try:
+            if source_type:
+                if limit:
+                    cursor = conn.execute("""
+                        SELECT * FROM source_entities
+                        WHERE canonical_person_id = ? AND source_type = ?
+                        ORDER BY observed_at DESC
+                        LIMIT ?
+                    """, (canonical_person_id, source_type, limit))
+                else:
+                    cursor = conn.execute("""
+                        SELECT * FROM source_entities
+                        WHERE canonical_person_id = ? AND source_type = ?
+                        ORDER BY observed_at DESC
+                    """, (canonical_person_id, source_type))
+            else:
+                if limit:
+                    cursor = conn.execute("""
+                        SELECT * FROM source_entities
+                        WHERE canonical_person_id = ?
+                        ORDER BY observed_at DESC
+                        LIMIT ?
+                    """, (canonical_person_id, limit))
+                else:
+                    cursor = conn.execute("""
+                        SELECT * FROM source_entities
+                        WHERE canonical_person_id = ?
+                        ORDER BY observed_at DESC
+                    """, (canonical_person_id,))
+
+            return [SourceEntity.from_row(row) for row in cursor.fetchall()]
+        finally:
+            conn.close()
+
+    # Bound each compound statement's size (SQL text + bound parameters).
+    # 300 people per statement covers the CRM UI's page size (web/crm.html
+    # requests limit=300) in a single round trip, while still keeping the
+    # statement (600 bound parameters) well under any SQLite build's
+    # variable limit for larger, less common page sizes that need chunking.
+    _BATCH_CHUNK_SIZE = 300
+
+    def get_for_people_batch(
+        self,
+        canonical_person_ids: list[str],
+        limit_per_person: int = 500,
+    ) -> dict[str, list[SourceEntity]]:
+        """
+        Get source entities for many canonical people in a handful of round
+        trips instead of one call to get_for_person() per person.
+
+        Ordering and per-person limiting are IDENTICAL to
+        get_for_person(canonical_person_id, limit=limit_per_person): most
+        recent (observed_at DESC) first, capped at limit_per_person rows per
+        person -- because each person's rows literally come from that exact
+        per-person query. The trick is combining many of those queries into
+        one compound statement (UNION ALL of subqueries, each independently
+        planned) rather than one round trip per person, or a single
+        WHERE canonical_person_id IN (...) query.
+
+        A naive single query (IN (...) plus either a Python-side group/sort
+        or a ROW_NUMBER() OVER (PARTITION BY ...) window function) was tried
+        and measured slower here, not faster: SQLite does not have a
+        per-group "top-K" optimization for window functions, so it must
+        fully rank every matching row before filtering, while a handful of
+        this dataset's people have 10,000-65,000+ source entities each
+        (heavy iMessage/calendar/Slack history) -- ranking all of those
+        dwarfs the cost of the bounded per-person queries this replaces.
+        A single-person `ORDER BY observed_at DESC LIMIT N` query, by
+        contrast, gets SQLite's efficient top-N-via-heap plan even without a
+        composite index, so preserving that per-person query shape (just
+        combined into fewer round trips) is what actually pays off.
+
+        Args:
+            canonical_person_ids: Canonical person IDs to fetch for
+            limit_per_person: Max source entities to keep per person, same
+                meaning as get_for_person()'s limit
+
+        Returns:
+            Dict mapping canonical_person_id -> list of SourceEntity, most
+            recent first. IDs with no source entities are simply absent
+            (equivalent to get_for_person() returning an empty list for them).
+        """
+        if not canonical_person_ids:
+            return {}
+
+        unique_ids = list(dict.fromkeys(canonical_person_ids))
+        results: dict[str, list[SourceEntity]] = {}
+
+        conn = self._get_connection()
+        try:
+            for start in range(0, len(unique_ids), self._BATCH_CHUNK_SIZE):
+                chunk = unique_ids[start:start + self._BATCH_CHUNK_SIZE]
+                subquery = (
+                    "SELECT * FROM ("
+                    "SELECT * FROM source_entities "
+                    "WHERE canonical_person_id = ? "
+                    "ORDER BY observed_at DESC LIMIT ?"
+                    ")"
+                )
+                compound_query = " UNION ALL ".join([subquery] * len(chunk))
+                params: list = []
+                for person_id in chunk:
+                    params.extend([person_id, limit_per_person])
+
+                cursor = conn.execute(compound_query, params)
+                for row in cursor.fetchall():
+                    person_id = row[7]  # canonical_person_id column (see SourceEntity.from_row)
+                    results.setdefault(person_id, []).append(SourceEntity.from_row(row))
+            return results
+        finally:
+            conn.close()
+
+    def get_unlinked(
+        self,
+        source_type: Optional[str] = None,
+        limit: int = 100,
+    ) -> list[SourceEntity]:
+        """
+        Get unlinked source entities.
+
+        Args:
+            source_type: Optional filter by source type
+            limit: Maximum results to return
+
+        Returns:
+            List of unlinked source entities
+        """
+        conn = self._get_connection()
+        try:
+            if source_type:
+                cursor = conn.execute("""
+                    SELECT * FROM source_entities
+                    WHERE canonical_person_id IS NULL AND source_type = ?
+                    ORDER BY observed_at DESC
+                    LIMIT ?
+                """, (source_type, limit))
+            else:
+                cursor = conn.execute("""
+                    SELECT * FROM source_entities
+                    WHERE canonical_person_id IS NULL
+                    ORDER BY observed_at DESC
+                    LIMIT ?
+                """, (limit,))
+
+            return [SourceEntity.from_row(row) for row in cursor.fetchall()]
+        finally:
+            conn.close()
+
+    def get_low_confidence(
+        self,
+        min_confidence: float = 0.0,
+        max_confidence: float = 0.85,
+        link_method: Optional[str] = None,
+        limit: int = 100,
+    ) -> list[SourceEntity]:
+        """
+        Get linked source entities with low confidence.
+
+        Used for the review queue to surface matches needing human verification.
+
+        Args:
+            min_confidence: Minimum confidence threshold
+            max_confidence: Maximum confidence threshold
+            link_method: Optional filter by resolution method
+            limit: Maximum results to return
+
+        Returns:
+            List of source entities with confidence in range
+        """
+        conn = self._get_connection()
+        try:
+            sql = """
+                SELECT * FROM source_entities
+                WHERE canonical_person_id IS NOT NULL
+                  AND link_confidence >= ?
+                  AND link_confidence <= ?
+                  AND link_status != 'confirmed'
+            """
+            params: list = [min_confidence, max_confidence]
+            if link_method is not None:
+                sql += "  AND link_method = ?\n"
+                params.append(link_method)
+            sql += "ORDER BY link_confidence ASC\nLIMIT ?"
+            params.append(limit)
+            cursor = conn.execute(sql, params)
+
+            return [SourceEntity.from_row(row) for row in cursor.fetchall()]
+        finally:
+            conn.close()
+
+    def count_low_confidence(
+        self,
+        min_confidence: float = 0.0,
+        max_confidence: float = 0.85,
+        link_method: Optional[str] = None,
+    ) -> int:
+        """
+        Count linked source entities with low confidence.
+
+        Args:
+            min_confidence: Minimum confidence threshold
+            max_confidence: Maximum confidence threshold
+            link_method: Optional filter by resolution method
+
+        Returns:
+            Count of entities in confidence range
+        """
+        conn = self._get_connection()
+        try:
+            sql = """
+                SELECT COUNT(*) FROM source_entities
+                WHERE canonical_person_id IS NOT NULL
+                  AND link_confidence >= ?
+                  AND link_confidence <= ?
+                  AND link_status != 'confirmed'
+            """
+            params: list = [min_confidence, max_confidence]
+            if link_method is not None:
+                sql += "  AND link_method = ?\n"
+                params.append(link_method)
+            cursor = conn.execute(sql, params)
+            return cursor.fetchone()[0]
+        finally:
+            conn.close()
+
+    def get_by_email(self, email: str) -> list[SourceEntity]:
+        """Get all entities with a specific observed email."""
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                "SELECT * FROM source_entities WHERE LOWER(observed_email) = LOWER(?)",
+                (email,)
+            )
+            return [SourceEntity.from_row(row) for row in cursor.fetchall()]
+        finally:
+            conn.close()
+
+    def get_by_phone(self, phone: str) -> list[SourceEntity]:
+        """Get all entities with a specific observed phone."""
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                "SELECT * FROM source_entities WHERE observed_phone = ?",
+                (phone,)
+            )
+            return [SourceEntity.from_row(row) for row in cursor.fetchall()]
+        finally:
+            conn.close()
+
+    def get_unlinked_by_email(self, email: str) -> list[SourceEntity]:
+        """
+        Get unlinked source entities matching a specific email.
+
+        Args:
+            email: Email address to match (case-insensitive)
+
+        Returns:
+            List of unlinked SourceEntity objects with this email
+        """
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                """SELECT * FROM source_entities
+                   WHERE LOWER(observed_email) = LOWER(?)
+                   AND canonical_person_id IS NULL""",
+                (email,)
+            )
+            return [SourceEntity.from_row(row) for row in cursor.fetchall()]
+        finally:
+            conn.close()
+
+    def get_unlinked_by_phone(self, phone: str) -> list[SourceEntity]:
+        """
+        Get unlinked source entities matching a specific phone.
+
+        Args:
+            phone: Phone number to match
+
+        Returns:
+            List of unlinked SourceEntity objects with this phone
+        """
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                """SELECT * FROM source_entities
+                   WHERE observed_phone = ?
+                   AND canonical_person_id IS NULL""",
+                (phone,)
+            )
+            return [SourceEntity.from_row(row) for row in cursor.fetchall()]
+        finally:
+            conn.close()
+
+    def link_unlinked_by_email(
+        self,
+        email: str,
+        person_id: str,
+        confidence: float = 1.0,
+    ) -> int:
+        """
+        Link all unlinked source entities with this email to a person.
+
+        This is used for retroactive linking when a person gains a new email
+        address. All existing unlinked source entities with that email
+        will be linked to the person.
+
+        Args:
+            email: Email address to match (case-insensitive)
+            person_id: Canonical person ID to link to
+            confidence: Link confidence score (default 1.0)
+
+        Returns:
+            Number of entities that were linked
+        """
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                """UPDATE source_entities SET
+                       canonical_person_id = ?,
+                       link_confidence = ?,
+                       link_status = ?,
+                       link_method = 'email_exact',
+                       linked_at = ?
+                   WHERE LOWER(observed_email) = LOWER(?)
+                   AND canonical_person_id IS NULL
+                   AND link_status != ?""",
+                (
+                    person_id,
+                    confidence,
+                    LINK_STATUS_AUTO,
+                    datetime.now(timezone.utc).isoformat(),
+                    email,
+                    LINK_STATUS_CONFIRMED,  # Don't overwrite confirmed links
+                )
+            )
+            conn.commit()
+            count = cursor.rowcount
+            if count > 0:
+                logger.info(f"Retroactively linked {count} source entities with email {email} to person {person_id[:8]}...")
+            return count
+        finally:
+            conn.close()
+
+    def link_unlinked_by_phone(
+        self,
+        phone: str,
+        person_id: str,
+        confidence: float = 1.0,
+    ) -> int:
+        """
+        Link all unlinked source entities with this phone to a person.
+
+        This is used for retroactive linking when a person gains a new phone
+        number. All existing unlinked source entities with that phone
+        will be linked to the person.
+
+        Args:
+            phone: Phone number to match
+            person_id: Canonical person ID to link to
+            confidence: Link confidence score (default 1.0)
+
+        Returns:
+            Number of entities that were linked
+        """
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                """UPDATE source_entities SET
+                       canonical_person_id = ?,
+                       link_confidence = ?,
+                       link_status = ?,
+                       link_method = 'phone_exact',
+                       linked_at = ?
+                   WHERE observed_phone = ?
+                   AND canonical_person_id IS NULL
+                   AND link_status != ?""",
+                (
+                    person_id,
+                    confidence,
+                    LINK_STATUS_AUTO,
+                    datetime.now(timezone.utc).isoformat(),
+                    phone,
+                    LINK_STATUS_CONFIRMED,  # Don't overwrite confirmed links
+                )
+            )
+            conn.commit()
+            count = cursor.rowcount
+            if count > 0:
+                logger.info(f"Retroactively linked {count} source entities with phone {phone} to person {person_id[:8]}...")
+            return count
+        finally:
+            conn.close()
+
+    def record_match_attempt(self, entity_id: str) -> bool:
+        """
+        Record a failed match attempt for a source entity.
+
+        Increments match_attempt_count and updates match_attempted_at timestamp.
+        Tracks entities that have been processed but couldn't be matched.
+
+        Args:
+            entity_id: Source entity ID
+
+        Returns:
+            True if updated, False if entity not found
+        """
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                """UPDATE source_entities SET
+                       match_attempted_at = ?,
+                       match_attempt_count = COALESCE(match_attempt_count, 0) + 1
+                   WHERE id = ?
+                   AND canonical_person_id IS NULL""",
+                (
+                    datetime.now(timezone.utc).isoformat(),
+                    entity_id,
+                )
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+        finally:
+            conn.close()
+
+    def get_unlinked_for_rematching(
+        self,
+        source_type: Optional[str] = None,
+        min_days_since_attempt: int = 30,
+        max_attempts: int = 3,
+        limit: int = 1000,
+        backoff_multiplier: int = 3,
+        max_capped_per_run: Optional[int] = 200,
+        exclude_blocklisted: bool = True,
+    ) -> list[SourceEntity]:
+        """
+        Get unlinked entities eligible for re-matching.
+
+        Below ``max_attempts``, behavior is unchanged: eligible once
+        ``min_days_since_attempt`` has elapsed since the last attempt.
+
+        At or above ``max_attempts`` ("capped" entities), a hard stop would
+        permanently lock an entity out even as the CRM it failed to match
+        against keeps growing — at scale, the vast majority of unlinked
+        entities can end up stuck this way, forever reporting 0 eligible.
+        Instead we apply
+        exponential backoff: the wait before the next attempt grows as
+        ``min_days_since_attempt * backoff_multiplier ** (match_attempt_count
+        - max_attempts)``. With the defaults (30 days, multiplier 3) that's
+        attempt 4 at 30d, attempt 5 at 90d, attempt 6 at 270d, and so on —
+        no entity is locked out forever, but stale entities are retried
+        exponentially less often, bounding the amortized cost.
+
+        This is deliberately stateless: it reuses the existing
+        match_attempted_at/match_attempt_count columns instead of adding new
+        schema (e.g. a stored PersonEntity-count watermark) to react to CRM
+        growth directly. That's simpler and needs no migration, at the cost
+        of being a proxy — "CRM probably changed enough" — rather than a
+        precise trigger tied to actual PersonEntity growth.
+
+        Because many capped entities can cross their backoff threshold on
+        the same night (they tend to have been last attempted in clusters),
+        ``max_capped_per_run`` bounds how many capped entities are retried
+        per run so a large backlog drains over several nights instead of
+        spiking one night's fuzzy-match cost. Entities below max_attempts
+        are never subject to this per-run cap — that population is small
+        and behaves exactly as before.
+
+        Args:
+            source_type: Optional filter by source type
+            min_days_since_attempt: Skip if attempted within this many days
+            max_attempts: Attempts before backoff (instead of a hard stop) kicks in
+            limit: Maximum entities to return overall
+            backoff_multiplier: Growth factor applied per attempt past max_attempts
+            max_capped_per_run: Max capped (attempt_count >= max_attempts) entities
+                to include per call. None disables the cap.
+            exclude_blocklisted: Drop entities whose observed_email is on a
+                blocklisted (marketing) domain. Being blocklisted is a permanent
+                property of the address, not a match that failed and deserves a
+                retry, so these are never eligible.
+
+        Returns:
+            List of SourceEntity objects eligible for re-matching
+        """
+        conn = self._get_connection()
+        try:
+            # Most lenient possible cutoff — anything attempted more recently
+            # than this can't be eligible under any backoff tier, so it's
+            # safe (and keeps the query on the existing index) to filter it
+            # out in SQL. The precise per-row backoff check happens in Python
+            # below, since SQLite has no portable POWER() to express it in SQL.
+            base_cutoff = (
+                datetime.now(timezone.utc) - timedelta(days=min_days_since_attempt)
+            ).isoformat()
+
+            if source_type:
+                cursor = conn.execute("""
+                    SELECT * FROM source_entities
+                    WHERE canonical_person_id IS NULL
+                      AND source_type = ?
+                      AND (match_attempted_at IS NULL OR match_attempted_at < ?)
+                    ORDER BY observed_at DESC
+                """, (source_type, base_cutoff))
+            else:
+                cursor = conn.execute("""
+                    SELECT * FROM source_entities
+                    WHERE canonical_person_id IS NULL
+                      AND (match_attempted_at IS NULL OR match_attempted_at < ?)
+                    ORDER BY observed_at DESC
+                """, (base_cutoff,))
+
+            candidates = [SourceEntity.from_row(row) for row in cursor.fetchall()]
+        finally:
+            conn.close()
+
+        if exclude_blocklisted:
+            candidates = [e for e in candidates if not _is_blocklisted_entity(e)]
+
+        now = datetime.now(timezone.utc)
+        normal: list[SourceEntity] = []
+        capped_eligible: list[SourceEntity] = []
+
+        for entity in candidates:
+            count = entity.match_attempt_count or 0
+            if count < max_attempts:
+                normal.append(entity)
+                continue
+
+            if entity.match_attempted_at is None:
+                capped_eligible.append(entity)
+                continue
+
+            required_days = min_days_since_attempt * (
+                backoff_multiplier ** (count - max_attempts)
+            )
+            attempted_at = _make_aware(entity.match_attempted_at)
+            if (now - attempted_at).days >= required_days:
+                capped_eligible.append(entity)
+
+        if max_capped_per_run is not None and len(capped_eligible) > max_capped_per_run:
+            # Retry the longest-waiting capped entities first so the backlog
+            # rotates fairly across runs instead of starving the same tail.
+            capped_eligible.sort(
+                key=lambda e: e.match_attempted_at or datetime.min.replace(tzinfo=timezone.utc)
+            )
+            capped_eligible = capped_eligible[:max_capped_per_run]
+
+        combined = normal + capped_eligible
+        combined.sort(key=lambda e: e.observed_at or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+        return combined[:limit]
+
+    def count_unlinked_for_rematching(
+        self,
+        source_type: Optional[str] = None,
+        min_days_since_attempt: int = 30,
+        max_attempts: int = 3,
+        backoff_multiplier: int = 3,
+        max_capped_per_run: Optional[int] = 200,
+    ) -> int:
+        """
+        Count unlinked entities eligible for re-matching right now.
+
+        Mirrors the eligibility logic in ``get_unlinked_for_rematching``
+        (including the per-run cap on capped entities), see there for the
+        backoff rationale.
+
+        Args:
+            source_type: Optional filter by source type
+            min_days_since_attempt: Skip if attempted within this many days
+            max_attempts: Attempts before backoff kicks in
+            backoff_multiplier: Growth factor applied per attempt past max_attempts
+            max_capped_per_run: Max capped entities counted as eligible per run
+
+        Returns:
+            Count of eligible entities
+        """
+        return len(self.get_unlinked_for_rematching(
+            source_type=source_type,
+            min_days_since_attempt=min_days_since_attempt,
+            max_attempts=max_attempts,
+            limit=1_000_000,
+            backoff_multiplier=backoff_multiplier,
+            max_capped_per_run=max_capped_per_run,
+        ))
+
+    def count_capped_backlog(
+        self,
+        source_type: Optional[str] = None,
+        max_attempts: int = 3,
+        exclude_blocklisted: bool = True,
+    ) -> int:
+        """
+        Count unlinked entities that have hit ``max_attempts`` or more.
+
+        This is the total capped population regardless of whether backoff
+        currently makes them eligible — it surfaces the backlog size in
+        sync stats so a saturated backlog is visible instead of
+        looking identical to "nothing to do".
+
+        Blocklisted entities are excluded by default so the number tracks work
+        that can actually drain. Counting them made the metric useless: they
+        were 70% of the reported backlog and could never be linked.
+
+        Args:
+            source_type: Optional filter by source type
+            max_attempts: Attempt count considered "capped"
+            exclude_blocklisted: Skip entities on blocklisted marketing domains
+
+        Returns:
+            Count of unlinked entities with match_attempt_count >= max_attempts
+        """
+        conn = self._get_connection()
+        try:
+            if source_type:
+                cursor = conn.execute("""
+                    SELECT observed_email FROM source_entities
+                    WHERE canonical_person_id IS NULL
+                      AND source_type = ?
+                      AND match_attempt_count >= ?
+                """, (source_type, max_attempts))
+            else:
+                cursor = conn.execute("""
+                    SELECT observed_email FROM source_entities
+                    WHERE canonical_person_id IS NULL
+                      AND match_attempt_count >= ?
+                """, (max_attempts,))
+
+            emails = [row[0] for row in cursor.fetchall()]
+        finally:
+            conn.close()
+
+        if not exclude_blocklisted:
+            return len(emails)
+        return sum(
+            1 for email in emails
+            if not (email and is_blocklisted_domain(email))
+        )
+
+    def delete(self, entity_id: str) -> bool:
+        """Delete a source entity."""
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                "DELETE FROM source_entities WHERE id = ?",
+                (entity_id,)
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+        finally:
+            conn.close()
+
+    def delete_for_person(self, canonical_person_id: str) -> int:
+        """Delete all source entities linked to a person."""
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                "DELETE FROM source_entities WHERE canonical_person_id = ?",
+                (canonical_person_id,)
+            )
+            conn.commit()
+            return cursor.rowcount
+        finally:
+            conn.close()
+
+    def count(self) -> int:
+        """Get total number of source entities."""
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute("SELECT COUNT(*) FROM source_entities")
+            return cursor.fetchone()[0]
+        finally:
+            conn.close()
+
+    def count_for_person(self, canonical_person_id: str) -> int:
+        """Get count of source entities for a person."""
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                "SELECT COUNT(*) FROM source_entities WHERE canonical_person_id = ?",
+                (canonical_person_id,)
+            )
+            return cursor.fetchone()[0]
+        finally:
+            conn.close()
+
+    def get_statistics(self) -> dict:
+        """Get aggregate statistics about source entities."""
+        conn = self._get_connection()
+        try:
+            total = conn.execute("SELECT COUNT(*) FROM source_entities").fetchone()[0]
+
+            linked = conn.execute(
+                "SELECT COUNT(*) FROM source_entities WHERE canonical_person_id IS NOT NULL"
+            ).fetchone()[0]
+
+            by_source = {}
+            cursor = conn.execute("""
+                SELECT source_type, COUNT(*) as count
+                FROM source_entities
+                GROUP BY source_type
+            """)
+            for row in cursor.fetchall():
+                by_source[row[0]] = row[1]
+
+            by_status = {}
+            cursor = conn.execute("""
+                SELECT link_status, COUNT(*) as count
+                FROM source_entities
+                GROUP BY link_status
+            """)
+            for row in cursor.fetchall():
+                by_status[row[0]] = row[1]
+
+            return {
+                "total_entities": total,
+                "linked_entities": linked,
+                "unlinked_entities": total - linked,
+                "by_source": by_source,
+                "by_status": by_status,
+            }
+        finally:
+            conn.close()
+
+
+# Singleton instance
+_source_entity_store: Optional[SourceEntityStore] = None
+# CRM/people/photos handlers run on worker threads (not the event loop),
+# so two first-requests after a restart can race this check-and-set.
+# Double-checked locking: the lock is only taken while
+# _source_entity_store is still None, so it costs nothing once constructed.
+_source_entity_store_lock = threading.Lock()
+
+
+def get_source_entity_store(db_path: Optional[str] = None) -> SourceEntityStore:
+    """
+    Get or create the singleton SourceEntityStore.
+
+    Args:
+        db_path: Path to SQLite database
+
+    Returns:
+        SourceEntityStore instance
+    """
+    global _source_entity_store
+    if _source_entity_store is None:
+        with _source_entity_store_lock:
+            if _source_entity_store is None:
+                _source_entity_store = SourceEntityStore(db_path)
+    return _source_entity_store
+
+
+# Factory functions for creating source entities from different sources
+
+
+def create_gmail_source_entity(
+    message_id: str,
+    sender_email: str,
+    sender_name: Optional[str] = None,
+    observed_at: Optional[datetime] = None,
+    metadata: Optional[dict] = None,
+) -> SourceEntity:
+    """Create a source entity from a Gmail message."""
+    return SourceEntity(
+        source_type="gmail",
+        source_id=message_id,
+        observed_name=sender_name,
+        observed_email=sender_email.lower() if sender_email else None,
+        observed_at=observed_at or datetime.now(timezone.utc),
+        metadata=metadata or {},
+    )
+
+
+def create_calendar_source_entity(
+    event_id: str,
+    attendee_email: str,
+    attendee_name: Optional[str] = None,
+    observed_at: Optional[datetime] = None,
+    metadata: Optional[dict] = None,
+) -> SourceEntity:
+    """Create a source entity from a calendar event attendee."""
+    return SourceEntity(
+        source_type="calendar",
+        source_id=f"{event_id}:{attendee_email}",
+        observed_name=attendee_name,
+        observed_email=attendee_email.lower() if attendee_email else None,
+        observed_at=observed_at or datetime.now(timezone.utc),
+        metadata=metadata or {},
+    )
+
+
+def create_slack_source_entity(
+    user_id: str,
+    display_name: Optional[str] = None,
+    email: Optional[str] = None,
+    observed_at: Optional[datetime] = None,
+    metadata: Optional[dict] = None,
+) -> SourceEntity:
+    """Create a source entity from a Slack user."""
+    return SourceEntity(
+        source_type="slack",
+        source_id=user_id,
+        observed_name=display_name,
+        observed_email=email.lower() if email else None,
+        observed_at=observed_at or datetime.now(timezone.utc),
+        metadata=metadata or {},
+    )
+
+
+def create_phone_source_entity(
+    phone: str,
+    observed_name: Optional[str] = None,
+    observed_at: Optional[datetime] = None,
+    metadata: Optional[dict] = None,
+) -> SourceEntity:
+    """Create a source entity for an observed phone number.
+
+    The ``source_id`` convention is ``phone_{e164}``. Centralising this
+    here keeps the two phone-call import paths
+    (``scripts/apple_data_import.import_phone_calls`` on Linux and
+    ``scripts/sync_phone_calls.py`` native on macOS) from drifting if the
+    format ever changes — silent duplicates are the failure mode this
+    centralization guards against.
+    """
+    return SourceEntity(
+        source_type="phone",
+        source_id=f"phone_{phone}",
+        observed_name=observed_name,
+        observed_phone=phone,
+        observed_at=observed_at or datetime.now(timezone.utc),
+        metadata=metadata or {},
+    )
+
+
+def create_imessage_source_entity(
+    handle: str,
+    display_name: Optional[str] = None,
+    observed_at: Optional[datetime] = None,
+    metadata: Optional[dict] = None,
+) -> SourceEntity:
+    """Create a source entity from an iMessage handle."""
+    # Handle can be email or phone
+    email = None
+    phone = None
+    if "@" in handle:
+        email = handle.lower()
+    else:
+        phone = handle
+
+    return SourceEntity(
+        source_type="imessage",
+        source_id=handle,
+        observed_name=display_name,
+        observed_email=email,
+        observed_phone=phone,
+        observed_at=observed_at or datetime.now(timezone.utc),
+        metadata=metadata or {},
+    )
+
+
+def create_contacts_source_entity(
+    contact_id: str,
+    name: Optional[str] = None,
+    email: Optional[str] = None,
+    phone: Optional[str] = None,
+    observed_at: Optional[datetime] = None,
+    metadata: Optional[dict] = None,
+) -> SourceEntity:
+    """Create a source entity from Apple Contacts."""
+    return SourceEntity(
+        source_type="contacts",
+        source_id=contact_id,
+        observed_name=name,
+        observed_email=email.lower() if email else None,
+        observed_phone=phone,
+        observed_at=observed_at or datetime.now(timezone.utc),
+        metadata=metadata or {},
+    )
+
+
+def create_linkedin_source_entity(
+    profile_url: str,
+    name: Optional[str] = None,
+    email: Optional[str] = None,
+    observed_at: Optional[datetime] = None,
+    metadata: Optional[dict] = None,
+) -> SourceEntity:
+    """Create a source entity from a LinkedIn profile."""
+    return SourceEntity(
+        source_type="linkedin",
+        source_id=profile_url,
+        observed_name=name,
+        observed_email=email.lower() if email else None,
+        observed_at=observed_at or datetime.now(timezone.utc),
+        metadata=metadata or {},
+    )
+
+
+def create_vault_source_entity(
+    file_path: str,
+    person_name: str,
+    observed_at: Optional[datetime] = None,
+    metadata: Optional[dict] = None,
+) -> SourceEntity:
+    """
+    Create a source entity from a vault mention.
+
+    Args:
+        file_path: Path to the vault note file
+        person_name: Name of the person mentioned
+        observed_at: When the note was created/modified
+        metadata: Additional metadata (note_title, is_granola, etc.)
+
+    Returns:
+        SourceEntity for this vault mention
+    """
+    # Use file_path:person_name as unique source_id
+    # This ensures each person mention per note is tracked separately
+    source_id = f"{file_path}:{person_name}"
+    return SourceEntity(
+        source_type="vault",
+        source_id=source_id,
+        observed_name=person_name,
+        observed_at=observed_at or datetime.now(timezone.utc),
+        metadata=metadata or {},
+    )
+
+
+def create_granola_source_entity(
+    file_path: str,
+    person_name: str,
+    observed_at: Optional[datetime] = None,
+    metadata: Optional[dict] = None,
+) -> SourceEntity:
+    """
+    Create a source entity from a Granola meeting note mention.
+
+    Args:
+        file_path: Path to the Granola note file
+        person_name: Name of the person mentioned
+        observed_at: When the meeting occurred
+        metadata: Additional metadata (note_title, granola_id, etc.)
+
+    Returns:
+        SourceEntity for this Granola mention
+    """
+    # Use file_path:person_name as unique source_id
+    source_id = f"{file_path}:{person_name}"
+    return SourceEntity(
+        source_type="granola",
+        source_id=source_id,
+        observed_name=person_name,
+        observed_at=observed_at or datetime.now(timezone.utc),
+        metadata=metadata or {},
+    )

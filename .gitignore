@@ -1,30 +1,178 @@
-# Generated Android/Gradle files
-.gradle/
-.gradle-dist/
-.kotlin/
-.cxx/
-.externalNativeBuild/
-**/build/
-local.properties
-.idea/
-*.iml
-# Local secrets and signing material
-.env
-.env.*
-!.env.example
-*.jks
-*.keystore
-*.p12
-*.pem
-# Personal/runtime data and generated packages
-*.db
-*.db-*
-*.sqlite
-*.sqlite3
-*.apk
-*.aab
-*.litertlm
-*.gguf
+# =============================================================================
+# LifeOS .gitignore
+# =============================================================================
+# Organized by category. Files are consolidated into folders where possible.
+# Root-level patterns (*.db, credentials.json) are safety catch-alls.
+
+# =============================================================================
+# PYTHON
+# =============================================================================
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
 .venv/
+env/
+ENV/
+uv.lock
+
+# =============================================================================
+# IDE & EDITOR
+# =============================================================================
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# =============================================================================
+# DATA (all personal data lives in data/)
+# =============================================================================
+data/
+*.db
+*.sqlite
+
+# =============================================================================
+# LOGS (all logs live in logs/)
+# =============================================================================
+logs/
+*.log
+
+# =============================================================================
+# CREDENTIALS & SECRETS
+# =============================================================================
+# Primary location: config/
+config/credentials*.json
+config/token*.json
+
+# Safety catch-alls (in case files end up in wrong place)
+credentials.json
+credentials-*.json
+token.json
+token-*.json
+*.pem
+*.key
+
+# Environment files
+.env
+.env.local
+.env-*
+*.env
+.env.bak.*
+
+# =============================================================================
+# PERSONAL CONFIGURATION (config/)
+# =============================================================================
+config/people_dictionary.json
+config/relationship_overrides.json
+config/relationship_overrides.json.bak.*
+config/family_members.json
+config/family_members.json.bak.*
+config/linkedin_tags.json
+config/linkedin_industry_mappings.json
+config/linkedin_bad_matches.json
+config/home/eero_targets.json
+config/agent_capabilities.md
+config/crm_mappings.yaml
+config/gsheet_sync.yaml
+config/gdoc_sync.yaml
+
+# Launchd plist files (use .plist.template to create)
+config/launchd/*.plist
+!config/launchd/*.plist.template
+# setup-launchd.sh's install_plist() backs up a differing pre-existing
+# plist here before replacing it (config/launchd/*.plist above matches
+# neither this subdirectory nor its timestamped filenames).
+config/launchd/backups/
+
+# =============================================================================
+# INTERNAL DOCUMENTATION (personal notes for AI agents)
+# =============================================================================
+.internal/
+
+# =============================================================================
+# ARCHIVE FOLDERS (old scripts, tests, docs)
+# =============================================================================
+scripts/archive/
+tests/archive/
+
+# docs/archive/ and docs/plans/ are personal — only the meta-guidance
+# files (AGENTS.md / CLAUDE.md / INDEX.md) are tracked so future agents
+# landing in those directories know what they're for.
+docs/archive/*
+!docs/archive/INDEX.md
+docs/plans/*
+!docs/plans/AGENTS.md
+!docs/plans/CLAUDE.md
+docs/plans/archive/
+
+# =============================================================================
+# TESTING
+# =============================================================================
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Test files with personal data
+tests/test_p91_*.py
+tests/qualitative_tests.md
+tests/qualitative_tests_v2.md
+tests/fixtures/production_test_data.py
+tests/fixtures/benchmark_config.json
+tests/e2e/test_chat_queries.py
+
+# =============================================================================
+# BUILD & DISTRIBUTION
+# =============================================================================
+dist/
+build/
+*.egg-info/
+
+# =============================================================================
+# OS & MISC
+# =============================================================================
+.DS_Store
+Thumbs.db
+venv.bak/
+vault/
+
+# External tools
+chromadb/
+.ralph/
+.playwright-mcp/
+.mm/
+
+# =============================================================================
+# DATE-PREFIXED DOCS (personal development notes)
+# =============================================================================
+docs/2026-*.md
+scripts/clear-caches.sh
+
+# Claude Code — ignore local state, track shared config
+.claude/*
+!.claude/settings.json
+!.claude/skills/
+
+# Per-subdirectory AGENTS.md files (api/, docs/, etc.) are project docs and
+# are tracked. This rule only ignores ad-hoc AGENTS.md files that some Claude
+# Code tooling may write at the repo root — the tracked root-level AGENTS.md
+# overrides this since gitignore doesn't apply to files already in the index.
+/AGENTS.md
+
+# Local git worktrees (agent/dev scratch). Never committed — and an untracked
+# .worktrees/ made `git status --porcelain` report dirty, which silently
+# disabled auto-deploy.sh for 62 consecutive ticks (#634).
+.worktrees/
+
+# Per-install persona selection; the tracked telegram_bots.json is the template.
+config/telegram_bots.local.json
+
+# Operator-specific taxonomy override (merged over config/vault_taxonomy.yaml)
+config/vault_taxonomy.local.yaml
+
+# Retrieval eval labeled set (real queries and file names)
+data/retrieval_eval/
+
+# Operator-local tailnet routes (see config/tailscale-routes.example)
+config/tailscale-routes.local

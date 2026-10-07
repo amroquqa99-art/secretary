@@ -1,0 +1,2520 @@
+"""API tests for the /agents Kanban board.
+
+Covers GET /api/agents/board, PUT .../board/cards/{id}/lane,
+POST .../board/cards/{id}/accept and /undo-accept, GET /api/agents/pending-questions,
+POST .../pending-questions/{id}/answer, the Hermes label fix, and the
+Codex (`cx:`) transcript stream dispatch. Uses temp-dir-backed stores via
+monkeypatch so the real vault/data directories are never touched.
+"""
+from __future__ import annotations
+
+import asyncio
+import copy
+import json
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+
+from api import main as api_main
+from api.routes import agents as agents_route
+import api.services.task_manager as task_manager_module
+import api.services.scheduler_store as scheduler_store_module
+from api.services.task_manager import TaskManager
+from api.services.scheduler_store import SchedulerStore
+from api.services.agent_worker.session_store import (
+    STATUS_BLOCKED,
+    STATUS_COMPLETED,
+    STATUS_FAILED,
+    STATUS_RUNNING,
+    SessionStore,
+)
+from api.services.agent_worker.transcript_store import TranscriptStore
+
+pytestmark = pytest.mark.unit
+
+
+@pytest.fixture
+def stores(tmp_path: Path, monkeypatch):
+    """Point every store the board endpoint touches at temp-dir fixtures."""
+    session_store = SessionStore(db_path=tmp_path / "sessions.db")
+    transcript_store = TranscriptStore(transcripts_dir=tmp_path / "transcripts")
+    monkeypatch.setattr(agents_route, "_session_store", session_store)
+    monkeypatch.setattr(agents_route, "_transcript_store", transcript_store)
+    agents_route._label_cache.clear()
+    # The board cache (finding #5) is module-level and TTL'd — reset it per
+    # test so a prior test's cached board can't leak into this one's stores.
+    monkeypatch.setattr(agents_route, "_board_cache", None)
+    monkeypatch.setattr(agents_route, "_claude_code_snapshot", lambda: ([], []))
+    monkeypatch.setattr(agents_route, "_codex_snapshot", lambda: ([], []))
+
+    task_manager = TaskManager(
+        vault_path=tmp_path / "vault", index_path=tmp_path / "task_index.json",
+    )
+    monkeypatch.setattr(task_manager_module, "_task_manager", task_manager)
+
+    scheduler_store = SchedulerStore(
+        vault_path=tmp_path / "vault", index_path=tmp_path / "scheduler_index.json",
+    )
+    monkeypatch.setattr(scheduler_store_module, "_scheduler_store", scheduler_store)
+
+    yield task_manager, scheduler_store, session_store, transcript_store
+    agents_route._label_cache.clear()
+
+
+@pytest.fixture
+def client():
+    return TestClient(api_main.app)
+
+
+# ---------------------------------------------------------------------------
+# GET /api/agents/board
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestGetBoard:
+    def test_empty_board_shape(self, client, stores):
+        r = client.get("/api/agents/board")
+        assert r.status_code == 200
+        body = r.json()
+        assert set(body["lanes"].keys()) == {
+            "unassigned", "assigned", "in_progress", "human_queue",
+            "scheduled", "review", "done", "snoozed",
+        }
+        assert "generated_at" in body
+
+    def test_board_carries_api_host(self, client, stores, monkeypatch):
+        """The board's own payload names the API host, so the client
+        can tell a card's assigned host (`fields.host`) apart from "this
+        machine" without a separate round trip."""
+        monkeypatch.setattr(agents_route, "api_host_name", lambda: "board-api-host")
+        body = client.get("/api/agents/board").json()
+        assert body["api_host"] == "board-api-host"
+
+    def test_get_board_never_served_from_stream_cache(self, client, stores):
+        """GET /board must always build fresh — it
+        must never read the TTL'd cache the stream's own tick uses.
+        Poisons the cache with a snapshot missing the task and proves GET
+        ignores it rather than serving pre-write data (reproduces the
+        drawer's own `await putTask(); await fetchBoard()` staleness)."""
+        task_manager, *_ = stores
+        task = task_manager.create("Notes card", tags=["me"])
+        empty_lanes = {lane: [] for lane in (
+            "unassigned", "assigned", "in_progress", "human_queue",
+            "scheduled", "review", "done",
+        )}
+        agents_route._board_cache = (time.monotonic(), {"lanes": empty_lanes, "generated_at": 0})
+        body = client.get("/api/agents/board").json()
+        assert task.id in [c["id"] for c in body["lanes"]["assigned"]]
+
+    def test_task_lands_in_derived_lane_with_full_card_shape(self, client, stores):
+        task_manager, *_ = stores
+        task_manager.create("Ping the vendor", context="Work", tags=["me"])
+        r = client.get("/api/agents/board")
+        assert r.status_code == 200
+        assigned = r.json()["lanes"]["assigned"]
+        assert len(assigned) == 1
+        card = assigned[0]
+        for key in (
+            "id", "title", "notes", "status", "tags", "assignee", "fields",
+            "context", "updated_at", "session", "pending_question", "policy",
+        ):
+            assert key in card
+        assert card["title"] == "Ping the vendor"
+        assert card["assignee"] == "me"
+
+    def test_agent_owned_card_policy_block_reflects_the_shared_decision_function(self, client, stores):
+        """The card's `policy` block comes from the same
+        `evaluate_card_action` the write paths enforce — the drawer and
+        board read this instead of re-deriving the rules in JS."""
+        task_manager, *_ = stores
+        task = task_manager.create("Handed to the agent", tags=["codex"])
+        r = client.get("/api/agents/board")
+        card = next(c for c in r.json()["lanes"]["assigned"] if c["id"] == task.id)
+        policy = card["policy"]
+        assert policy["claimed"] is False
+        assert policy["agent_owned"] is True
+        assert policy["cancel"] == {"allowed": True, "reason": None}
+        assert policy["assignee"] == {"allowed": True, "reason": None}
+        assert policy["fields"] == {"allowed": True, "reason": None}
+        # `lanes` lists ONLY refused lanes — the allowed ones
+        # (unassigned/assigned) are simply absent, not present-and-true,
+        # matching what onCardDropped already assumes client-side.
+        assert "unassigned" not in policy["lanes"]
+        assert "assigned" not in policy["lanes"]
+        assert policy["lanes"]["in_progress"]["allowed"] is False
+        assert policy["lanes"]["human_queue"]["allowed"] is False
+        assert policy["lanes"]["done"]["allowed"] is False
+        assert policy["lanes"]["human_queue"]["reason"] == (
+            "agent-owned cards are managed by the agent — reassign, unassign, "
+            "or cancel this card instead"
+        )
+        # `scheduled` is refused for every card unconditionally — it's
+        # emitted here too (not just `review`), so a consumer following
+        # "absent means allowed" never has to special-case the one lane no
+        # task can ever land in directly.
+        assert policy["lanes"]["scheduled"] == {
+            "allowed": False, "reason": "lane 'scheduled' cannot be set directly",
+        }
+
+    def test_me_assigned_card_policy_block_is_all_allowed(self, client, stores):
+        """A `me`-assigned card is unaffected — every lane, the assignee
+        picker, the field pickers, all allowed; cancel refused (cancel is
+        agent-cards-only)."""
+        task_manager, *_ = stores
+        task = task_manager.create("My own task", tags=["me"])
+        r = client.get("/api/agents/board")
+        card = next(c for c in r.json()["lanes"]["assigned"] if c["id"] == task.id)
+        policy = card["policy"]
+        assert policy["claimed"] is False
+        assert policy["agent_owned"] is False
+        assert policy["assignee"]["allowed"] is True
+        assert policy["fields"]["allowed"] is True
+        assert policy["cancel"] == {
+            "allowed": False,
+            "reason": "cancel is only available for agent-assigned cards",
+        }
+        # Positive case: every SETTABLE lane is allowed for a plain `me`
+        # card, so only the three every-card-unconditional 400s ("review",
+        # "scheduled", "snoozed") appear — not `{lane: {allowed: true}}`
+        # for the other five. This is the direct proof of the "absence
+        # means allowed" contract on the one card type where every real
+        # move really is allowed.
+        assert policy["lanes"] == {
+            "review": {"allowed": False, "reason": "lane 'review' cannot be set directly"},
+            "scheduled": {"allowed": False, "reason": "lane 'scheduled' cannot be set directly"},
+            "snoozed": {"allowed": False, "reason": "lane 'snoozed' cannot be set directly"},
+        }
+
+    def test_claimed_card_policy_block_refuses_everything_but_cancel(self, client, stores):
+        task_manager, *_ = stores
+        task = task_manager.create("Being worked by the agent", tags=["codex", "agent-running"])
+        r = client.get("/api/agents/board")
+        card = next(c for c in r.json()["lanes"]["in_progress"] if c["id"] == task.id)
+        policy = card["policy"]
+        assert policy["claimed"] is True
+        assert policy["agent_owned"] is True
+        assert policy["assignee"]["allowed"] is False
+        assert policy["fields"]["allowed"] is False
+        assert policy["cancel"]["allowed"] is True
+        for lane in ("unassigned", "assigned", "in_progress", "human_queue", "done"):
+            assert policy["lanes"][lane]["allowed"] is False, lane
+        assert card["session"] is None
+        assert card["pending_question"] is None
+
+    def test_pending_handoff_card_policy_refuses_ordinary_cancel(self, client, stores):
+        """A pending handoff keeps its scoped cancellation action, not the
+        ordinary card Cancel route that refuses it before teardown."""
+        task_manager, *_ = stores
+        task = task_manager.create("Interrupted synthetic handoff", tags=["codex", "agent-running"])
+        task_manager.update(
+            task.id,
+            fields={"project_handoff_operation_id": "synthetic-handoff"},
+            _project_action=True,
+        )
+
+        board = client.get("/api/agents/board").json()
+        card = next(
+            card
+            for cards in board["lanes"].values()
+            for card in cards
+            if card["id"] == task.id
+        )
+        assert card["is_project"] is False
+        assert card["policy"]["cancel"] == {
+            "allowed": False,
+            "reason": "pending handoffs use the Cancel handoff action",
+        }
+        assert card["policy"]["can_cancel_project"] is True
+        refusal = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert refusal.status_code == 409
+        assert refusal.json()["detail"] == card["policy"]["cancel"]["reason"]
+
+    def test_agent_blocked_card_carries_pending_question(self, client, stores):
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create("Investigate the outage", tags=["agent-blocked"], status="blocked")
+        session = session_store.create(task_id=task.id, status=STATUS_BLOCKED)
+        session_store.create_pending_question(
+            session_id=session.session_id,
+            task_id=task.id,
+            question="Which environment — staging or prod?",
+            sent_message_id=42,
+        )
+        r = client.get("/api/agents/board")
+        human_queue = r.json()["lanes"]["human_queue"]
+        assert len(human_queue) == 1
+        pq = human_queue[0]["pending_question"]
+        assert pq is not None
+        assert pq["question"] == "Which environment — staging or prod?"
+        assert pq["session_id"] == session.session_id
+
+
+    def test_locally_scanned_cc_session_does_not_bogus_link_to_a_task(
+        self, client, stores, monkeypatch, tmp_path: Path,
+    ):
+        """`to_session_dict`'s `task_id` must never be the Claude Code UUID —
+        `_build_board`'s `sessions_by_task` join is keyed purely on
+        truthiness, so a leaked UUID would treat a locally scanned CC
+        session as if it had a real LifeOS task link. A session with no real
+        link (`task_id: None`) must not surface on any task's card.
+
+        Driving a real `cc.build_snapshot` over a synthetic on-disk
+        transcript (rather than monkeypatching `_claude_code_snapshot` to
+        return a literal dict with `task_id: None` hardcoded) ensures
+        `to_session_dict` actually runs and production code supplies the
+        field."""
+        from api.services.claude_code import session_ingest as cc
+
+        task_manager, *_ = stores
+        task = task_manager.create("Ping the vendor", context="Work", tags=["me"])
+
+        projects_dir = tmp_path / "cc_projects"
+        proj = projects_dir / "-home-synthetic-unrelated-proj"
+        proj.mkdir(parents=True)
+        # No custom title, no AI title, no user text, no cwd basename to key
+        # off of — the shape that falls back to `label = raw_session_id`
+        # (session_ingest.py) and, pre-fix, `task_id = raw_session_id` too.
+        (proj / "cc-unrelated-raw-uuid.jsonl").write_text(
+            json.dumps({
+                "type": "assistant",
+                "timestamp": "2026-05-30T10:41:38Z",
+                "message": {
+                    "role": "assistant", "model": "claude-sonnet-4-6",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "usage": {"input_tokens": 10, "output_tokens": 5,
+                              "cache_creation_input_tokens": 0,
+                              "cache_read_input_tokens": 0},
+                },
+            }) + "\n",
+            encoding="utf-8",
+        )
+
+        cc.invalidate_cache()
+        cc_sessions, cc_edges = cc.build_snapshot(
+            projects_dir=projects_dir, cache_ttl=0,
+        )
+        assert len(cc_sessions) == 1
+        assert cc_sessions[0]["task_id"] is None  # sanity: production code agrees
+
+        monkeypatch.setattr(
+            agents_route, "_claude_code_snapshot",
+            lambda: (cc_sessions, cc_edges),
+        )
+        r = client.get("/api/agents/board")
+        assigned = r.json()["lanes"]["assigned"]
+        assert len(assigned) == 1
+        assert assigned[0]["id"] == task.id
+        assert assigned[0]["session"] is None
+
+    def test_card_carries_its_linked_session(self, client, stores):
+        """`_task_card`'s session join, exercised with a card whose
+        `session` is not `None`."""
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create("Draft the memo", tags=["codex"])
+        session = session_store.create(task_id=task.id, status="running", routing="claude")
+        r = client.get("/api/agents/board")
+        card = r.json()["lanes"]["assigned"][0]
+        assert card["session"] is not None
+        assert card["session"]["session_id"] == session.session_id
+
+    def test_card_session_picks_most_recently_active_of_several(self, client, stores, monkeypatch):
+        """With two sessions on the same task, the card
+        must carry the one with the latest `last_activity_at`, not just
+        whichever the store happened to return first. `sessions` PRIMARY
+        KEYs on `task_id` (at most one LifeOS-worker session per task at a
+        time), so the second session here models the realistic case of a
+        task later resumed via a Claude Code CLI session — the union
+        `_task_card` actually has to pick between."""
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create("Draft the memo", tags=["codex"])
+        older = session_store.create(task_id=task.id, status="completed", routing="claude")
+        with session_store._connect() as conn:
+            conn.execute(
+                "UPDATE sessions SET last_activity_at = ? WHERE session_id = ?",
+                (100, older.session_id),
+            )
+        newer_session_id = "cc:newer-session"
+        monkeypatch.setattr(
+            agents_route, "_claude_code_snapshot",
+            lambda: ([{
+                "session_id": newer_session_id, "task_id": task.id,
+                "status": "running", "last_activity_at": 200,
+            }], []),
+        )
+
+        r = client.get("/api/agents/board")
+        card = r.json()["lanes"]["assigned"][0]
+        assert card["session"]["session_id"] == newer_session_id
+
+    def test_review_lane_agent_completed_not_accepted(self, client, stores):
+        task_manager, *_ = stores
+        task_manager.create("Draft the memo", tags=["agent-completed"], status="done")
+        r = client.get("/api/agents/board")
+        lanes = r.json()["lanes"]
+        assert len(lanes["review"]) == 1
+        assert lanes["done"] == []
+
+    def test_scheduled_cron_entry_with_future_fire(self, client, stores):
+        _tm, scheduler_store, *_ = stores
+        scheduler_store.create(
+            name="Morning briefing", schedule_type="cron", schedule_value="0 9 * * *",
+            message_type="static", message_content="Good morning",
+        )
+        r = client.get("/api/agents/board")
+        lanes = r.json()["lanes"]
+        assert len(lanes["scheduled"]) == 1
+        card = lanes["scheduled"][0]
+        assert card["recurring"] is True
+        assert card["next_fire_at"] is not None
+        assert card["last_run"] is None
+        assert lanes["done"] == []
+
+    def test_scheduled_card_carries_the_full_schedule_for_the_drawer(self, client, stores):
+        """The board drawer edits schedule type, timing, timezone, action,
+        executor, and bot without a second round trip — the card has to
+        carry all of them."""
+        _tm, scheduler_store, *_ = stores
+        scheduler_store.create(
+            name="Weekly review", schedule_type="cron", schedule_value="0 9 * * 6",
+            action="agent", executor="cloud", message_content="Draft my weekly review",
+            timezone="America/Chicago",
+        )
+        r = client.get("/api/agents/board")
+        card = r.json()["lanes"]["scheduled"][0]
+        assert card["schedule_type"] == "cron"
+        assert card["schedule_value"] == "0 9 * * 6"
+        assert card["timezone"] == "America/Chicago"
+        assert card["action"] == "agent"
+        assert card["executor"] == "cloud"
+        assert card["bot"] == ""
+
+    def test_scheduled_card_carries_per_action_inputs_for_the_drawer(self, client, stores):
+        """The drawer's per-action sections (an endpoint action's call
+        config, an agent action's execution context) render from the card
+        alone, with no second fetch — so the card must carry every one of
+        those fields."""
+        _tm, scheduler_store, *_ = stores
+        scheduler_store.create(
+            name="Pinned agent run", schedule_type="cron", schedule_value="0 9 * * *",
+            action="agent", message_content="Draft the pinned update",
+            persona_id="primary", model_id="claude-synthetic-model",
+            effort="high", host="synthetic-host", working_dir="/tmp/synthetic-project",
+        )
+        scheduler_store.create(
+            name="Endpoint check", schedule_type="cron", schedule_value="0 8 * * *",
+            action="endpoint", endpoint_config={"method": "GET", "endpoint": "/api/health", "params": {"x": 1}},
+        )
+        r = client.get("/api/agents/board")
+        cards = {c["name"]: c for c in r.json()["lanes"]["scheduled"]}
+
+        agent_card = cards["Pinned agent run"]
+        assert agent_card["persona_id"] == "primary"
+        assert agent_card["model_id"] == "claude-synthetic-model"
+        assert agent_card["effort"] == "high"
+        assert agent_card["host"] == "synthetic-host"
+        assert agent_card["working_dir"] == "/tmp/synthetic-project"
+
+        endpoint_card = cards["Endpoint check"]
+        assert endpoint_card["endpoint_config"] == {"method": "GET", "endpoint": "/api/health", "params": {"x": 1}}
+
+    def test_scheduled_cron_entry_carries_last_run_after_it_fires(self, client, stores):
+        """A recurring entry that has already fired once
+        but is still enabled with a future next trigger stays in Scheduled —
+        its `last_run` must still be populated from the prior fire."""
+        _tm, scheduler_store, *_ = stores
+        entry = scheduler_store.create(
+            name="Morning briefing", schedule_type="cron", schedule_value="0 9 * * *",
+            message_type="static", message_content="Good morning",
+        )
+        scheduler_store.mark_triggered(entry.id)
+        scheduler_store.record_run(entry.id, "sent", "delivered the briefing")
+
+        r = client.get("/api/agents/board")
+        lanes = r.json()["lanes"]
+        assert lanes["done"] == []
+        assert len(lanes["scheduled"]) == 1
+        card = lanes["scheduled"][0]
+        assert card["last_run"] is not None
+        assert card["last_run"]["outcome"] == "sent"
+        assert card["last_run"]["snippet"] == "delivered the briefing"
+
+    def test_disabled_recurring_schedule_shows_in_done(self, client, stores):
+        _tm, scheduler_store, *_ = stores
+        entry = scheduler_store.create(
+            name="Retired job", schedule_type="cron", schedule_value="0 9 * * *",
+            message_type="static", message_content="x",
+        )
+        scheduler_store.update(entry.id, enabled=False)
+        r = client.get("/api/agents/board")
+        lanes = r.json()["lanes"]
+        assert lanes["scheduled"] == []
+        assert len(lanes["done"]) == 1
+
+    def test_fired_one_off_shows_in_done_not_scheduled(self, client, stores):
+        _tm, scheduler_store, *_ = stores
+        entry = scheduler_store.create(
+            name="One-time nudge", schedule_type="once",
+            schedule_value="2020-01-01T09:00:00+00:00",
+            message_type="static", message_content="x",
+        )
+        scheduler_store.mark_triggered(entry.id)
+        scheduler_store.record_run(entry.id, "sent", "delivered")
+        r = client.get("/api/agents/board")
+        lanes = r.json()["lanes"]
+        assert lanes["scheduled"] == []
+        assert len(lanes["done"]) == 1
+        assert lanes["done"][0]["last_run"]["outcome"] == "sent"
+
+
+# ---------------------------------------------------------------------------
+# GET /api/agents/board/stream
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestCardLifecycleDates:
+    def test_task_card_carries_the_lifecycle_dates_the_drawer_renders(self, client, stores):
+        """The drawer's metadata block reads these off the card. A card that
+        never reached a terminal state carries nulls rather than omitting the
+        keys, so the client can branch on value instead of presence.
+        """
+        task_manager, _sched, _session_store, _transcript = stores
+        open_task = task_manager.create("Synthetic open card", tags=["me"])
+        done_task = task_manager.create("Synthetic finished card", tags=["me"])
+        task_manager.complete(done_task.id)
+
+        lanes = client.get("/api/agents/board").json()["lanes"]
+        cards = {c["id"]: c for lane in lanes.values() for c in lane if c.get("kind") == "task"}
+
+        opened = cards[open_task.id]
+        assert opened["created_date"] == open_task.created_date
+        assert opened["done_date"] is None
+        assert opened["cancelled_date"] is None
+
+        finished = cards[done_task.id]
+        assert finished["done_date"], finished
+        assert finished["updated_at"]
+
+
+@pytest.mark.unit
+class TestReviewActions:
+    def test_reject_requires_note_and_queues_context(self, client, stores):
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create("Review synthetic output", tags=["codex", "agent-completed"], status="done")
+        session = session_store.create(task_id=task.id, status=STATUS_COMPLETED, routing="local")
+
+        missing = client.post(f"/api/agents/board/cards/{task.id}/review-action", json={"action": "reject"})
+        assert missing.status_code == 400
+        assert task_manager.get(task.id).status == "done"
+
+        response = client.post(
+            f"/api/agents/board/cards/{task.id}/review-action",
+            json={"action": "reject", "note": "Please add a synthetic edge-case check."},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["lane"] == "in_progress"
+        updated = task_manager.get(task.id)
+        assert updated.status == "in_progress"
+        assert "agent-running" in updated.tags
+        assert "Please add a synthetic edge-case check." in (updated.notes or "")
+        queued = session_store.list_answered_unprocessed_questions()
+        assert len(queued) == 1
+        assert queued[0]["session_id"] == session.session_id
+        assert queued[0]["answer"] == "Please add a synthetic edge-case check."
+
+    def test_reject_clears_a_stale_snooze(self, client, stores):
+        """A snoozed Review card rejected back to In progress must not
+        carry a future `snoozed_until` forward — In progress is never
+        snooze-eligible, and a lingering value would silently re-hide the
+        card the next time it lands back in Review."""
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create("Snoozed review, rejected", tags=["codex", "agent-completed"], status="done")
+        task_manager.update(task.id, fields={"snoozed_until": "2099-01-01T00:00:00+00:00"})
+        session_store.create(task_id=task.id, status=STATUS_COMPLETED, routing="local")
+
+        response = client.post(
+            f"/api/agents/board/cards/{task.id}/review-action",
+            json={"action": "reject", "note": "Retry the synthetic case."},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["lane"] == "in_progress"
+        updated = task_manager.get(task.id)
+        assert updated.status == "in_progress"
+        assert "snoozed_until" not in updated.fields
+
+    def test_reassign_preserves_session_context_and_moves_to_assigned(self, client, stores):
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create("Review synthetic output", tags=["codex", "agent-completed"], status="done", notes="Prior output")
+        session = session_store.create(task_id=task.id, status=STATUS_COMPLETED, routing="codex")
+        session_store.append_message(session.session_id, "assistant", "Prior synthetic result")
+
+        response = client.post(
+            f"/api/agents/board/cards/{task.id}/review-action",
+            json={"action": "reassign", "assignee": "claude", "note": "Try a second synthetic approach."},
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["lane"] == "assigned"
+        updated = task_manager.get(task.id)
+        assert updated.status == "todo"
+        assert updated.tags == ["claude", "agent-reassigned"]
+        assert "Prior output" in (updated.notes or "")
+        assert "Try a second synthetic approach." in (updated.notes or "")
+        assert session_store.get(task.id).session_id == session.session_id
+        assert session_store.get_messages(session.session_id)[0]["content"] == "Prior synthetic result"
+
+    def test_reassign_clears_a_stale_snooze(self, client, stores):
+        """Assigned IS a snooze-eligible natural lane, so the write-path
+        natural-lane guard alone would not clear this — the reassignment
+        must clear it explicitly, since reassigning a card is an operator
+        action that wakes it, the same as a lane-move drag."""
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create("Snoozed review, reassigned", tags=["codex", "agent-completed"], status="done")
+        task_manager.update(task.id, fields={"snoozed_until": "2099-01-01T00:00:00+00:00"})
+        session_store.create(task_id=task.id, status=STATUS_COMPLETED, routing="codex")
+
+        response = client.post(
+            f"/api/agents/board/cards/{task.id}/review-action",
+            json={"action": "reassign", "assignee": "claude"},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["lane"] == "assigned"
+        updated = task_manager.get(task.id)
+        assert updated.tags == ["claude", "agent-reassigned"]
+        assert "snoozed_until" not in updated.fields
+
+    def test_reassign_without_a_prior_session_moves_the_card_and_reports_no_context(
+        self, client, stores,
+    ):
+        """A Review card whose session was never recorded (or has since been
+        pruned) still reassigns. Refusing it strands the card in Review with
+        no way to hand the work to anyone else.
+        """
+        task_manager, _sched, _session_store, _transcript = stores
+        task = task_manager.create(
+            "Review synthetic output", tags=["cloud", "agent-completed"], status="done",
+        )
+        response = client.post(
+            f"/api/agents/board/cards/{task.id}/review-action",
+            json={"action": "reassign", "assignee": "claude", "note": "Start from scratch."},
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["lane"] == "assigned"
+        assert body["context_preserved"] is False
+        updated = task_manager.get(task.id)
+        assert updated.status == "todo"
+        assert updated.tags == ["claude", "agent-reassigned"]
+        assert "Start from scratch." in (updated.notes or "")
+
+    def test_reject_without_a_prior_session_is_refused_and_leaves_the_card_alone(
+        self, client, stores,
+    ):
+        """Reject resumes the prior session — with none to resume, it must
+        refuse rather than move the card to In progress with nothing running.
+        """
+        task_manager, _sched, _session_store, _transcript = stores
+        task = task_manager.create(
+            "Review synthetic output", tags=["cloud", "agent-completed"], status="done",
+        )
+        response = client.post(
+            f"/api/agents/board/cards/{task.id}/review-action",
+            json={"action": "reject", "note": "Please redo the synthetic case."},
+        )
+        assert response.status_code == 409
+        assert response.json()["detail"] == "the prior agent session cannot be resumed"
+        unchanged = task_manager.get(task.id)
+        assert unchanged.status == "done"
+        assert unchanged.tags == ["cloud", "agent-completed"]
+        assert not (unchanged.notes or "")
+
+    def test_reassign_removes_managed_executor_tag_before_setting_target(self, client, stores):
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create(
+            "Review managed synthetic output",
+            tags=["cloud-haiku", "agent-completed"], status="done",
+        )
+        session_store.create(task_id=task.id, status=STATUS_COMPLETED, routing="claude")
+        response = client.post(
+            f"/api/agents/board/cards/{task.id}/review-action",
+            json={"action": "reassign", "assignee": "codex"},
+        )
+        assert response.status_code == 200, response.text
+        assert task_manager.get(task.id).tags == ["codex", "agent-reassigned"]
+
+    def test_review_action_conflict_leaves_card_and_queue_unchanged(self, client, stores, monkeypatch):
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create("Review synthetic output", tags=["codex", "agent-completed"], status="done")
+        session_store.create(task_id=task.id, status=STATUS_COMPLETED, routing="local")
+        from api.services.task_manager import TaskConflictError
+        monkeypatch.setattr(task_manager, "update", lambda *_a, **_k: (_ for _ in ()).throw(TaskConflictError("race")))
+
+        response = client.post(
+            f"/api/agents/board/cards/{task.id}/review-action",
+            json={"action": "reject", "note": "Retry the synthetic example."},
+        )
+        assert response.status_code == 409
+        assert task_manager.get(task.id).status == "done"
+        assert task_manager.get(task.id).tags == ["codex", "agent-completed"]
+        assert session_store.list_answered_unprocessed_questions() == []
+
+    def test_reject_bad_input_from_the_task_write_is_a_422_not_a_409(self, client, stores, monkeypatch):
+        """`board_review.reject_review` maps a non-conflict `ValueError` from
+        the task write onto `invalid_arg`; the route must still surface that
+        as 422 (its status before the accept/reject logic moved into
+        `board_review.py`), not fold it into the generic 409 the same route
+        uses for every other `BoardReviewError` code."""
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create("Review synthetic output", tags=["codex", "agent-completed"], status="done")
+        session_store.create(task_id=task.id, status=STATUS_COMPLETED, routing="local")
+        monkeypatch.setattr(task_manager, "update", lambda *_a, **_k: (_ for _ in ()).throw(ValueError("bad input")))
+
+        response = client.post(
+            f"/api/agents/board/cards/{task.id}/review-action",
+            json={"action": "reject", "note": "Retry the synthetic example."},
+        )
+        assert response.status_code == 422
+        assert task_manager.get(task.id).status == "done"
+
+    def test_blocked_respond_uses_existing_question_path(self, client, stores):
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create("Need synthetic clarification", tags=["agent-blocked"], status="blocked")
+        session = session_store.create(task_id=task.id, status=STATUS_BLOCKED)
+        question_id = session_store.create_pending_question(
+            session.session_id, task.id, "Which synthetic fixture?", 17,
+        )
+        response = client.post(
+            f"/api/agents/board/cards/{task.id}/review-action",
+            json={"action": "respond", "note": "Use fixture alpha."},
+        )
+        assert response.status_code == 200
+        assert response.json()["question_id"] == question_id
+        answered = session_store.list_answered_unprocessed_questions()
+        assert answered[0]["answer"] == "Use fixture alpha."
+
+    def test_reject_queues_only_after_card_transition_and_rolls_back_on_queue_failure(
+        self, client, stores, monkeypatch,
+    ):
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create("Synthetic rollback", tags=["codex", "agent-completed"], status="done")
+        session_store.create(task_id=task.id, status=STATUS_COMPLETED, routing="codex")
+        monkeypatch.setattr(
+            session_store, "enqueue_web_followup",
+            lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("synthetic queue failure")),
+        )
+        response = client.post(
+            f"/api/agents/board/cards/{task.id}/review-action",
+            json={"action": "reject", "note": "Retry synthetic output."},
+        )
+        assert response.status_code == 409
+        restored = task_manager.get(task.id)
+        assert restored.status == "done"
+        assert restored.tags == ["codex", "agent-completed"]
+        assert session_store.list_answered_unprocessed_questions() == []
+
+    def test_reject_rollback_does_not_clobber_a_concurrent_note(self, client, stores, monkeypatch):
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create("Synthetic rollback race", tags=["codex", "agent-completed"], status="done")
+        session_store.create(task_id=task.id, status=STATUS_COMPLETED, routing="codex")
+        original_update = task_manager.update
+        transition_seen = False
+
+        def raced_update(task_id, **kwargs):
+            nonlocal transition_seen
+            result = original_update(task_id, **kwargs)
+            if "_tags_merge" in kwargs and not transition_seen:
+                transition_seen = True
+                original_update(task_id, notes="Concurrent synthetic note")
+            return result
+
+        monkeypatch.setattr(task_manager, "update", raced_update)
+        monkeypatch.setattr(
+            session_store, "enqueue_web_followup",
+            lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("synthetic queue failure")),
+        )
+        response = client.post(
+            f"/api/agents/board/cards/{task.id}/review-action",
+            json={"action": "reject", "note": "Retry synthetic output."},
+        )
+        assert response.status_code == 409
+        assert "rollback conflict" in response.json()["detail"]
+        assert task_manager.get(task.id).notes == "Concurrent synthetic note"
+
+    def test_reassign_retires_old_completion_anchor_and_reports_context_reality(self, client, stores):
+        task_manager, _sched, session_store, transcript_store = stores
+        task = task_manager.create("Synthetic reassign", tags=["codex", "agent-completed"], status="done")
+        session = session_store.create(task_id=task.id, status=STATUS_COMPLETED, routing="codex")
+        session_store.register_completion_followup(session.session_id, task.id, [91], label="Synthetic reassign")
+        response = client.post(
+            f"/api/agents/board/cards/{task.id}/review-action",
+            json={"action": "reassign", "assignee": "claude"},
+        )
+        assert response.status_code == 200
+        assert response.json()["context_preserved"] is False
+        with session_store._connect() as conn:
+            row = conn.execute(
+                "SELECT processed, timed_out FROM pending_questions WHERE sent_message_id = 91",
+            ).fetchone()
+        assert tuple(row) == (1, 1)
+
+    def test_accept_undo_rejects_stale_transition_token(self, client, stores):
+        task_manager, _sched, _session_store, _transcript = stores
+        task = task_manager.create("Synthetic token", tags=["agent-completed"], status="done")
+        accepted = client.post(f"/api/agents/board/cards/{task.id}/accept")
+        assert accepted.status_code == 200
+        token = accepted.json()["undo_token"]
+        task_manager.update(task.id, notes="unrelated synthetic edit")
+        undo = client.post(
+            f"/api/agents/board/cards/{task.id}/undo-accept",
+            json={"token": token},
+        )
+        assert undo.status_code == 409
+        assert "accepted" in task_manager.get(task.id).tags
+
+    def test_reassign_keeps_native_handles_until_worker_selects_route(self, client, stores):
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create("Synthetic native context", tags=["claude", "agent-completed"], status="done")
+        _session = session_store.create(
+            task_id=task.id, status=STATUS_COMPLETED, routing="claude_code",
+        )
+        session_store.set_claude_code_session_id(task.id, "synthetic-cli-thread")
+        response = client.post(
+            f"/api/agents/board/cards/{task.id}/review-action",
+            json={"action": "reassign", "assignee": "claude"},
+        )
+        assert response.status_code == 200
+        rearmed = session_store.rearm_for_claim(task.id)
+        assert rearmed is not None
+        assert rearmed.claude_code_session_id == "synthetic-cli-thread"
+
+    def test_hermes_reject_without_conversation_id_refuses_before_mutation(self, client, stores):
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create("Synthetic Hermes review", tags=["hermes", "agent-completed"], status="done")
+        session_store.create(task_id=task.id, status=STATUS_COMPLETED, routing="hermes")
+        response = client.post(
+            f"/api/agents/board/cards/{task.id}/review-action",
+            json={"action": "reject", "note": "Continue synthetic work."},
+        )
+        assert response.status_code == 409
+        assert task_manager.get(task.id).status == "done"
+        assert session_store.list_answered_unprocessed_questions() == []
+
+
+class TestBoardStream:
+    async def test_stream_emits_a_second_frame_after_a_task_mutation(self, stores):
+        """Drives the real SSE generator (GET /api/agents/board/stream)
+        directly rather than through TestClient — its
+        `_TestClientTransport` fully drains an ASGI call before returning a
+        response, and this generator never completes on its own — and
+        proves a task mutation produces a second, different frame on the
+        path the page actually uses ("The board updates within three
+        seconds of an external vault edit without a page reload.")."""
+        task_manager, *_ = stores
+        task = task_manager.create("Ping the vendor")
+
+        resp = await agents_route.stream_board()
+        gen = resp.body_iterator
+        next_task = None
+        try:
+            first = await gen.__anext__()
+            assert first == ": ok\n\n"
+
+            second = await gen.__anext__()
+            assert second.startswith("event: board\n")
+            first_board = json.loads(second.split("data: ", 1)[1])
+            assert task.id in [c["id"] for c in first_board["lanes"]["unassigned"]]
+            # The streamed frame carries the same api_host field GET
+            # /api/agents/board does, so a client reading the SSE stream
+            # can tell a card's assigned host apart from "this machine"
+            # too.
+            assert first_board["api_host"] == agents_route.api_host_name()
+
+            # Without a mutation, ticks must not emit —
+            # the signature-diff suppression, not "any frame that shows up".
+            # Use asyncio.wait (not wait_for) so a timeout leaves the pending
+            # __anext__() task running rather than cancelling it — cancelling
+            # an async generator's __anext__() closes the generator, which
+            # would make every subsequent __anext__() raise StopAsyncIteration.
+            next_task = asyncio.ensure_future(gen.__anext__())
+            done, _pending = await asyncio.wait(
+                {next_task}, timeout=2 * agents_route._BOARD_STREAM_INTERVAL,
+            )
+            assert next_task not in done, (
+                "stream emitted a frame despite no board mutation "
+                "(signature-diff suppression broken)"
+            )
+
+            task_manager.update(task.id, tags=["me"])
+
+            third = await next_task
+            assert third.startswith("event: board\n")
+            second_board = json.loads(third.split("data: ", 1)[1])
+            assert task.id in [c["id"] for c in second_board["lanes"]["assigned"]]
+            assert task.id not in [c["id"] for c in second_board["lanes"]["unassigned"]]
+        finally:
+            # If anything between asyncio.wait and `await next_task` raises,
+            # next_task is still pending — closing the generator while its
+            # own __anext__() is still outstanding raises "aclose(): asynchronous
+            # generator is already running" and masks the real error.
+            # Cancel it first so aclose() sees a
+            # generator that isn't mid-iteration.
+            if next_task is not None and not next_task.done():
+                next_task.cancel()
+                await asyncio.gather(next_task, return_exceptions=True)
+            await gen.aclose()
+
+    async def test_snoozed_card_leaves_its_lane_once_the_wake_time_passes(
+        self, stores, monkeypatch,
+    ):
+        """A snooze expiring is a wall-clock change, not a vault edit — a
+        content-hash/mtime cache would never notice it. Proves the
+        stream's own tick recomputes lane derivation against the current
+        time on every rebuild by injecting `agents_route._now` (no sleep):
+        the task file is never touched between the two frames, only the
+        injected clock moves past the wake-up time.
+        """
+        task_manager, *_ = stores
+        task = task_manager.create("Wakes up on its own", tags=["me"])
+        wake_at = datetime(2026, 1, 1, 9, 0, tzinfo=timezone.utc)
+        task_manager.update(task.id, fields={"snoozed_until": wake_at.isoformat()})
+        monkeypatch.setattr(agents_route, "_now", lambda: wake_at - timedelta(seconds=1))
+
+        resp = await agents_route.stream_board()
+        gen = resp.body_iterator
+        next_task = None
+        try:
+            first = await gen.__anext__()
+            assert first == ": ok\n\n"
+
+            second = await gen.__anext__()
+            first_board = json.loads(second.split("data: ", 1)[1])
+            assert task.id in [c["id"] for c in first_board["lanes"]["snoozed"]]
+            assert task.id not in [c["id"] for c in first_board["lanes"]["assigned"]]
+
+            # Move only the injected clock past the wake-up time — the task
+            # itself is never written again.
+            monkeypatch.setattr(agents_route, "_now", lambda: wake_at + timedelta(seconds=1))
+
+            next_task = asyncio.ensure_future(gen.__anext__())
+            done, _pending = await asyncio.wait(
+                {next_task}, timeout=2 * agents_route._BOARD_STREAM_INTERVAL,
+            )
+            assert next_task in done, (
+                "stream did not emit a frame after the injected clock passed "
+                "the card's wake-up time"
+            )
+            third = await next_task
+            second_board = json.loads(third.split("data: ", 1)[1])
+            assert task.id in [c["id"] for c in second_board["lanes"]["assigned"]]
+            assert task.id not in [c["id"] for c in second_board["lanes"]["snoozed"]]
+        finally:
+            if next_task is not None and not next_task.done():
+                next_task.cancel()
+                await asyncio.gather(next_task, return_exceptions=True)
+            await gen.aclose()
+
+
+# ---------------------------------------------------------------------------
+# PUT /api/agents/board/cards/{id}/lane
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestMoveBoardCard:
+    def test_missing_card_is_404(self, client, stores):
+        r = client.put("/api/agents/board/cards/does-not-exist/lane", json={"lane": "done"})
+        assert r.status_code == 404
+
+    def test_done_marks_task_done(self, client, stores):
+        task_manager, *_ = stores
+        task = task_manager.create("Ship the release")
+        r = client.put(f"/api/agents/board/cards/{task.id}/lane", json={"lane": "done"})
+        assert r.status_code == 200
+        assert r.json()["lane"] == "done"
+        assert task_manager.get(task.id).status == "done"
+
+    def test_unassigned_removes_assignee_tag(self, client, stores):
+        task_manager, *_ = stores
+        task = task_manager.create("Review the PR", tags=["codex", "urgent-work"])
+        r = client.put(f"/api/agents/board/cards/{task.id}/lane", json={"lane": "unassigned"})
+        assert r.status_code == 200
+        assert r.json()["lane"] == "unassigned"
+        assert sorted(task_manager.get(task.id).tags) == ["urgent-work"]
+
+    def test_assigned_sets_codex_and_removes_other_assignee(self, client, stores):
+        task_manager, *_ = stores
+        task = task_manager.create("Fix the flaky test", tags=["me"])
+        r = client.put(
+            f"/api/agents/board/cards/{task.id}/lane",
+            json={"lane": "assigned", "assignee": "codex"},
+        )
+        assert r.status_code == 200
+        updated = task_manager.get(task.id)
+        assert sorted(updated.tags) == ["codex"]
+
+    def test_in_progress_on_agent_assigned_task_is_409(self, client, stores):
+        task_manager, *_ = stores
+        task = task_manager.create("Write the migration", tags=["codex"])
+        r = client.put(f"/api/agents/board/cards/{task.id}/lane", json={"lane": "in_progress"})
+        assert r.status_code == 409
+        # Unmodified — a rejected move must not have written anything.
+        assert task_manager.get(task.id).status == "todo"
+
+    def test_in_progress_on_me_assigned_task_succeeds(self, client, stores):
+        task_manager, *_ = stores
+        task = task_manager.create("Send the invoice", tags=["me"])
+        r = client.put(f"/api/agents/board/cards/{task.id}/lane", json={"lane": "in_progress"})
+        assert r.status_code == 200
+        assert task_manager.get(task.id).status == "in_progress"
+
+    def test_review_lane_is_not_directly_settable(self, client, stores):
+        task_manager, *_ = stores
+        task = task_manager.create("Something")
+        r = client.put(f"/api/agents/board/cards/{task.id}/lane", json={"lane": "review"})
+        assert r.status_code == 400
+
+    def test_human_queue_card_dropped_into_done_lands_in_done(self, client, stores):
+        """A #human + blocked card dropped into Done must
+        actually leave Human queue: the `human` tag must be stripped along
+        with the status write, since the lane is otherwise derived from the
+        tag and would keep it there even after `status` becomes `done`."""
+        task_manager, *_ = stores
+        task = task_manager.create("Escalated to the operator", tags=["human"], status="blocked")
+        r = client.put(f"/api/agents/board/cards/{task.id}/lane", json={"lane": "done"})
+        assert r.status_code == 200
+        assert r.json()["lane"] == "done"
+        updated = task_manager.get(task.id)
+        assert updated.status == "done"
+        assert "human" not in updated.tags
+
+        board = client.get("/api/agents/board").json()
+        done_ids = [c["id"] for c in board["lanes"]["done"]]
+        human_queue_ids = [c["id"] for c in board["lanes"]["human_queue"]]
+        assert task.id in done_ids
+        assert task.id not in human_queue_ids
+
+    @pytest.mark.parametrize("worker_tag", ["agent-running", "agent-blocked"])
+    @pytest.mark.parametrize("target_lane", ["in_progress", "done"])
+    def test_worker_owned_card_cannot_be_dropped_on_in_progress_or_done(
+        self, client, stores, worker_tag, target_lane,
+    ):
+        """A worker-owned card (agent-running or
+        agent-blocked) must 409 for In progress and Done, with NO write at
+        all — a tag-strip there would silently detach it from a live
+        worker task."""
+        task_manager, *_ = stores
+        task = task_manager.create("Being worked by the agent", tags=["agent", worker_tag])
+        inbox = task_manager.tasks_dir / "Inbox.md"
+        before = inbox.read_bytes()
+
+        r = client.put(f"/api/agents/board/cards/{task.id}/lane", json={"lane": target_lane})
+        assert r.status_code == 409
+        assert r.json()["detail"] == (
+            "the worker owns this task while it is running or waiting on an "
+            "answer — answer or kill the session first"
+        )
+        # No write at all — the vault file is byte-for-byte unchanged.
+        assert inbox.read_bytes() == before
+        updated = task_manager.get(task.id)
+        assert sorted(updated.tags) == sorted(["agent", worker_tag])
+
+    @pytest.mark.parametrize("target_lane", ["in_progress", "human_queue"])
+    def test_review_card_cannot_be_moved_to_in_progress_or_human_queue(
+        self, client, stores, target_lane,
+    ):
+        """A pending review (agent-completed, not yet
+        accepted) must 409 rather than silently writing status/tags while
+        the card stays in Review — only Done still doubles as accept."""
+        task_manager, *_ = stores
+        task = task_manager.create("Reviewed by the operator", tags=["me", "agent-completed"], status="done")
+        r = client.put(f"/api/agents/board/cards/{task.id}/lane", json={"lane": target_lane})
+        assert r.status_code == 409
+        assert r.json()["detail"] == "accept the review first"
+        updated = task_manager.get(task.id)
+        assert updated.status == "done"
+        assert sorted(updated.tags) == ["agent-completed", "me"]
+
+        board = client.get("/api/agents/board").json()
+        review_ids = [c["id"] for c in board["lanes"]["review"]]
+        assert task.id in review_ids
+
+    def test_review_card_dropped_on_done_still_accepts(self, client, stores):
+        """Done keeps acting as the accept path for a Review card — only
+        In progress and Human queue 409 instead."""
+        task_manager, *_ = stores
+        task = task_manager.create("Reviewed by the operator", tags=["me", "agent-completed"], status="done")
+        r = client.put(f"/api/agents/board/cards/{task.id}/lane", json={"lane": "done"})
+        assert r.status_code == 200
+        assert r.json()["lane"] == "done"
+        updated = task_manager.get(task.id)
+        assert "accepted" in updated.tags
+        assert updated.status == "done"
+
+    # -- claimed cards refuse EVERY lane, not just in_progress/done --
+
+    @pytest.mark.parametrize("worker_tag", ["agent-running", "agent-blocked"])
+    @pytest.mark.parametrize("target_lane", ["unassigned", "assigned", "human_queue"])
+    def test_worker_owned_card_cannot_be_dropped_on_any_lane(
+        self, client, stores, worker_tag, target_lane,
+    ):
+        """Every lane is refused for a claimed card, not just In progress
+        and Done — a human could otherwise still silently detach a live
+        worker task by dragging it to Unassigned, Assigned, or Human queue."""
+        task_manager, *_ = stores
+        task = task_manager.create("Being worked by the agent", tags=["codex", worker_tag])
+        inbox = task_manager.tasks_dir / "Inbox.md"
+        before = inbox.read_bytes()
+
+        body = {"lane": target_lane}
+        if target_lane == "assigned":
+            body["assignee"] = "me"
+        r = client.put(f"/api/agents/board/cards/{task.id}/lane", json=body)
+        assert r.status_code == 409
+        assert r.json()["detail"] == (
+            "the worker owns this task while it is running or waiting on an "
+            "answer — answer or kill the session first"
+        )
+        assert inbox.read_bytes() == before
+        updated = task_manager.get(task.id)
+        assert sorted(updated.tags) == sorted(["codex", worker_tag])
+
+    # -- an unclaimed agent-owned card also refuses Human queue/Done --
+
+    @pytest.mark.parametrize("target_lane", ["human_queue", "done"])
+    @pytest.mark.parametrize("engine", ["claude", "codex", "hermes", "local"])
+    def test_agent_owned_unclaimed_card_cannot_be_dropped_on_human_queue_or_done(
+        self, client, stores, engine, target_lane,
+    ):
+        """Dragging an unclaimed agent-assigned card straight to Human
+        queue or Done is refused, so work handed to an agent can't be
+        silently closed or re-routed that way; reassign, unassign, or
+        Cancel instead."""
+        task_manager, *_ = stores
+        task = task_manager.create("Handed to the agent", tags=[engine])
+        inbox = task_manager.tasks_dir / "Inbox.md"
+        before = inbox.read_bytes()
+
+        r = client.put(f"/api/agents/board/cards/{task.id}/lane", json={"lane": target_lane})
+        assert r.status_code == 409
+        assert r.json()["detail"] == (
+            "agent-owned cards are managed by the agent — reassign, unassign, "
+            "or cancel this card instead"
+        )
+        assert inbox.read_bytes() == before
+        assert task_manager.get(task.id).tags == [engine]
+
+    @pytest.mark.parametrize("target_lane", ["unassigned", "assigned"])
+    @pytest.mark.parametrize("engine", ["claude", "codex", "hermes", "local"])
+    def test_agent_owned_unclaimed_card_can_still_be_reassigned_or_unassigned(
+        self, client, stores, engine, target_lane,
+    ):
+        """Only Human queue/Done and In progress are refused for an
+        unclaimed agent-owned card — Unassigned/Assigned stay open."""
+        task_manager, *_ = stores
+        task = task_manager.create("Handed to the agent", tags=[engine])
+        body = {"lane": target_lane}
+        if target_lane == "assigned":
+            body["assignee"] = "codex"
+        r = client.put(f"/api/agents/board/cards/{task.id}/lane", json=body)
+        assert r.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# PUT / DELETE /api/agents/board/cards/{id}/snooze
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestSnoozeBoardCard:
+    FUTURE = "2099-01-01T00:00:00+00:00"
+
+    def test_missing_card_is_404(self, client, stores):
+        r = client.put(
+            "/api/agents/board/cards/does-not-exist/snooze", json={"until": self.FUTURE},
+        )
+        assert r.status_code == 404
+
+    @pytest.mark.parametrize("status,tags", [
+        ("todo", []),                      # unassigned
+        ("todo", ["codex"]),               # assigned
+        ("blocked", []),                   # human_queue
+        ("done", ["agent-completed"]),     # review
+    ])
+    def test_eligible_card_persists_the_wake_up_time(self, client, stores, status, tags):
+        task_manager, *_ = stores
+        task = task_manager.create(
+            "Snoozable card", status=status, tags=tags, notes="original notes",
+        )
+        before = task_manager.get(task.id)
+        r = client.put(
+            f"/api/agents/board/cards/{task.id}/snooze", json={"until": self.FUTURE},
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["lane"] == "snoozed"
+        assert body["snoozed_until"] == self.FUTURE
+
+        after = task_manager.get(task.id)
+        assert after.status == before.status
+        assert after.tags == before.tags
+        assert after.notes == before.notes
+        assert after.fields.get("snoozed_until") == self.FUTURE
+
+        board = client.get("/api/agents/board").json()
+        assert task.id in [c["id"] for c in board["lanes"]["snoozed"]]
+
+    @pytest.mark.parametrize("until,expected", [
+        ("20990101T000000+0000", "2099-01-01T00:00:00+00:00"),  # compact form
+        ("2099-01-01T00:00:00Z", "2099-01-01T00:00:00+00:00"),  # Z suffix
+    ])
+    def test_until_is_stored_normalized_not_verbatim(self, client, stores, until, expected):
+        """`fromisoformat` accepts compact and `Z`-suffixed forms, but a
+        browser's `Date` constructor doesn't parse them all uniformly —
+        the vault stores the canonical `parsed.isoformat()` form instead of
+        echoing whatever was sent."""
+        task_manager, *_ = stores
+        task = task_manager.create("Snooze normalization card")
+        r = client.put(f"/api/agents/board/cards/{task.id}/snooze", json={"until": until})
+        assert r.status_code == 200, r.text
+        assert r.json()["snoozed_until"] == expected
+
+        after = task_manager.get(task.id)
+        assert after.fields.get("snoozed_until") == expected
+        content = (task_manager.tasks_dir / "Inbox.md").read_text(encoding="utf-8")
+        assert f"[snoozed_until:: {expected}]" in content
+
+    @pytest.mark.parametrize("status,tags", [
+        ("in_progress", []),
+        ("todo", ["agent", "agent-running"]),
+        ("done", []),
+        ("cancelled", []),
+    ])
+    def test_in_progress_or_done_card_is_refused_and_unmodified(
+        self, client, stores, status, tags,
+    ):
+        task_manager, *_ = stores
+        task = task_manager.create("Not snoozable", status=status, tags=tags)
+        before = task_manager.get(task.id)
+        r = client.put(
+            f"/api/agents/board/cards/{task.id}/snooze", json={"until": self.FUTURE},
+        )
+        assert 400 <= r.status_code < 500, r.text
+        after = task_manager.get(task.id)
+        assert after.status == before.status
+        assert after.tags == before.tags
+        assert "snoozed_until" not in after.fields
+
+    def test_missing_until_is_refused(self, client, stores):
+        task_manager, *_ = stores
+        task = task_manager.create("Card")
+        r = client.put(f"/api/agents/board/cards/{task.id}/snooze", json={})
+        assert 400 <= r.status_code < 500
+        assert "snoozed_until" not in task_manager.get(task.id).fields
+
+    @pytest.mark.parametrize("until", [
+        "not-a-date",
+        "2099-01-01T00:00:00",          # no UTC offset
+        "2000-01-01T00:00:00+00:00",    # parseable, not a future time
+    ])
+    def test_bad_until_is_refused_and_unmodified(self, client, stores, until):
+        task_manager, *_ = stores
+        task = task_manager.create("Card")
+        r = client.put(f"/api/agents/board/cards/{task.id}/snooze", json={"until": until})
+        assert 400 <= r.status_code < 500, r.text
+        assert "snoozed_until" not in task_manager.get(task.id).fields
+
+    def test_scheduler_entry_is_refused(self, client, stores):
+        _task_manager, scheduler_store, *_ = stores
+        entry = scheduler_store.create(
+            name="Nightly digest", schedule_type="cron", schedule_value="0 9 * * *",
+            message_type="static", message_content="digest",
+        )
+        r = client.put(
+            f"/api/agents/board/cards/{entry.id}/snooze", json={"until": self.FUTURE},
+        )
+        assert 400 <= r.status_code < 500
+
+
+@pytest.mark.unit
+class TestUnsnoozeBoardCard:
+    def test_missing_card_is_404(self, client, stores):
+        r = client.delete("/api/agents/board/cards/does-not-exist/snooze")
+        assert r.status_code == 404
+
+    def test_removes_the_field_and_restores_the_natural_lane(self, client, stores):
+        task_manager, *_ = stores
+        task = task_manager.create("Snoozed card", tags=["codex"])
+        task_manager.update(task.id, fields={"snoozed_until": "2099-01-01T00:00:00+00:00"})
+
+        r = client.delete(f"/api/agents/board/cards/{task.id}/snooze")
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["lane"] == "assigned"
+        assert body["snoozed_until"] is None
+        after = task_manager.get(task.id)
+        assert "snoozed_until" not in after.fields
+
+        board = client.get("/api/agents/board").json()
+        assert task.id in [c["id"] for c in board["lanes"]["assigned"]]
+        assert task.id not in [c["id"] for c in board["lanes"]["snoozed"]]
+
+    def test_non_snoozed_card_is_a_no_op_success(self, client, stores):
+        task_manager, *_ = stores
+        task = task_manager.create("Never snoozed", tags=["me"])
+        before = task_manager.get(task.id)
+        r = client.delete(f"/api/agents/board/cards/{task.id}/snooze")
+        assert r.status_code == 200
+        after = task_manager.get(task.id)
+        # A true no-op — no write at all, not merely an idempotent-looking one.
+        assert after.updated_at == before.updated_at
+        assert after.status == before.status
+        assert after.tags == before.tags
+
+
+# ---------------------------------------------------------------------------
+# Lane move / snooze interaction
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestLaneMoveSnoozeInteraction:
+    def test_snoozed_lane_cannot_be_set_directly(self, client, stores):
+        task_manager, *_ = stores
+        task = task_manager.create("Card")
+        r = client.put(f"/api/agents/board/cards/{task.id}/lane", json={"lane": "snoozed"})
+        assert r.status_code == 400
+
+    def test_moving_a_snoozed_card_out_clears_the_snooze_and_applies_the_move(
+        self, client, stores,
+    ):
+        task_manager, *_ = stores
+        task = task_manager.create("Snoozed and dragged", tags=["codex"])
+        task_manager.update(task.id, fields={"snoozed_until": "2099-01-01T00:00:00+00:00"})
+
+        r = client.put(f"/api/agents/board/cards/{task.id}/lane", json={"lane": "unassigned"})
+        assert r.status_code == 200, r.text
+        assert r.json()["lane"] == "unassigned"
+        after = task_manager.get(task.id)
+        assert "snoozed_until" not in after.fields
+        assert after.tags == []
+
+
+# ---------------------------------------------------------------------------
+# POST /api/agents/board/cards/{id}/cancel
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestCancelBoardCard:
+    def test_cancel_unclaimed_card_sets_status_no_session_touched(self, client, stores, monkeypatch):
+        task_manager, _sched, session_store, _transcript = stores
+        monkeypatch.setattr(agents_route, "_maybe_managed_driver", lambda: None)
+        task = task_manager.create("Handed to the agent, never claimed", tags=["codex"])
+
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["status"] == "cancelled"
+        assert body["lane"] == "done"
+        assert body["killed"] == []
+        updated = task_manager.get(task.id)
+        assert updated.status == "cancelled"
+        assert updated.cancelled_date is not None
+
+        board = client.get("/api/agents/board").json()
+        done_ids = [c["id"] for c in board["lanes"]["done"]]
+        assert task.id in done_ids
+
+    def test_cancel_clears_a_stale_snooze_so_the_card_lands_in_done(
+        self, client, stores, monkeypatch,
+    ):
+        """Cancel is available on an Assigned card, and Assigned is
+        snooze-eligible — a cancelled card must land in Done immediately,
+        not stay hidden in Snoozed until an unrelated future wake-up time
+        passes."""
+        task_manager, *_ = stores
+        monkeypatch.setattr(agents_route, "_maybe_managed_driver", lambda: None)
+        task = task_manager.create("Snoozed then cancelled", tags=["codex"])
+        task_manager.update(task.id, fields={"snoozed_until": "2099-01-01T00:00:00+00:00"})
+
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 200, r.text
+        assert r.json()["lane"] == "done"
+        after = task_manager.get(task.id)
+        assert after.status == "cancelled"
+        assert "snoozed_until" not in after.fields
+
+        board = client.get("/api/agents/board").json()
+        assert task.id in [c["id"] for c in board["lanes"]["done"]]
+        assert task.id not in [c["id"] for c in board["lanes"]["snoozed"]]
+
+    def test_cancel_claimed_card_kills_session_and_descendants(self, client, stores, monkeypatch):
+        """A claimed card's live session (and its whole subtree) is torn
+        down the same way Kill does, then the task is marked cancelled."""
+        task_manager, _sched, session_store, transcript_store = stores
+        monkeypatch.setattr(agents_route, "_maybe_managed_driver", lambda: None)
+        task = task_manager.create("Being worked by the agent", tags=["codex", "agent-running"])
+        root = session_store.create(task_id=task.id, status=STATUS_RUNNING, routing="claude")
+        child = session_store.create(
+            task_id="child-of-" + task.id,
+            status=STATUS_RUNNING,
+            routing="local",
+            parent_session_id=root.session_id,
+            root_session_id=root.session_id,
+            spawn_depth=1,
+        )
+
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["status"] == "cancelled"
+        assert body["lane"] == "done"
+        assert set(body["killed"]) == {root.session_id, child.session_id}
+        assert body["failures"] == []
+
+        assert session_store.get_by_session_id(root.session_id).status == STATUS_FAILED
+        assert session_store.get_by_session_id(child.session_id).status == STATUS_FAILED
+        root_events = transcript_store.read(root.session_id)
+        assert any(e["kind"] == "operator_killed" for e in root_events)
+        child_events = transcript_store.read(child.session_id)
+        assert any(e["kind"] == "cascade_killed" for e in child_events)
+
+        updated = task_manager.get(task.id)
+        assert updated.status == "cancelled"
+        assert "agent-running" not in updated.tags
+
+    def test_cancel_claimed_card_with_no_assignee_tears_down_and_cancels(
+        self, client, stores, monkeypatch,
+    ):
+        """A claimed card with no engine assignee is still agent-owned —
+        Cancel tears down the live session and marks the task cancelled."""
+        task_manager, _sched, session_store, transcript_store = stores
+        monkeypatch.setattr(agents_route, "_maybe_managed_driver", lambda: None)
+        task = task_manager.create("A claimed card with no assignee", tags=["agent-running"])
+        assert task.tags == ["agent-running"]
+        root = session_store.create(task_id=task.id, status=STATUS_RUNNING, routing="claude")
+
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["status"] == "cancelled"
+        assert body["lane"] == "done"
+        assert body["killed"] == [root.session_id]
+        assert body["failures"] == []
+        assert session_store.get_by_session_id(root.session_id).status == STATUS_FAILED
+        root_events = transcript_store.read(root.session_id)
+        assert any(e["kind"] == "operator_killed" for e in root_events)
+
+        updated = task_manager.get(task.id)
+        assert updated.status == "cancelled"
+        assert "agent-running" not in updated.tags
+
+    def test_cancel_review_card_is_409(self, client, stores):
+        task_manager, *_ = stores
+        task = task_manager.create("Pending review", tags=["codex", "agent-completed"], status="done")
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 409
+        assert r.json()["detail"] == "accept or reject the review"
+        updated = task_manager.get(task.id)
+        assert updated.status == "done"
+        assert "accepted" not in updated.tags
+
+    def test_cancel_non_agent_owned_card_is_409(self, client, stores):
+        task_manager, *_ = stores
+        task = task_manager.create("A plain me-assigned card", tags=["me"])
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 409
+        assert r.json()["detail"] == "cancel is only available for agent-assigned cards"
+
+    def test_cancel_is_idempotent(self, client, stores, monkeypatch):
+        task_manager, *_ = stores
+        monkeypatch.setattr(agents_route, "_maybe_managed_driver", lambda: None)
+        task = task_manager.create("Handed to the agent", tags=["codex"])
+
+        r1 = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r1.status_code == 200
+        updated_at_1 = task_manager.get(task.id).updated_at
+
+        r2 = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r2.status_code == 200
+        body2 = r2.json()
+        assert body2["status"] == "cancelled"
+        assert body2["killed"] == []
+        # Second call is a true no-op — no write, so updated_at is unchanged.
+        assert task_manager.get(task.id).updated_at == updated_at_1
+
+    def test_cancel_missing_card_is_404(self, client, stores):
+        r = client.post("/api/agents/board/cards/nope/cancel")
+        assert r.status_code == 404
+
+    def test_cancel_finds_session_outside_the_snapshot_window(self, client, stores, monkeypatch):
+        """The session lookup is a direct primary-key read
+        (task_id is the `sessions` table's PRIMARY KEY), not bounded by the
+        200-row, most-recently-started window `_build_snapshot`'s
+        `list_sessions(limit=200)` uses for display — a session that
+        started before the 200 most recent must still be found and torn
+        down, not silently skipped."""
+        import sqlite3
+
+        task_manager, _sched, session_store, transcript_store = stores
+        monkeypatch.setattr(agents_route, "_maybe_managed_driver", lambda: None)
+        task = task_manager.create("Old but still running", tags=["codex", "agent-running"])
+        target = session_store.create(task_id=task.id, status=STATUS_RUNNING, routing="claude")
+
+        with sqlite3.connect(str(session_store.db_path)) as conn:
+            # Push the target far into the past, then seed 200 sessions
+            # that all sort ahead of it in `ORDER BY started_at DESC`.
+            conn.execute("UPDATE sessions SET started_at = 0 WHERE task_id = ?", (task.id,))
+            conn.commit()
+        for i in range(200):
+            session_store.create(task_id=f"padding-{i}", status=STATUS_COMPLETED, routing="claude")
+
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["killed"] == [target.session_id]
+        assert body["status"] == "cancelled"
+        assert session_store.get_by_session_id(target.session_id).status == STATUS_FAILED
+
+    def test_cancel_reports_a_cli_session_on_another_host_instead_of_killing_it(
+        self, client, stores, monkeypatch,
+    ):
+        """This API can only reach its own wezterm, so a CLI session recorded
+        against a different machine is reported rather than torn down. The
+        task is still marked cancelled; the session it could not reach is
+        named under `failures`."""
+        task_manager, _sched, session_store, _transcript = stores
+        monkeypatch.setattr(agents_route, "_maybe_managed_driver", lambda: None)
+        # status="in_progress" with no agent-running tag is what
+        # cli_session_event leaves behind after Open spawns a session.
+        task = task_manager.create("Opened via a CLI session", tags=["codex"], status="in_progress")
+        session_store.record_cli_session_event(
+            engine="codex", event="user_prompt_submit", session_id="live1",
+            host="some-host", prompt="do the thing", task_id=task.id,
+        )
+
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["status"] == "cancelled"
+        assert body["killed"] == []
+        assert len(body["failures"]) == 1
+        assert body["failures"][0]["session_id"] == "cx:live1"
+        assert "some-host" in body["failures"][0]["reason"]
+
+    def test_cancel_repeated_on_an_unreachable_cli_session_reports_it_again(
+        self, client, stores, monkeypatch,
+    ):
+        """A second Cancel on a card whose CLI session this API cannot reach
+        must report it again, not `failures: []` — the already-cancelled
+        short-circuit runs after the CLI lookup, so a repeat click still tells
+        the operator a session is open that it could not stop."""
+        task_manager, _sched, session_store, _transcript = stores
+        monkeypatch.setattr(agents_route, "_maybe_managed_driver", lambda: None)
+        task = task_manager.create("Opened via a CLI session", tags=["codex"], status="in_progress")
+        session_store.record_cli_session_event(
+            engine="codex", event="user_prompt_submit", session_id="live1",
+            host="some-host", prompt="do the thing", task_id=task.id,
+        )
+
+        r1 = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r1.status_code == 200
+        assert len(r1.json()["failures"]) == 1
+
+        r2 = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r2.status_code == 200
+        body2 = r2.json()
+        assert body2["killed"] == []
+        assert len(body2["failures"]) == 1
+        assert body2["failures"][0]["session_id"] == "cx:live1"
+
+    def test_cancel_ignores_an_already_ended_cli_session(self, client, stores, monkeypatch):
+        """Positive case for AR5: a CLI session that already ended must NOT
+        show up as an untorn-down failure — only a still-live one does."""
+        task_manager, _sched, session_store, _transcript = stores
+        monkeypatch.setattr(agents_route, "_maybe_managed_driver", lambda: None)
+        task = task_manager.create("Opened then closed via CLI", tags=["codex"])
+        session_store.record_cli_session_event(
+            engine="codex", event="session_start", session_id="ended1",
+            host="some-host", task_id=task.id,
+        )
+        session_store.record_cli_session_event(
+            engine="codex", event="session_end", session_id="ended1",
+            host="some-host", task_id=task.id,
+        )
+
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 200
+        assert r.json()["failures"] == []
+
+    def test_cancel_on_already_cancelled_me_card_is_409_not_idempotent_200(self, client, stores):
+        """Ownership must be checked before the idempotence
+        short-circuit — a `me` card that somehow already carries
+        status="cancelled" (not a state Cancel itself ever produces, since
+        it refuses `me` cards) must still 409 for the real reason, not
+        silently look like a successful no-op cancel."""
+        task_manager, *_ = stores
+        task = task_manager.create("A plain me card, already cancelled", tags=["me"], status="cancelled")
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 409
+        assert r.json()["detail"] == "cancel is only available for agent-assigned cards"
+
+    def test_cancel_on_already_cancelled_review_card_is_409_not_idempotent_200(self, client, stores):
+        """Same as above for a pending-review card."""
+        task_manager, *_ = stores
+        task = task_manager.create(
+            "A review card, cancelled some other way", tags=["codex", "agent-completed"], status="cancelled",
+        )
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 409
+        assert r.json()["detail"] == "accept or reject the review"
+
+    def test_cancel_on_already_done_agent_card_is_409(self, client, stores):
+        """evaluate_card_action refuses Cancel on any
+        terminal-status agent-owned card, not just an already-cancelled
+        one — an accepted/finished card has nothing left to cancel."""
+        task_manager, *_ = stores
+        task = task_manager.create(
+            "Already accepted and done", tags=["codex", "agent-completed", "accepted"], status="done",
+        )
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 409
+        updated = task_manager.get(task.id)
+        assert updated.status == "done"  # nothing written
+
+    def test_cancel_policy_is_refused_once_the_card_is_already_cancelled(self, client, stores, monkeypatch):
+        """`policy.cancel.allowed` must go False once a card is
+        already cancelled — the drawer's Cancel button must disappear
+        instead of staying offered for a pointless second click."""
+        task_manager, *_ = stores
+        monkeypatch.setattr(agents_route, "_maybe_managed_driver", lambda: None)
+        task = task_manager.create("Handed to the agent", tags=["codex"])
+        r1 = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r1.status_code == 200
+
+        board = client.get("/api/agents/board").json()
+        card = next(c for c in board["lanes"]["done"] if c["id"] == task.id)
+        assert card["policy"]["cancel"]["allowed"] is False
+
+    def test_cancel_skips_teardown_for_already_terminal_session(self, client, stores, monkeypatch):
+        """A claimed card whose linked session already reached a
+        terminal status (e.g. it finished between the board loading and the
+        operator clicking Cancel) must not attempt teardown."""
+        task_manager, _sched, session_store, _transcript = stores
+        monkeypatch.setattr(agents_route, "_maybe_managed_driver", lambda: None)
+        task = task_manager.create("Already finished", tags=["codex", "agent-running"])
+        session = session_store.create(task_id=task.id, status=STATUS_COMPLETED, routing="claude")
+
+        called = []
+        orig = agents_route._kill_session_subtree
+
+        async def _spy(*a, **kw):
+            called.append(True)
+            return await orig(*a, **kw)
+
+        monkeypatch.setattr(agents_route, "_kill_session_subtree", _spy)
+
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 200
+        assert r.json()["killed"] == []
+        assert called == []
+        assert session_store.get_by_session_id(session.session_id).status == STATUS_COMPLETED
+
+    def test_cancel_invalidates_the_board_cache(self, client, stores, monkeypatch):
+        """Cancel must invalidate the shared stream-tick board
+        cache like the lane/accept endpoints do, so the very next tick
+        reflects the cancellation instead of serving a pre-write board for
+        up to `_BOARD_CACHE_TTL` more seconds."""
+        task_manager, *_ = stores
+        monkeypatch.setattr(agents_route, "_maybe_managed_driver", lambda: None)
+        task = task_manager.create("Handed to the agent", tags=["codex"])
+        monkeypatch.setattr(agents_route, "_board_cache", (time.monotonic(), {"lanes": {}, "generated_at": 0}))
+
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 200
+        assert agents_route._board_cache is None
+
+    def test_cancel_teardown_failure_does_not_write_cancelled_and_reports_stopped_sessions(
+        self, client, stores, monkeypatch,
+    ):
+        """If `_kill_session_subtree` raises partway through (a real
+        teardown failure, distinct from the already-modeled
+        `managed_failure` outcome), Cancel must NOT mark the task
+        cancelled — claiming a cancellation the teardown didn't actually
+        finish would strand a still-running session behind a card that
+        looks done. The error reports what was already stopped."""
+        task_manager, *_ = stores
+        task = task_manager.create("Being worked by the agent", tags=["codex", "agent-running"])
+        session_store = stores[2]
+        session_store.create(task_id=task.id, status=STATUS_RUNNING, routing="claude")
+
+        async def _raise(*a, **kw):
+            raise agents_route.SubtreeTeardownError(
+                "teardown failed for session sess-abc: boom", killed=["sess-already-stopped"], failures=[],
+            )
+
+        monkeypatch.setattr(agents_route, "_kill_session_subtree", _raise)
+
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 500
+        assert "sess-already-stopped" in r.json()["detail"]
+        assert "not marked cancelled" in r.json()["detail"]
+        updated = task_manager.get(task.id)
+        assert updated.status != "cancelled"
+        assert "agent-running" in updated.tags
+
+    def test_cancel_write_conflict_after_successful_teardown_invites_a_retry(
+        self, client, stores, monkeypatch,
+    ):
+        """A `TaskConflictError` on the final write, AFTER the session was
+        already torn down, must say the session is already stopped and
+        invite a retry — not the generic conflict text, which would read
+        like an ordinary refusal and hide that the teardown already
+        happened."""
+        from api.services.task_manager import TaskConflictError
+
+        task_manager, *_ = stores
+        monkeypatch.setattr(agents_route, "_maybe_managed_driver", lambda: None)
+        task = task_manager.create("Being worked by the agent", tags=["codex", "agent-running"])
+        session_store = stores[2]
+        session_store.create(task_id=task.id, status=STATUS_RUNNING, routing="claude")
+
+        orig_update = task_manager.update
+
+        def _conflict_once(*a, **kw):
+            if kw.get("status") == "cancelled":
+                raise TaskConflictError("too many conflicting writes")
+            return orig_update(*a, **kw)
+
+        monkeypatch.setattr(task_manager, "update", _conflict_once)
+
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 409
+        detail = r.json()["detail"]
+        assert "already stopped" in detail
+        assert "retry" in detail
+
+
+# ---------------------------------------------------------------------------
+# POST /api/agents/board/cards/{id}/accept
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestAcceptBoardCard:
+    def test_accept_moves_review_to_done(self, client, stores):
+        task_manager, *_ = stores
+        task = task_manager.create("Refactor the parser", tags=["agent-completed"], status="done")
+        r = client.post(f"/api/agents/board/cards/{task.id}/accept")
+        assert r.status_code == 200
+        assert r.json()["lane"] == "done"
+        updated = task_manager.get(task.id)
+        assert "accepted" in updated.tags
+        assert updated.status == "done"
+
+    def test_accept_works_on_a_snoozed_review_card_and_clears_the_snooze(self, client, stores):
+        """A snoozed Review card is still a Review card as far as Accept is
+        concerned — it uses the natural (status/tag-only) lane, not the
+        snoozed one, so accepting it both moves it to Done and wakes it."""
+        task_manager, *_ = stores
+        task = task_manager.create("Snoozed review, accepted", tags=["agent-completed"], status="done")
+        task_manager.update(task.id, fields={"snoozed_until": "2099-01-01T00:00:00+00:00"})
+
+        r = client.post(f"/api/agents/board/cards/{task.id}/accept")
+        assert r.status_code == 200, r.text
+        assert r.json()["lane"] == "done"
+        updated = task_manager.get(task.id)
+        assert "accepted" in updated.tags
+        assert updated.status == "done"
+        assert "snoozed_until" not in updated.fields
+
+    def test_accept_is_idempotent(self, client, stores):
+        task_manager, *_ = stores
+        task = task_manager.create("Refactor the parser", tags=["agent-completed"], status="done")
+        r1 = client.post(f"/api/agents/board/cards/{task.id}/accept")
+        updated_at_1 = task_manager.get(task.id).updated_at
+        r2 = client.post(f"/api/agents/board/cards/{task.id}/accept")
+        assert r1.status_code == 200
+        assert r2.status_code == 200
+        updated = task_manager.get(task.id)
+        assert updated.tags.count("accepted") == 1
+        # Second call is a true no-op — no write, so updated_at is unchanged.
+        assert updated.updated_at == updated_at_1
+
+    def test_accept_preserves_lifecycle_added_during_cas_retry(
+        self, client, stores, monkeypatch,
+    ):
+        task_manager, *_ = stores
+        task = task_manager.create(
+            "Accept with concurrent lifecycle", tags=["codex", "agent-completed", "keep-me"], status="done",
+        )
+        path = Path(task.source_file)
+        original_mtime = task_manager_module._mtime_or_none
+        calls = {"count": 0}
+
+        def race_once(candidate):
+            calls["count"] += 1
+            if calls["count"] == 2:
+                path.write_text(path.read_text().replace("#keep-me", "#keep-me #agent-failed"))
+            return original_mtime(candidate)
+
+        monkeypatch.setattr(task_manager_module, "_mtime_or_none", race_once)
+        response = client.post(f"/api/agents/board/cards/{task.id}/accept")
+        assert response.status_code == 200
+        assert set(task_manager.get(task.id).tags) == {
+            "codex", "agent-completed", "keep-me", "agent-failed", "accepted",
+        }
+
+    def test_accept_missing_card_is_404(self, client, stores):
+        r = client.post("/api/agents/board/cards/nope/accept")
+        assert r.status_code == 404
+
+    def test_accept_on_non_review_card_is_409(self, client, stores):
+        """/accept must be rejected for a card outside the Review lane, not
+        mark an arbitrary todo card done."""
+        task_manager, *_ = stores
+        task = task_manager.create("A plain todo, never touched by the worker")
+        r = client.post(f"/api/agents/board/cards/{task.id}/accept")
+        assert r.status_code == 409
+        updated = task_manager.get(task.id)
+        assert updated.status == "todo"
+        assert "accepted" not in updated.tags
+
+    def test_undo_accept_restores_review_without_touching_unrelated_tags(self, client, stores):
+        task_manager, *_ = stores
+        task = task_manager.create(
+            "Restore this review",
+            tags=["hermes", "agent-completed", "keep-me", "accepted"],
+            status="done",
+        )
+        r = client.post(f"/api/agents/board/cards/{task.id}/undo-accept")
+        assert r.status_code == 200
+        assert r.json()["lane"] == "review"
+        updated = task_manager.get(task.id)
+        assert updated.status == "done"
+        assert updated.tags == ["hermes", "agent-completed", "keep-me"]
+
+    def test_undo_accept_clears_the_accepted_by_stamp(self, client, stores):
+        """A card `Undo`ne back to Review must not still claim to have been
+        accepted by whoever accepted it the first time — the drawer's
+        "Accepted by" row must disappear along with the `accepted` tag."""
+        task_manager, *_ = stores
+        task = task_manager.create("Review synthetic output", tags=["codex", "agent-completed"], status="done")
+
+        accepted = client.post(f"/api/agents/board/cards/{task.id}/accept")
+        assert accepted.status_code == 200
+        assert task_manager.get(task.id).fields.get("review_accepted_by") == "operator"
+
+        r = client.post(f"/api/agents/board/cards/{task.id}/undo-accept")
+        assert r.status_code == 200
+        assert "review_accepted_by" not in task_manager.get(task.id).fields
+
+    def test_undo_accept_rejects_unaccepted_card(self, client, stores):
+        task_manager, *_ = stores
+        task = task_manager.create("Not accepted")
+        r = client.post(f"/api/agents/board/cards/{task.id}/undo-accept")
+        assert r.status_code == 409
+
+    def test_undo_accept_is_idempotent_after_first_undo(self, client, stores):
+        task_manager, *_ = stores
+        task = task_manager.create(
+            "Retry undo", tags=["codex", "agent-completed", "accepted"], status="done",
+        )
+        first = client.post(f"/api/agents/board/cards/{task.id}/undo-accept")
+        second = client.post(f"/api/agents/board/cards/{task.id}/undo-accept")
+        assert first.status_code == 200
+        assert second.status_code == 200
+        assert second.json()["lane"] == "review"
+        assert task_manager.get(task.id).tags == ["codex", "agent-completed"]
+
+    def test_board_tags_preserve_lifecycle_added_during_cas_retry(
+        self, client, stores, monkeypatch,
+    ):
+        """A stale full-list picker save must not erase a worker tag added
+        between its initial read and the CAS write."""
+        task_manager, *_ = stores
+        task = task_manager.create("Concurrent picker", tags=["codex", "keep-me"])
+        path = Path(task.source_file)
+        original_mtime = task_manager_module._mtime_or_none
+        calls = {"count": 0}
+
+        def race_once(candidate):
+            calls["count"] += 1
+            if calls["count"] == 2:
+                path.write_text(path.read_text().replace("#codex", "#codex #agent-running"))
+            return original_mtime(candidate)
+
+        monkeypatch.setattr(task_manager_module, "_mtime_or_none", race_once)
+        response = client.put(
+            f"/api/agents/board/cards/{task.id}/tags",
+            json={"tags": ["keep-me", "new-label"]},
+        )
+        assert response.status_code == 200
+        assert set(task_manager.get(task.id).tags) == {
+            "codex", "agent-running", "keep-me", "new-label",
+        }
+
+
+# ---------------------------------------------------------------------------
+# Pending questions
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestPendingQuestions:
+    def test_answer_invalidates_the_stream_cache(self, client, stores):
+        """Answering a question must invalidate
+        `_board_cache` like a lane-move/accept write does, so the stream's
+        next tick doesn't keep serving a pre-answer board for the rest of
+        the TTL."""
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create("Investigate the outage", tags=["agent-blocked"], status="blocked")
+        session = session_store.create(task_id=task.id, status=STATUS_BLOCKED)
+        qid = session_store.create_pending_question(
+            session_id=session.session_id, task_id=task.id, question="Staging or prod?",
+            sent_message_id=1,
+        )
+        agents_route._board_cache = (time.monotonic(), {"stale": True})
+        r = client.post(f"/api/agents/pending-questions/{qid}/answer", json={"answer": "staging"})
+        assert r.status_code == 200
+        assert agents_route._board_cache is None
+
+    def test_list_and_answer_matches_deposit_answer_columns(self, client, stores):
+        _tm, _sched, session_store, _transcript = stores
+        session = session_store.create(task_id="t1", status=STATUS_BLOCKED)
+        qid = session_store.create_pending_question(
+            session_id=session.session_id,
+            task_id="t1",
+            question="Staging or prod?",
+            sent_message_id=99,
+        )
+
+        r = client.get("/api/agents/pending-questions")
+        assert r.status_code == 200
+        questions = r.json()["questions"]
+        assert len(questions) == 1
+        assert questions[0]["id"] == qid
+        assert questions[0]["question"] == "Staging or prod?"
+        assert questions[0]["task_id"] == "t1"
+        assert questions[0]["session_id"] == session.session_id
+
+        r2 = client.post(f"/api/agents/pending-questions/{qid}/answer", json={"answer": "staging"})
+        assert r2.status_code == 200
+
+        # The row looks exactly like it would after a Telegram reply via
+        # deposit_answer: answer + answered_at set, nothing else touched.
+        with session_store._connect() as conn:
+            row = dict(conn.execute(
+                "SELECT * FROM pending_questions WHERE id = ?", (qid,),
+            ).fetchone())
+        assert row["answer"] == "staging"
+        assert row["answered_at"] is not None
+        assert row["processed"] == 0
+        assert row["timed_out"] == 0
+
+        # Answered questions drop off the open list.
+        r3 = client.get("/api/agents/pending-questions")
+        assert r3.json()["questions"] == []
+
+    def test_answer_matches_deposit_answer_effect_exactly(self, stores):
+        """Same row state whether answered via deposit_answer (Telegram) or
+        deposit_answer_by_id (board) — the shape worker.py consumes."""
+        _tm, _sched, session_store, _transcript = stores
+        s1 = session_store.create(task_id="t1", status=STATUS_BLOCKED)
+        s2 = session_store.create(task_id="t2", status=STATUS_BLOCKED)
+        qid1 = session_store.create_pending_question(
+            session_id=s1.session_id, task_id="t1", question="Q1", sent_message_id=1,
+        )
+        qid2 = session_store.create_pending_question(
+            session_id=s2.session_id, task_id="t2", question="Q2", sent_message_id=2,
+        )
+
+        session_store.deposit_answer(1, "via telegram")
+        session_store.deposit_answer_by_id(qid2, "via board")
+
+        with session_store._connect() as conn:
+            row1 = dict(conn.execute("SELECT * FROM pending_questions WHERE id = ?", (qid1,)).fetchone())
+            row2 = dict(conn.execute("SELECT * FROM pending_questions WHERE id = ?", (qid2,)).fetchone())
+        assert row1["answer"] == "via telegram"
+        assert row2["answer"] == "via board"
+        for row in (row1, row2):
+            assert row["answered_at"] is not None
+            assert row["processed"] == 0
+            assert row["timed_out"] == 0
+
+    def test_answer_empty_string_is_400(self, client, stores):
+        _tm, _sched, session_store, _transcript = stores
+        session = session_store.create(task_id="t1", status=STATUS_BLOCKED)
+        qid = session_store.create_pending_question(
+            session_id=session.session_id, task_id="t1", question="Q", sent_message_id=1,
+        )
+        r = client.post(f"/api/agents/pending-questions/{qid}/answer", json={"answer": "  "})
+        assert r.status_code == 400
+
+    def test_answer_unknown_question_is_404(self, client, stores):
+        r = client.post("/api/agents/pending-questions/999999/answer", json={"answer": "x"})
+        assert r.status_code == 404
+
+    def test_answer_bare_empty_string_is_400_via_min_length(self, client, stores):
+        """`answer` has a min_length, so a bare empty
+        string is rejected by Pydantic validation (whitespace still 400s via
+        the handler's own strip check — see test_answer_empty_string_is_400
+        above). This app's `RequestValidationError` handler (api/main.py)
+        converts every validation failure to 400, not FastAPI's default 422
+        — matching every other `min_length` field in this codebase — so both
+        paths land on the same status code."""
+        _tm, _sched, session_store, _transcript = stores
+        session = session_store.create(task_id="t1", status=STATUS_BLOCKED)
+        qid = session_store.create_pending_question(
+            session_id=session.session_id, task_id="t1", question="Q", sent_message_id=1,
+        )
+        r = client.post(f"/api/agents/pending-questions/{qid}/answer", json={"answer": ""})
+        assert r.status_code == 400
+
+    def test_status_anchor_row_excluded_from_pending_questions(self, client, stores):
+        """`status_anchor` rows are routing plumbing (see
+        `add_reply_anchors`), never a real question."""
+        _tm, _sched, session_store, _transcript = stores
+        session = session_store.create(task_id="t1", status=STATUS_BLOCKED)
+        session_store.add_reply_anchors(
+            session_id=session.session_id, task_id="t1", message_ids=[5],
+        )
+        r = client.get("/api/agents/pending-questions")
+        assert r.json()["questions"] == []
+
+    def test_answering_already_answered_question_is_404(self, client, stores):
+        """The second answer attempt on the same
+        question must 404, not silently overwrite the first answer."""
+        _tm, _sched, session_store, _transcript = stores
+        session = session_store.create(task_id="t1", status=STATUS_BLOCKED)
+        qid = session_store.create_pending_question(
+            session_id=session.session_id, task_id="t1", question="Q", sent_message_id=1,
+        )
+        r1 = client.post(f"/api/agents/pending-questions/{qid}/answer", json={"answer": "first"})
+        assert r1.status_code == 200
+        r2 = client.post(f"/api/agents/pending-questions/{qid}/answer", json={"answer": "second"})
+        assert r2.status_code == 404
+        with session_store._connect() as conn:
+            row = dict(conn.execute(
+                "SELECT answer FROM pending_questions WHERE id = ?", (qid,),
+            ).fetchone())
+        assert row["answer"] == "first"
+
+    def test_followup_row_excluded_from_pending_questions(self, client, stores):
+        """`kind='followup'` rows are completion notices,
+        not real questions — they must not render a fake pending-question
+        badge on a Review card."""
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create(
+            "Draft the memo", tags=["codex", "agent-completed"], status="done",
+        )
+        session = session_store.create(task_id=task.id, status="completed")
+        session_store.register_completion_followup(
+            session_id=session.session_id, task_id=task.id,
+            sent_message_ids=[7], label="Draft the memo",
+        )
+
+        r = client.get("/api/agents/pending-questions")
+        assert r.json()["questions"] == []
+
+        board = client.get("/api/agents/board").json()
+        review_cards = board["lanes"]["review"]
+        assert len(review_cards) == 1
+        assert review_cards[0]["pending_question"] is None
+
+
+# ---------------------------------------------------------------------------
+# Hermes label + Codex stream dispatch
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestSnapshotLaneMatchesBoardForSnoozedCard:
+    def test_snapshot_session_lane_matches_board_lane_when_snoozed(self, client, stores):
+        """`lane_for_session` must pass the task's fields through to
+        `derive_lane`, the same as every other lane-derivation call site in
+        `agents.py` — otherwise the Graph tab's node colour disagrees with
+        the card's own board column for a snoozed Review card, which
+        always has a linked session."""
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create(
+            "Snoozed review with a session", tags=["codex", "agent-completed"], status="done",
+        )
+        task_manager.update(task.id, fields={"snoozed_until": "2099-01-01T00:00:00+00:00"})
+        session = session_store.create(task_id=task.id, status="completed", routing="codex")
+
+        board = client.get("/api/agents/board").json()
+        board_lane = next(
+            lane for lane, cards in board["lanes"].items()
+            if task.id in [c["id"] for c in cards]
+        )
+        assert board_lane == "snoozed"
+
+        snapshot = client.get("/api/agents/snapshot").json()
+        sessions = {sd["session_id"]: sd for sd in snapshot["sessions"]}
+        assert sessions[session.session_id]["lane"] == "snoozed"
+
+
+@pytest.mark.unit
+class TestHermesLabelAndCodexStream:
+    def test_hermes_routing_labeled_hermes_not_claude(self, client, stores):
+        session_store = stores[2]
+        s = session_store.create(task_id="t1", status="running", routing="hermes")
+        r = client.get("/api/agents/snapshot")
+        assert r.status_code == 200
+        sessions = {sd["session_id"]: sd for sd in r.json()["sessions"]}
+        assert sessions[s.session_id]["model_label"] == "Hermes"
+
+    def test_codex_stream_dispatches_to_codex_ingest_not_lifeos_store(self, client, stores, monkeypatch):
+        """/sessions/{id}/stream must dispatch a `cx:` id to the Codex
+        ingest path — not fall through to the LifeOS transcript store's
+        path-traversal guard, which 400s on it."""
+        called = {}
+
+        async def fake_stream_codex(session_id, backfill):
+            called["session_id"] = session_id
+            yield ": ok\n\n"
+            yield "event: transcript_event\ndata: {\"kind\": \"codex_test\"}\n\n"
+
+        monkeypatch.setattr(agents_route, "_stream_codex_session", fake_stream_codex)
+        monkeypatch.setattr(agents_route, "_codex_enabled", lambda: True)
+        monkeypatch.setattr(
+            "api.services.codex.session_ingest.validate_session_id",
+            lambda sid: sid[len("cx:"):],
+        )
+
+        with client.stream("GET", "/api/agents/sessions/cx:abc123/stream") as r:
+            assert r.status_code == 200
+            body = "".join(r.iter_text())
+        assert called["session_id"] == "cx:abc123"
+        assert "codex_test" in body
+
+    def test_codex_stream_disabled_is_404(self, client, stores, monkeypatch):
+        monkeypatch.setattr(agents_route, "_codex_enabled", lambda: False)
+        r = client.get("/api/agents/sessions/cx:abc123/stream")
+        assert r.status_code == 404
+
+    async def test_stream_codex_session_actually_reads_a_rollout_file(self, stores, monkeypatch, tmp_path):
+        """Points `settings.codex_sessions_dir` at a synthetic rollout and
+        drives the real `_stream_codex_session` generator directly (not
+        through TestClient — its `_TestClientTransport` fully drains an ASGI
+        call before returning a response, and this generator only ends on a
+        300s idle timeout, so a real HTTP round trip through it can't
+        complete inside a unit test); it should backfill the file's events
+        unchanged."""
+        from tests.test_codex_ingest import _write_rollout, _session_meta, _agent_event_msg
+        from config.settings import settings
+
+        sessions_dir = tmp_path / "codex_sessions"
+        _write_rollout(sessions_dir, "cafe1234", [
+            _session_meta(),
+            _agent_event_msg(text="hello from a synthetic codex rollout"),
+        ])
+        monkeypatch.setattr(settings, "codex_sessions_dir", str(sessions_dir))
+
+        gen = agents_route._stream_codex_session("cx:cafe1234", 50)
+        chunks = [await gen.__anext__() for _ in range(3)]
+        await gen.aclose()
+
+        body = "".join(chunks)
+        assert chunks[0] == ": ok\n\n"
+        assert body.count("event: transcript_event") == 2
+        assert '"kind": "system_session_meta"' in body
+        assert '"kind": "assistant_message"' in body
+        assert "hello from a synthetic codex rollout" in body
+
+
+@pytest.mark.unit
+class TestGuardedWriteRevalidation:
+    """A decision computed against an earlier read must never be applied to a
+    state it was not computed for. The re-check runs inside the store's own
+    CAS, against the exact snapshot being written.
+    """
+
+    def test_lane_move_is_refused_when_the_worker_claims_the_card_first(
+        self, client, stores,
+    ):
+        """The route reads an unclaimed card, plans an allowed move, and the
+        worker claims it before the write lands. The stale plan would strip
+        the assignee tag off a card that is now live.
+        """
+        task_manager, _sched, _session_store, _transcript = stores
+        task = task_manager.create("Synthetic claimed race", tags=["claude"], status="todo")
+
+        original_get = task_manager.get
+        claimed = {"done": False}
+
+        def claim_between_read_and_write(task_id):
+            found = original_get(task_id)
+            if task_id != task.id or found is None:
+                return found
+            unclaimed = copy.deepcopy(found)
+            if not claimed["done"]:
+                claimed["done"] = True
+                # The worker claims it in the store; the route keeps the
+                # unclaimed snapshot it already read and plans against that.
+                task_manager.update(task_id, tags=["claude", "agent-running"], status="in_progress")
+            return unclaimed
+
+        task_manager.get = claim_between_read_and_write
+        try:
+            response = client.put(
+                f"/api/agents/board/cards/{task.id}/lane", json={"lane": "unassigned"},
+            )
+        finally:
+            task_manager.get = original_get
+        assert response.status_code == 409, response.text
+        assert "worker" in response.json()["detail"] or "agent" in response.json()["detail"]
+        after = task_manager.get(task.id)
+        assert "claude" in after.tags, after.tags
+        assert "agent-running" in after.tags, after.tags
+
+    def test_lane_move_still_succeeds_when_nothing_the_decision_depends_on_changed(
+        self, client, stores,
+    ):
+        """A concurrent edit the decision does not read must not manufacture a
+        refusal — the re-check is decision-level, not a version pin.
+        """
+        task_manager, _sched, _session_store, _transcript = stores
+        task = task_manager.create("Synthetic unclaimed", tags=["me"], status="todo")
+
+        original_get = task_manager.get
+        edited = {"done": False}
+
+        def notes_edit_between_read_and_write(task_id):
+            found = original_get(task_id)
+            if task_id == task.id and found is not None and not edited["done"]:
+                edited["done"] = True
+                task_manager.update(task_id, notes="A concurrent synthetic note")
+            return found
+
+        task_manager.get = notes_edit_between_read_and_write
+        try:
+            response = client.put(
+                f"/api/agents/board/cards/{task.id}/lane",
+                json={"lane": "assigned", "assignee": "codex"},
+            )
+        finally:
+            task_manager.get = original_get
+        assert response.status_code == 200, response.text
+        after = task_manager.get(task.id)
+        assert after.tags == ["codex"]
+        assert "A concurrent synthetic note" in (after.notes or "")
+
+    def test_lane_move_writes_the_tags_the_revalidated_decision_produced(
+        self, client, stores,
+    ):
+        """A user tag added between the read and the write survives: the write
+        carries the re-planned tags, not the stale read's.
+        """
+        task_manager, _sched, _session_store, _transcript = stores
+        task = task_manager.create("Synthetic tag race", tags=["me"], status="todo")
+
+        original_get = task_manager.get
+        added = {"done": False}
+
+        def tag_added_between_read_and_write(task_id):
+            found = original_get(task_id)
+            if task_id == task.id and found is not None and not added["done"]:
+                added["done"] = True
+                task_manager.update(task_id, tags=["me", "urgent"])
+            return found
+
+        task_manager.get = tag_added_between_read_and_write
+        try:
+            response = client.put(
+                f"/api/agents/board/cards/{task.id}/lane",
+                json={"lane": "assigned", "assignee": "codex"},
+            )
+        finally:
+            task_manager.get = original_get
+        assert response.status_code == 200, response.text
+        after = task_manager.get(task.id)
+        assert "urgent" in after.tags, after.tags
+        assert "codex" in after.tags
+        assert "me" not in after.tags
+
+    def test_cancel_is_refused_when_the_card_finishes_first(self, client, stores):
+        """Cancel cleared against an unfinished read must not be applied to a
+        card that reached a finished state in the meantime.
+        """
+        task_manager, _sched, _session_store, _transcript = stores
+        task = task_manager.create("Synthetic cancel race", tags=["claude"], status="todo")
+
+        original_get = task_manager.get
+        finished = {"done": False}
+
+        def finish_between_read_and_write(task_id):
+            found = original_get(task_id)
+            if task_id == task.id and found is not None and not finished["done"]:
+                finished["done"] = True
+                task_manager.update(task_id, status="done")
+            return found
+
+        task_manager.get = finish_between_read_and_write
+        try:
+            response = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        finally:
+            task_manager.get = original_get
+        assert response.status_code == 409, response.text
+        assert task_manager.get(task.id).status == "done"
+
+
+@pytest.mark.unit
+class TestCliSessionTeardown:
+    """Kill and Cancel reach board-opened `cc:`/`cx:` sessions, which live in
+    `cli_sessions` and so are invisible to the worker-session teardown."""
+
+    @staticmethod
+    def _local_cli_card(task_manager, session_store, monkeypatch, *, pane_id=7):
+        """A card whose only live session is a CLI session on this API host."""
+        monkeypatch.setattr(agents_route, "_maybe_managed_driver", lambda: None)
+        monkeypatch.setattr(agents_route, "api_host_name", lambda: "this-box")
+        task = task_manager.create(
+            "Opened via a CLI session", tags=["codex"], status="in_progress",
+        )
+        session_store.record_cli_session_event(
+            engine="codex", event="user_prompt_submit", session_id="live1",
+            host="this-box", prompt="do the thing", task_id=task.id, pane_id=pane_id,
+        )
+        return task
+
+    @staticmethod
+    def _capture_pane_kills(monkeypatch, *, ok=True, detail=""):
+        killed_panes: list[int] = []
+
+        def fake_kill_pane(pane_id, env):
+            killed_panes.append(pane_id)
+            return ok, detail
+
+        monkeypatch.setattr(agents_route, "_kill_pane", fake_kill_pane)
+        return killed_panes
+
+    def test_cancel_tears_down_a_local_cli_session_and_reports_it_as_killed(
+        self, client, stores, monkeypatch,
+    ):
+        task_manager, _sched, session_store, transcript_store = stores
+        task = self._local_cli_card(task_manager, session_store, monkeypatch)
+        killed_panes = self._capture_pane_kills(monkeypatch)
+
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["status"] == "cancelled"
+        assert body["killed"] == ["cx:live1"]
+        assert body["failures"] == []
+        # The pane the session runs in, not the wezterm-gui process.
+        assert killed_panes == [7]
+        assert session_store.get_cli_session("cx:live1").status == "ended"
+        kinds = [e.get("kind") or e.get("event") for e in transcript_store.read("cx:live1")]
+        assert "operator_killed" in kinds, kinds
+
+    def test_cancel_marks_the_row_ended_even_when_the_pane_is_already_gone(
+        self, client, stores, monkeypatch,
+    ):
+        """The row says whether work is running. Leaving it live because the
+        process died first would strand the card showing a session that isn't
+        there."""
+        task_manager, _sched, session_store, _transcript = stores
+        task = self._local_cli_card(task_manager, session_store, monkeypatch)
+        self._capture_pane_kills(monkeypatch, ok=False, detail="no such pane")
+
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 200, r.text
+        assert r.json()["killed"] == ["cx:live1"]
+        assert session_store.get_cli_session("cx:live1").status == "ended"
+
+    def test_a_refused_cancel_does_not_touch_the_cli_session(
+        self, client, stores, monkeypatch,
+    ):
+        """Tearing a session down for a card whose cancel is about to be
+        refused would stop work the operator never cancelled."""
+        task_manager, _sched, session_store, _transcript = stores
+        monkeypatch.setattr(agents_route, "_maybe_managed_driver", lambda: None)
+        monkeypatch.setattr(agents_route, "api_host_name", lambda: "this-box")
+        task = task_manager.create("Already accepted", tags=["codex"], status="done")
+        session_store.record_cli_session_event(
+            engine="codex", event="user_prompt_submit", session_id="live2",
+            host="this-box", task_id=task.id, pane_id=9,
+        )
+        killed_panes = self._capture_pane_kills(monkeypatch)
+
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 409, r.text
+        assert killed_panes == []
+        assert session_store.get_cli_session("cx:live2").status != "ended"
+
+    def test_kill_endpoint_tears_down_a_cli_session_instead_of_404ing(
+        self, client, stores, monkeypatch,
+    ):
+        task_manager, _sched, session_store, _transcript = stores
+        self._local_cli_card(task_manager, session_store, monkeypatch)
+        killed_panes = self._capture_pane_kills(monkeypatch)
+
+        r = client.post("/api/agents/sessions/cx:live1/kill")
+        assert r.status_code == 200, r.text
+        assert r.json()["killed"] == ["cx:live1"]
+        assert killed_panes == [7]
+        assert session_store.get_cli_session("cx:live1").status == "ended"
+
+    def test_kill_skips_an_already_ended_cli_session(self, client, stores, monkeypatch):
+        task_manager, _sched, session_store, _transcript = stores
+        self._local_cli_card(task_manager, session_store, monkeypatch)
+        session_store.record_cli_session_event(
+            engine="codex", event="session_end", session_id="live1", host="this-box",
+        )
+        killed_panes = self._capture_pane_kills(monkeypatch)
+
+        r = client.post("/api/agents/sessions/cx:live1/kill")
+        assert r.status_code == 200, r.text
+        assert r.json()["killed"] == []
+        assert killed_panes == []
+
+    def test_kill_still_404s_for_a_session_in_neither_table(self, client, stores):
+        r = client.post("/api/agents/sessions/cx:nosuch/kill")
+        assert r.status_code == 404
+
+    def test_killing_a_cli_session_leaves_the_worker_session_row_untouched(
+        self, client, stores, monkeypatch,
+    ):
+        """The two tables are separate; a teardown in one must not close the
+        other's row."""
+        task_manager, _sched, session_store, _transcript = stores
+        task = self._local_cli_card(task_manager, session_store, monkeypatch)
+        worker = session_store.create(task_id=task.id, status="running", routing="codex")
+        self._capture_pane_kills(monkeypatch)
+
+        r = client.post("/api/agents/sessions/cx:live1/kill")
+        assert r.status_code == 200, r.text
+        assert session_store.get(task.id).session_id == worker.session_id
+        assert session_store.get(task.id).status == "running"
+
+
+# ---------------------------------------------------------------------------
+# Review card outcome — GET /api/agents/board's `outcome` field
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestBoardCardOutcome:
+    def test_card_outcome_is_none_by_default(self, client, stores):
+        task_manager, *_ = stores
+        task_manager.create("Ping the vendor", tags=["me"])
+        r = client.get("/api/agents/board")
+        card = r.json()["lanes"]["assigned"][0]
+        assert card["outcome"] is None
+
+    def test_card_outcome_carries_summary_branch_and_unrefreshed_pr(self, client, stores):
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create("Ship the fix", tags=["claude"])
+        session_store.record_card_outcome(
+            task.id, session_id="sess-1", engine_label="Claude Code",
+            summary="Implemented the fix and opened a PR.",
+            branch="feat/fix-it",
+            pr_urls=["https://github.com/nbramia/LifeOS/pull/1234"],
+        )
+        r = client.get("/api/agents/board")
+        card = next(c for c in r.json()["lanes"]["assigned"] if c["id"] == task.id)
+        outcome = card["outcome"]
+        assert outcome["engine_label"] == "Claude Code"
+        assert outcome["summary"] == "Implemented the fix and opened a PR."
+        assert outcome["branch"] == "feat/fix-it"
+        assert len(outcome["prs"]) == 1
+        pr = outcome["prs"][0]
+        assert pr["url"] == "https://github.com/nbramia/LifeOS/pull/1234"
+        # Never refreshed yet — no gh call ever happens on the board's own
+        # read path, so state is unknown and flagged stale rather than
+        # fabricated as "open" or omitted.
+        assert pr["number"] is None
+        assert pr["state"] is None
+        assert pr["stale"] is True
+
+    def test_card_outcome_pr_status_reflects_the_background_cache(self, client, stores):
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create("Ship the fix", tags=["claude"])
+        pr_url = "https://github.com/nbramia/LifeOS/pull/1234"
+        session_store.record_card_outcome(
+            task.id, session_id="sess-1", engine_label="Claude Code",
+            summary="Implemented the fix.", branch="feat/fix-it", pr_urls=[pr_url],
+        )
+        session_store.upsert_pr_status(pr_url, {
+            "number": 1234, "title": "Ship the fix", "state": "MERGED",
+            "merged_at": "2026-09-18T04:00:00Z",
+        })
+
+        r = client.get("/api/agents/board")
+        card = next(c for c in r.json()["lanes"]["assigned"] if c["id"] == task.id)
+        pr = card["outcome"]["prs"][0]
+        assert pr["number"] == 1234
+        assert pr["state"] == "MERGED"
+        assert pr["stale"] is False
+
+    def test_get_board_never_shells_out_to_gh(self, client, stores, monkeypatch):
+        """A board read must never block on the git host — PR status comes
+        entirely from the cache table, never a live `gh` call."""
+        import subprocess
+
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create("Ship the fix", tags=["claude"])
+        session_store.record_card_outcome(
+            task.id, session_id="sess-1", engine_label="Claude Code",
+            summary="Implemented the fix.", branch="feat/fix-it",
+            pr_urls=["https://github.com/nbramia/LifeOS/pull/1234"],
+        )
+
+        def _forbidden(*args, **kwargs):
+            raise AssertionError("GET /board must never invoke a subprocess for PR status")
+        monkeypatch.setattr(subprocess, "run", _forbidden)
+
+        r = client.get("/api/agents/board")
+        assert r.status_code == 200
+
+    def test_get_board_bulk_loads_outcomes_and_pr_status_instead_of_per_card_queries(
+        self, client, stores, monkeypatch,
+    ):
+        """A board with many outcome-carrying cards must not pay one
+        `get_card_outcome`/`get_pr_status` SQLite round trip per card/PR —
+        `_build_board` bulk-loads both once via `list_all_card_outcomes`/
+        `list_all_pr_statuses` instead. Patches the exact `session_store`
+        instance `agents.py` uses (not the class), since a session-scoped
+        isolation fixture elsewhere subclasses `SessionStore` for other
+        tests and class-level patching would silently miss that."""
+        task_manager, _sched, session_store, _transcript = stores
+        for n in range(50):
+            task = task_manager.create(f"Ship fix {n}", tags=["claude"])
+            pr_url = f"https://github.com/nbramia/LifeOS/pull/{n}"
+            session_store.record_card_outcome(
+                task.id, session_id=f"sess-{n}", engine_label="Claude Code",
+                summary="Implemented the fix.", branch="feat/fix-it", pr_urls=[pr_url],
+            )
+            session_store.upsert_pr_status(pr_url, {
+                "number": n, "title": "t", "state": "OPEN", "merged_at": None,
+            })
+
+        per_card_calls = {"get_card_outcome": 0, "get_pr_status": 0}
+        bulk_calls = {"list_all_card_outcomes": 0, "list_all_pr_statuses": 0}
+        original_get_card_outcome = session_store.get_card_outcome
+        original_get_pr_status = session_store.get_pr_status
+        original_list_outcomes = session_store.list_all_card_outcomes
+        original_list_statuses = session_store.list_all_pr_statuses
+
+        def counted_get_card_outcome(*a, **kw):
+            per_card_calls["get_card_outcome"] += 1
+            return original_get_card_outcome(*a, **kw)
+
+        def counted_get_pr_status(*a, **kw):
+            per_card_calls["get_pr_status"] += 1
+            return original_get_pr_status(*a, **kw)
+
+        def counted_list_outcomes(*a, **kw):
+            bulk_calls["list_all_card_outcomes"] += 1
+            return original_list_outcomes(*a, **kw)
+
+        def counted_list_statuses(*a, **kw):
+            bulk_calls["list_all_pr_statuses"] += 1
+            return original_list_statuses(*a, **kw)
+
+        monkeypatch.setattr(session_store, "get_card_outcome", counted_get_card_outcome)
+        monkeypatch.setattr(session_store, "get_pr_status", counted_get_pr_status)
+        monkeypatch.setattr(session_store, "list_all_card_outcomes", counted_list_outcomes)
+        monkeypatch.setattr(session_store, "list_all_pr_statuses", counted_list_statuses)
+
+        r = client.get("/api/agents/board")
+
+        assert r.status_code == 200
+        assert len(r.json()["lanes"]["assigned"]) == 50
+        assert per_card_calls == {"get_card_outcome": 0, "get_pr_status": 0}
+        assert bulk_calls == {"list_all_card_outcomes": 1, "list_all_pr_statuses": 1}

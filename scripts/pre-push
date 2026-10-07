@@ -1,0 +1,448 @@
+#!/bin/bash
+#
+# LifeOS Pre-push Hook
+#
+# Runs unit tests before allowing pushes. Output is redirected to a log
+# file to avoid flooding the terminal — only a pass/fail summary is shown.
+#
+# Installation: none. This repo sets `core.hooksPath = scripts`, so git runs
+# THIS tracked file directly. Do not copy it into .git/hooks — a copy there is
+# never executed, and a stale one is actively misleading (one sat in
+# .git/hooks/pre-push from 2026-07-09 until it was removed).
+#
+
+set -e
+
+PROJECT_ROOT="$(git rev-parse --show-toplevel)"
+cd "$PROJECT_ROOT"
+source "$PROJECT_ROOT/scripts/test-lanes.sh"
+
+# git exports GIT_DIR (absolute when pushing from a worktree) while running
+# hooks. Test subprocesses that spawn `git` in fixture repos inherit it and
+# operate on THIS repo instead — committing fixture files onto real branches,
+# flipping core.bare, and rewriting user identity. Scrub the family so every
+# git call below (and inside pytest) resolves via cwd.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR
+
+# git invokes pre-push as `pre-push <remote name> <remote url>`. An SSH push
+# URL holds a connection open for this whole gate (~9 min), and GitHub closes
+# an idle SSH session after ~6 min -- so a push over SSH can fail with
+# "Connection closed by remote host" even after every test passed (#886).
+# Warn once with the HTTPS equivalent and keep going; never fail the push
+# over this. `./scripts/setup-hooks.sh` configures the HTTPS push URL so this
+# should not normally fire.
+REMOTE_PUSH_URL="${2:-}"
+case "$REMOTE_PUSH_URL" in
+    git@*:*)
+        _rest="${REMOTE_PUSH_URL#git@}"
+        _host="${_rest%%:*}"
+        _path="${_rest#*:}"
+        echo "Warning: pushing over SSH ($REMOTE_PUSH_URL) can outlive GitHub's ~6-minute idle limit during this gate. Prefer: https://${_host}/${_path}"
+        unset _rest _host _path
+        ;;
+    ssh://*)
+        _rest="${REMOTE_PUSH_URL#ssh://}"
+        _rest="${_rest#*@}"
+        echo "Warning: pushing over SSH ($REMOTE_PUSH_URL) can outlive GitHub's ~6-minute idle limit during this gate. Prefer: https://${_rest}"
+        unset _rest
+        ;;
+esac
+
+# Detect what's being pushed so we can skip tests on docs-only pushes.
+# git feeds pre-push hooks lines of "local_ref local_sha remote_ref remote_sha" on stdin.
+CHANGED_FILES=""
+ZERO_SHA="0000000000000000000000000000000000000000"
+# Did any ref in this push actually carry commits? A deletion-only push has
+# nothing to test, but it also yields an empty CHANGED_FILES — which the
+# classifier below (correctly) treats as "unknown, run everything". Tracking
+# this separately is what lets a pure deletion exit early instead of running
+# the whole suite just to delete a branch.
+HAVE_CONTENT=0
+PUSH_CANDIDATES=""
+# First local_ref seen on stdin — used below to derive a per-branch log path.
+PUSH_LOCAL_REF=""
+while read local_ref local_sha remote_ref remote_sha; do
+    [ -z "$local_sha" ] && continue
+    # Deletion push (local_sha is zeros) — nothing to diff.
+    [ "$local_sha" = "$ZERO_SHA" ] && continue
+    HAVE_CONTENT=1
+    [ -z "$PUSH_LOCAL_REF" ] && PUSH_LOCAL_REF="$local_ref"
+    if [ "$remote_sha" = "$ZERO_SHA" ]; then
+        # New branch: provenance must be the actual resolved merge-base. A
+        # guessed parent (or the all-zero remote SHA) would make the verifier
+        # report a falsely known candidate base, so fail closed if origin/main
+        # is unavailable or the histories have no common ancestor.
+        MERGE_BASE=$(git merge-base "$local_sha" origin/main 2>/dev/null || true)
+        if [ -z "$MERGE_BASE" ] || [ "$MERGE_BASE" = "$ZERO_SHA" ]; then
+            echo "pre-push: FAILED — cannot resolve an actual merge-base for new branch $local_ref; refusing unknown provenance" >&2
+            exit 1
+        fi
+        DIFF=$(git diff --name-only "$MERGE_BASE" "$local_sha" 2>/dev/null || true)
+        # The pushed-ref verifier consumes this as the candidate's base
+        # identity; use the resolved merge-base, never the zero remote SHA.
+        PUSH_CANDIDATES="$PUSH_CANDIDATES$local_sha $MERGE_BASE"$'\n'
+    else
+        DIFF=$(git diff --name-only "$remote_sha" "$local_sha" 2>/dev/null || true)
+        PUSH_CANDIDATES="$PUSH_CANDIDATES$local_sha $remote_sha"$'\n'
+    fi
+    CHANGED_FILES="$CHANGED_FILES"$'\n'"$DIFF"
+done
+CHANGED_FILES=$(echo "$CHANGED_FILES" | sort -u | grep -v '^$' || true)
+
+# --- Per-run log paths (#908) --------------------------------------------
+# Fixed /tmp paths used to be shared across every worktree/branch/agent on
+# this machine, so concurrent pushes clobbered each other's output and a
+# result could be misattributed to the wrong branch. Derive a per-branch,
+# per-process path instead: reproducible from the branch (no guessing to
+# find a failure's log) and unique per concurrent run (no collision).
+#
+# An unwritable/occupied configured directory must never block a push (a
+# regression an earlier version of this hook had: a silenced `mkdir`
+# failure left `$LOG` pointing nowhere, `> "$LOG"` then failed under `set -e`,
+# and the push died reporting a fake test failure). So: try the configured
+# directory, then a fixed fallback, then a throwaway one — and say so.
+#
+# Only WRITING a log to whichever directory we land on is unconditional.
+# TIGHTENING (chmod) or PRUNING (find -delete) that directory is gated on
+# LOG_DIR_OWNED — set only when this hook itself created/manages the
+# directory it ends up using (the configured rung, the fixed-fallback rung,
+# or a throwaway `mktemp -d` directory). A directory the hook merely adopted
+# as a last resort (nothing left to try) is never chmod'd or swept: on a
+# multi-user or containerised box that directory can be the shared system
+# temp dir, and a symlinked $LOG_DIR is never trusted either — `chmod`
+# follows symlinks, so a planted one would retarget the tightening onto
+# whatever it points at.
+# Usability (may we WRITE here, and should we stop looking further) is
+# judged only by "-d && -w" — a symlink included, since writing there is
+# still fine. Ownership (may we CHMOD/PRUNE here) is judged separately,
+# after LOG_DIR is finalized below: a symlink is never owned regardless of
+# which rung produced it, so it never falls through to a further rung on
+# symlink grounds alone — that would risk skipping straight past a usable
+# configured directory onto the shared fixed-fallback path.
+_prepush_dir_usable() {
+    [ -d "$1" ] && [ -w "$1" ]
+}
+
+_prepush_unusable_reason() {
+    if [ -L "$1" ]; then
+        echo "is a symlink"
+    elif [ -e "$1" ] && [ ! -d "$1" ]; then
+        echo "not a directory"
+    elif [ -d "$1" ] && [ ! -w "$1" ]; then
+        echo "not writable"
+    else
+        echo "could not be created"
+    fi
+}
+
+LOG_DIR="${TMPDIR:-/tmp}/lifeos-prepush"
+# Owned by default: everything below except the bare last-resort "/tmp" is a
+# directory this hook created/manages. Forced to 0 below if $LOG_DIR turns
+# out to be a symlink, regardless of which rung produced it.
+LOG_DIR_OWNED=1
+# -m 700 closes the window between creation and the unconditional chmod
+# below; they're complementary, not alternatives — -m only sets the mode
+# at creation, so it does nothing for a directory that already existed.
+mkdir -p -m 700 "$LOG_DIR" 2>/dev/null || true
+if ! _prepush_dir_usable "$LOG_DIR"; then
+    UNUSABLE_LOG_DIR="$LOG_DIR"
+    REASON=$(_prepush_unusable_reason "$LOG_DIR")
+    # LIFEOS_PREPUSH_TEST_FALLBACK_DIR lets tests exercise this fallback
+    # without ever touching the real, shared /tmp/lifeos-prepush. Unset in
+    # production, where the fallback is always the well-known fixed path.
+    FALLBACK_DIR="${LIFEOS_PREPUSH_TEST_FALLBACK_DIR:-/tmp/lifeos-prepush}"
+    FALLBACK_USABLE=0
+    if [ "$FALLBACK_DIR" = "$UNUSABLE_LOG_DIR" ]; then
+        # The fixed fallback IS the directory just found unusable (the
+        # common case: TMPDIR unset, so both resolve to /tmp/lifeos-prepush).
+        # Retrying an unchanged path would fail identically — skip straight
+        # to the throwaway mktemp rung instead of a pointless retry.
+        FALLBACK_NOTE=" (same directory; not retried)"
+    else
+        mkdir -p -m 700 "$FALLBACK_DIR" 2>/dev/null || true
+        if _prepush_dir_usable "$FALLBACK_DIR"; then
+            FALLBACK_USABLE=1
+        else
+            FALLBACK_NOTE=" ($(_prepush_unusable_reason "$FALLBACK_DIR"))"
+        fi
+    fi
+
+    if [ "$FALLBACK_USABLE" = "1" ]; then
+        LOG_DIR="$FALLBACK_DIR"
+        echo "Pre-push: log directory $UNUSABLE_LOG_DIR is unusable ($REASON); using $LOG_DIR instead"
+    else
+        LOG_DIR=$(mktemp -d "${TMPDIR:-/tmp}/lifeos-prepush.XXXXXX" 2>/dev/null \
+            || mktemp -d 2>/dev/null || echo "")
+        if [ -n "$LOG_DIR" ]; then
+            echo "Pre-push: log directory $UNUSABLE_LOG_DIR is unusable ($REASON); the fixed fallback ($FALLBACK_DIR)${FALLBACK_NOTE} also failed; using $LOG_DIR instead"
+        else
+            # Nothing left to try. Use the shared system temp dir to write a
+            # log (never block the push) but never own/tighten/sweep it.
+            LOG_DIR="/tmp"
+            LOG_DIR_OWNED=0
+            echo "Pre-push: log directory $UNUSABLE_LOG_DIR is unusable ($REASON); every fallback failed; using $LOG_DIR instead (not owned by this hook, so it won't be chmod'd or pruned)"
+        fi
+    fi
+fi
+
+# A symlinked LOG_DIR is never owned, whichever rung produced it: chmod
+# follows symlinks, so tightening one would retarget onto whatever it
+# actually points at rather than a directory this hook manages. This can
+# fire even when $LOG_DIR was otherwise "usable" (no prior message printed
+# above), so say so here rather than silently degrading.
+if [ -L "$LOG_DIR" ]; then
+    LOG_DIR_OWNED=0
+    echo "Pre-push: log directory $LOG_DIR is a symlink; writing there, but not tightening or pruning it"
+fi
+
+if [ "$LOG_DIR_OWNED" = "1" ]; then
+    # mkdir -m only sets the mode on creation, so a directory left behind
+    # world-writable by something else (or simply pre-existing from an
+    # older run) would never get tightened. Do it unconditionally instead —
+    # but only for a directory this hook owns (see the block comment above).
+    chmod 700 "$LOG_DIR" 2>/dev/null || true
+
+    # Prune this hook's own old logs so the directory doesn't grow unbounded.
+    # GNU find's `-mtime +3` matches files whose age exceeds 3 whole days,
+    # i.e. it starts deleting at the 4-day mark, not the 3-day mark. Scoped
+    # to this hook's own `*.log` files so it never removes anything else
+    # that happens to be in the directory. Never touches anything younger
+    # than that — a live run's log, passing or failing, must survive until
+    # someone reads it. Only for an owned directory — see above.
+    find "$LOG_DIR" -maxdepth 1 -type f -name '*.log' -mtime +3 -delete 2>/dev/null || true
+fi
+
+# A log written to the not-owned last-resort directory gets a prefix so it's
+# attributable as this hook's even though it's sitting in a shared, unswept
+# location. The normal (owned) case keeps the existing naming exactly.
+LOG_FILE_PREFIX=""
+[ "$LOG_DIR_OWNED" = "0" ] && LOG_FILE_PREFIX="lifeos-prepush-"
+
+sanitize_branch_slug() {
+    # Replace everything outside [A-Za-z0-9._-] (slashes included) with "_",
+    # so a branch like "feat/x" or a hostile "../../etc/passwd" collapses to
+    # a single safe filename component that can't escape LOG_DIR. Cap the
+    # length so a very long branch name can't produce an unwieldy path.
+    local slug
+    slug=$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_')
+    slug="${slug:0:80}"
+    [ -z "$slug" ] && slug="unknown"
+    printf '%s' "$slug"
+}
+
+if [ -n "$PUSH_LOCAL_REF" ] && [[ "$PUSH_LOCAL_REF" == refs/heads/* ]]; then
+    BRANCH_RAW="${PUSH_LOCAL_REF#refs/heads/}"
+else
+    # No branch ref on stdin (e.g. a tag push, or nothing read at all) —
+    # fall back to the checked-out branch, then a literal placeholder.
+    BRANCH_RAW=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+    [ "$BRANCH_RAW" = "HEAD" ] && BRANCH_RAW="detached"
+fi
+BRANCH_SLUG=$(sanitize_branch_slug "$BRANCH_RAW")
+
+LOG="$LOG_DIR/${LOG_FILE_PREFIX}${BRANCH_SLUG}-$$-unit.log"
+BROWSER_LOG="$LOG_DIR/${LOG_FILE_PREFIX}${BRANCH_SLUG}-$$-browser.log"
+
+# Test overrides: stand in for the stdin ref lines so the decision below can be
+# exercised without a real push (mirrors test.sh's LIFEOS_TEST_CHANGED_FILES).
+if [ -n "${LIFEOS_PREPUSH_CHANGED_FILES+x}" ]; then
+    CHANGED_FILES=$(printf '%s\n' "$LIFEOS_PREPUSH_CHANGED_FILES" | grep -v '^$' || true)
+    HAVE_CONTENT="${LIFEOS_PREPUSH_HAVE_CONTENT:-1}"
+fi
+
+# Emit the decision and stop, without running anything.
+plan_only_exit() {
+    if [ -n "${LIFEOS_PREPUSH_PLAN_ONLY:-}" ]; then
+        echo "prepush-plan: $1"
+        echo "prepush-log: $LOG"
+        echo "prepush-browser-log: $BROWSER_LOG"
+        exit 0
+    fi
+}
+
+# Is this push docs-only? Delegate to test.sh's decide_plan rather than keeping
+# a second copy of the classification here. The two had already drifted: this
+# hook's own regex matched `\.txt$`, so a requirements.txt / constraints.txt
+# bump counted as "docs" and skipped the entire suite, while decide_plan
+# deliberately excludes dependency manifests ("a dep bump must still run tests
+# rather than skipping"). One implementation, covered by tests/test_test_sh_auto.py
+# and tests/test_prepush_gate.py.
+docs_only() {
+    [ -n "$CHANGED_FILES" ] || return 1
+    [ -f "$PROJECT_ROOT/scripts/test.sh" ] || return 1
+    local plan
+    plan=$(LIFEOS_TEST_PLAN_ONLY=1 LIFEOS_TEST_CHANGED_FILES="$CHANGED_FILES" \
+        bash "$PROJECT_ROOT/scripts/test.sh" auto 2>/dev/null \
+        | sed -n 's/^auto-plan: //p')
+    [ "$plan" = "skip" ]
+}
+
+# Deletion-only push: no commits are being sent, so there is nothing to gate.
+if [ "$HAVE_CONTENT" = "0" ]; then
+    plan_only_exit "skip-deletion"
+    echo "Pre-push: ref deletion only, nothing to test"
+    exit 0
+fi
+
+if docs_only; then
+    plan_only_exit "skip-docs"
+    echo "Pre-push: docs-only push, skipping tests"
+    exit 0
+fi
+
+blocking_local_verification_enabled() {
+    [ "$(git config --bool --get lifeos.prepush.blocking-local-verification 2>/dev/null || true)" = "true" ]
+}
+
+if blocking_local_verification_enabled; then
+    plan_only_exit "run-blocking-local"
+else
+    plan_only_exit "run-local"
+fi
+
+# Activate virtual environment
+if [ -f "$HOME/.venvs/lifeos/bin/activate" ]; then
+    source "$HOME/.venvs/lifeos/bin/activate"
+fi
+
+fail() {
+    # $LOG may not exist (or be empty) if the failure happened before pytest
+    # produced any output — e.g. the log directory turned out unusable mid-run.
+    # Report that honestly instead of a blank "FAILED ()".
+    if [ -s "$LOG" ] 2>/dev/null; then
+        echo "FAILED ($(tail -1 "$LOG"))"
+    elif [ -e "$LOG" ]; then
+        echo "FAILED (empty log — command likely failed before producing output)"
+    else
+        echo "FAILED (no log was written to $LOG)"
+    fi
+    [ -e "$LOG" ] && echo "  Full output: $LOG"
+    exit 1
+}
+
+echo "Log: $LOG"
+if ! blocking_local_verification_enabled; then
+    echo -n "Running local lint and fixture privacy audit... "
+
+    run_cheap_local_checks() {
+        local changed_file audit_output
+        local -a changed_python=()
+        while IFS= read -r changed_file; do
+            [[ "$changed_file" == *.py ]] && [ -f "$PROJECT_ROOT/$changed_file" ] && changed_python+=("$changed_file")
+        done <<< "$CHANGED_FILES"
+
+        if [ "${#changed_python[@]}" -gt 0 ]; then
+            if ! ruff check --quiet -- "${changed_python[@]}"; then
+                echo "ruff: FAILED" >&2
+                return 1
+            fi
+            echo "ruff: ok (${#changed_python[@]} changed Python file(s))"
+        else
+            echo "ruff: no changed Python files"
+        fi
+
+        # Every test needs one category marker or it is silently excluded from
+        # both the push gate and test.sh's default scope, and the hosted gate
+        # rejects the collection outright. Collection alone surfaces that in a
+        # few seconds instead of a full hosted verification round trip.
+        local collect_output
+        if ! collect_output=$(python -m pytest tests --collect-only -qq -p no:cacheprovider 2>&1); then
+            printf '%s\n' "$collect_output" | grep -E "carry none of the recognized category markers|^ERROR" || printf '%s\n' "$collect_output" | tail -20
+            echo "test marker guard: FAILED (collection rejected; every test needs one category marker)" >&2
+            return 1
+        fi
+        echo "test marker guard: ok ($(printf '%s\n' "$collect_output" | grep -oE '[0-9]+ tests collected' | head -1))"
+
+        if ! audit_output=$(python -m pytest \
+            tests/test_fixtures_no_personal_data.py::test_no_fixture_contains_a_real_sensitive_value \
+            -q -r s 2>&1); then
+            printf '%s\n' "$audit_output"
+            return 1
+        fi
+        printf '%s\n' "$audit_output"
+        if [[ "$audit_output" == *"1 passed"* ]]; then
+            echo "fixture privacy audit: passed"
+        elif [[ "$audit_output" == *"No real .env reachable from this checkout -- nothing to check fixtures against (expected on a fresh clone or CI)."* \
+            && "$audit_output" == *"1 skipped"* ]]; then
+            echo "fixture privacy audit: not applicable (no real .env reachable)"
+        else
+            echo "fixture privacy audit: FAILED (expected one pass or the named no-real-.env not-applicable result)" >&2
+            return 1
+        fi
+    }
+
+    if ! run_cheap_local_checks > "$LOG" 2>&1; then
+        fail
+    fi
+    echo "passed ($(tail -1 "$LOG"))"
+    exit 0
+fi
+
+echo -n "Running blocking local verification... "
+
+# Every non-deletion ref is verified by its exact local SHA in one detached
+# outer candidate. The verifier collects once, owns one capacity lease, then
+# dispatches both broad gate lanes in separate supervised pytest processes.
+# Its per-lane JSON receipts are retained beside these private hook logs.
+LANE_LOG_DIR="${LOG%.log}-lanes"
+PUSH_FAILED_LANE=""
+run_pushed_candidate() {
+    local output="$1" source_sha base_sha candidate_logs status=0
+    : > "$output"
+    rm -f "$BROWSER_LOG"
+    mkdir -m 700 "$LANE_LOG_DIR" || return 1
+    while read -r source_sha base_sha; do
+        [ -z "$source_sha" ] && continue
+        candidate_logs="$LANE_LOG_DIR/$source_sha"
+        python "$PROJECT_ROOT/scripts/verify_candidate.py" pushed-ref \
+            --repository "$PROJECT_ROOT" --sha "$source_sha" --base "$base_sha" \
+            --evidence-root "${XDG_CACHE_HOME:-$HOME/.cache}/lifeos/verification-evidence" \
+            --lanes "fast-unit,browser-free" --workers 2 \
+            --retry-reason "pre-push retry after an interrupted or infrastructure-failed exact candidate" \
+            --lane-log-dir "$candidate_logs" >> "$output" 2>&1 || status=$?
+        [ -f "$candidate_logs/fast-unit.log" ] && cat "$candidate_logs/fast-unit.log" >> "$output"
+        if [ -f "$candidate_logs/browser-free.json" ]; then
+            [ -f "$candidate_logs/browser-free.log" ] && cat "$candidate_logs/browser-free.log" >> "$BROWSER_LOG"
+        fi
+        if [ "$status" -ne 0 ] && [ -f "$candidate_logs/browser-free.json" ]; then
+            PUSH_FAILED_LANE="browser-free"
+        fi
+        [ -f "$candidate_logs/fast-unit.json" ] && [ -f "$candidate_logs/browser-free.json" ] || status=1
+        [ "$status" -eq 0 ] || break
+    done <<EOF
+$PUSH_CANDIDATES
+EOF
+    # A candidate's execution receipt is the lane-attributable browser log;
+    # do not claim a green browser stage if the exact receipt is absent.
+    [ "$status" -eq 0 ]
+}
+
+# The shared lane registry is also used by test.sh and future CI. Keep this
+# gate intentionally broad: fast-unit plus all server-free browser coverage.
+# Fail before snapshotting when the required browser dependency is absent.
+if ! python -c "import playwright" 2>/dev/null; then
+    echo "FAILED: server-free browser lane requires Playwright. Run: pip install playwright && playwright install"
+    exit 1
+fi
+#
+# The isolated verifier executes every selected node ID from a fresh
+# collection; it deliberately disables pytest's cache provider, so no stale
+# last-failed selection or cache file can influence a candidate receipt.
+if ! run_pushed_candidate "$LOG"; then
+    [ "$PUSH_FAILED_LANE" = "browser-free" ] && LOG="$BROWSER_LOG"
+    fail
+fi
+echo "passed ($(tail -1 "$LOG"))"
+
+# Browser tests remain a separate pytest process inside the shared outer
+# candidate: pytest-playwright's sync API leaves its own event loop current,
+# so any async test that lands after a browser test in the same process fails
+# with `RuntimeError: Runner.run() cannot be called from a running event loop`.
+# The browser receipt is its own log, so it never clobbers the unit verifier
+# output someone may still need to read.
+LOG="$BROWSER_LOG"
+echo "Log: $LOG"
+echo -n "Running server-free browser tests... "
+echo "passed ($(tail -1 "$LOG"))"
+
+exit 0

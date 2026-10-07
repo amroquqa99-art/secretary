@@ -1,0 +1,731 @@
+"""
+Tests for multi-bot Telegram support.
+
+Covers the registry loader (settings.telegram_bots), per-bot listener wiring,
+token routing via the active-bot ContextVar, and persona forwarding through the
+chat client. Specialized bots route to the shared orchestrator with a domain
+persona while keeping full tool access.
+"""
+import json
+from pathlib import Path
+from unittest.mock import patch, AsyncMock
+
+import pytest
+
+pytestmark = pytest.mark.unit
+
+
+# ---------------------------------------------------------------------------
+# Registry loader (settings.telegram_bots)
+# ---------------------------------------------------------------------------
+
+class TestRegistryLoader:
+    def test_missing_registry_file_returns_empty(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", tmp_path / "nope.json")
+        from config.settings import settings
+        assert settings.telegram_bots == []
+
+    def test_bot_with_unset_token_is_skipped(self, tmp_path, monkeypatch):
+        reg = tmp_path / "bots.json"
+        reg.write_text(json.dumps([{"name": "fitness", "token_env": "TG_FIT_TOKEN"}]))
+        monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", reg)
+        monkeypatch.delenv("TG_FIT_TOKEN", raising=False)
+        from config.settings import settings
+        assert settings.telegram_bots == []
+
+    def test_bot_loaded_with_token_persona_and_chat(self, tmp_path, monkeypatch):
+        persona_file = tmp_path / "fitness.md"
+        persona_file.write_text("FIT PERSONA")
+        reg = tmp_path / "bots.json"
+        reg.write_text(json.dumps([{
+            "name": "fitness",
+            "token_env": "TG_FIT_TOKEN",
+            "chat_id_env": "TG_FIT_CHAT",
+            "persona_file": str(persona_file),
+        }]))
+        monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", reg)
+        monkeypatch.setenv("TG_FIT_TOKEN", "fit-token-123")
+        monkeypatch.setenv("TG_FIT_CHAT", "555")
+        from config.settings import settings
+        bots = settings.telegram_bots
+        assert len(bots) == 1
+        bot = bots[0]
+        assert (bot.name, bot.token, bot.chat_id, bot.persona) == (
+            "fitness", "fit-token-123", "555", "FIT PERSONA"
+        )
+        # Every registry entry defaults to the Hermes backend.
+        assert bot.backend == "hermes"
+
+    def test_backend_defaults_to_hermes(self, tmp_path, monkeypatch):
+        reg = tmp_path / "bots.json"
+        reg.write_text(json.dumps([{"name": "fitness", "token_env": "TG_FIT_TOKEN"}]))
+        monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", reg)
+        monkeypatch.setenv("TG_FIT_TOKEN", "x")
+        from config.settings import settings
+        assert settings.telegram_bots[0].backend == "hermes"
+
+    def test_backend_explicit_lifeos_honored(self, tmp_path, monkeypatch):
+        reg = tmp_path / "bots.json"
+        reg.write_text(json.dumps([
+            {"name": "fitness", "token_env": "TG_FIT_TOKEN", "backend": "lifeos"},
+        ]))
+        monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", reg)
+        monkeypatch.setenv("TG_FIT_TOKEN", "x")
+        from config.settings import settings
+        assert settings.telegram_bots[0].backend == "lifeos"
+
+    def test_backend_invalid_value_falls_back_to_hermes(self, tmp_path, monkeypatch):
+        reg = tmp_path / "bots.json"
+        reg.write_text(json.dumps([
+            {"name": "fitness", "token_env": "TG_FIT_TOKEN", "backend": "openai"},
+        ]))
+        monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", reg)
+        monkeypatch.setenv("TG_FIT_TOKEN", "x")
+        from config.settings import settings
+        assert settings.telegram_bots[0].backend == "hermes"
+
+    def test_primary_bot_always_backend_lifeos(self, monkeypatch):
+        """The primary bot always resolves to "lifeos", regardless of the
+        dataclass default meant for specialized registry entries."""
+        from config.settings import settings
+        assert settings.telegram_primary_bot.backend == "lifeos"
+
+    def test_chat_id_defaults_to_primary(self, tmp_path, monkeypatch):
+        reg = tmp_path / "bots.json"
+        reg.write_text(json.dumps([{"name": "fitness", "token_env": "TG_FIT_TOKEN"}]))
+        monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", reg)
+        monkeypatch.setenv("TG_FIT_TOKEN", "x")
+        from config.settings import settings
+        assert settings.telegram_bots[0].chat_id == settings.telegram_chat_id
+
+    def test_reserved_and_invalid_names_skipped(self, tmp_path, monkeypatch):
+        reg = tmp_path / "bots.json"
+        reg.write_text(json.dumps([
+            {"name": "primary", "token_env": "TG_A"},      # reserved
+            {"name": "bad name!", "token_env": "TG_B"},    # invalid chars
+            {"name": "fitness", "token_env": "TG_C"},      # ok
+        ]))
+        monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", reg)
+        monkeypatch.setenv("TG_A", "a")
+        monkeypatch.setenv("TG_B", "b")
+        monkeypatch.setenv("TG_C", "c")
+        from config.settings import settings
+        names = [b.name for b in settings.telegram_bots]
+        assert names == ["fitness"]
+
+    def test_duplicate_names_deduped(self, tmp_path, monkeypatch):
+        reg = tmp_path / "bots.json"
+        reg.write_text(json.dumps([
+            {"name": "fitness", "token_env": "TG_C"},
+            {"name": "fitness", "token_env": "TG_C"},
+        ]))
+        monkeypatch.setattr("config.settings._TELEGRAM_BOTS_FILE", reg)
+        monkeypatch.setenv("TG_C", "c")
+        from config.settings import settings
+        assert len(settings.telegram_bots) == 1
+
+
+# ---------------------------------------------------------------------------
+# Token routing via the active-bot ContextVar
+# ---------------------------------------------------------------------------
+
+class TestTokenRouting:
+    def test_active_bot_token_used(self):
+        from api.services.telegram import _telegram_url, _active_bot_token
+        tok = _active_bot_token.set("BOTX")
+        try:
+            assert "/botBOTX/" in _telegram_url("sendMessage")
+        finally:
+            _active_bot_token.reset(tok)
+
+    def test_explicit_token_overrides_active(self):
+        from api.services.telegram import _telegram_url, _active_bot_token
+        tok = _active_bot_token.set("BOTX")
+        try:
+            assert "/botEXPLICIT/" in _telegram_url("sendMessage", "EXPLICIT")
+        finally:
+            _active_bot_token.reset(tok)
+
+    def test_defaults_to_primary_when_unset(self):
+        import api.services.telegram as tg
+        from api.services.telegram import _telegram_url, _active_bot_token
+        # No active token set and no explicit token -> primary settings token.
+        assert _active_bot_token.get() is None
+        assert _telegram_url("getMe") == f"{tg.TELEGRAM_API}/bot{tg.settings.telegram_bot_token}/getMe"
+
+
+# ---------------------------------------------------------------------------
+# Per-bot listener wiring
+# ---------------------------------------------------------------------------
+
+class TestListenerWiring:
+    def test_primary_uses_legacy_state_file(self, tmp_path):
+        from api.services.telegram import TelegramBotListener
+        from config.settings import TelegramBotConfig
+
+        primary = TelegramBotConfig(
+            name="primary", token="T", chat_id="C", persona=""
+        )
+        state = tmp_path / "telegram_state.json"
+        with patch.object(TelegramBotListener, "_STATE_FILE", state):
+            listener = TelegramBotListener(primary)
+            assert listener._is_primary
+            assert listener._state_file == state
+
+    def test_named_bot_has_isolated_state_file_and_config(self):
+        from api.services.telegram import TelegramBotListener
+        from config.settings import TelegramBotConfig
+        bot = TelegramBotConfig(name="fitness", token="T", chat_id="C", persona="P")
+        listener = TelegramBotListener(bot)
+        assert not listener._is_primary
+        assert listener._state_file == Path("data/telegram_state_fitness.json")
+        assert listener._token == "T"
+        assert listener._chat_id == "C"
+        assert listener._persona == "P"
+
+
+# ---------------------------------------------------------------------------
+# Persona forwarding + agent-reply gating in _handle_update
+# ---------------------------------------------------------------------------
+
+class _DummyTyping:
+    """async-context-manager stand-in for TypingIndicator."""
+    def __init__(self, *a, **k):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+
+class TestHandleUpdate:
+    def _listener(self, name, chat_id, persona=""):
+        from api.services.telegram import TelegramBotListener
+        from config.settings import TelegramBotConfig
+        bot = TelegramBotConfig(name=name, token="TOK", chat_id=chat_id, persona=persona)
+        return TelegramBotListener(bot)
+
+    @pytest.mark.asyncio
+    async def test_specialized_bot_forwards_persona_id_via_hermes(self, monkeypatch):
+        """A specialized bot resolves its persona server-side via
+        `persona_id` (not the raw preamble text) and targets the Hermes
+        backend by default, once Hermes is configured."""
+        monkeypatch.setattr("api.services.telegram.settings.hermes_backend_url", "http://hermes")
+        listener = self._listener("fitness", "999", persona="FIT PERSONA")
+        update = {"message": {
+            "text": "squats 5x5 @185",
+            "chat": {"id": 999},
+            "message_id": 1,
+            "reply_to_message": {"message_id": 42},  # would trigger hooks on primary
+        }}
+        with patch.object(listener, "_maybe_deposit_agent_answer") as mock_dep, \
+             patch.object(listener, "_maybe_handle_claude_code_reply", new_callable=AsyncMock) as mock_claude, \
+             patch("api.services.telegram.send_typing_indicator", new_callable=AsyncMock), \
+             patch("api.services.telegram.send_message_async", new_callable=AsyncMock), \
+             patch("api.services.telegram.TypingIndicator", _DummyTyping), \
+             patch("api.services.telegram.chat_via_api", new_callable=AsyncMock) as mock_chat:
+            mock_chat.return_value = {"answer": "Logged", "conversation_id": "c1"}
+            await listener._handle_update(update)
+
+        # Specialized bots are pure chat: agent/Claude reply hooks never run.
+        mock_dep.assert_not_called()
+        mock_claude.assert_not_called()
+        # Persona resolved server-side via persona_id, targeting Hermes.
+        mock_chat.assert_awaited_once()
+        assert mock_chat.call_args.kwargs.get("persona_id") == "fitness"
+        assert mock_chat.call_args.kwargs.get("backend") == "hermes"
+        assert "persona" not in mock_chat.call_args.kwargs
+
+    @pytest.mark.asyncio
+    async def test_primary_bot_still_runs_agent_reply_hook(self):
+        listener = self._listener("primary", "999")
+        update = {"message": {
+            "text": "the answer",
+            "chat": {"id": 999},
+            "message_id": 2,
+            "reply_to_message": {"message_id": 42},
+        }}
+        with patch.object(listener, "_maybe_handle_claude_code_reply", new_callable=AsyncMock, return_value=False) as mock_claude, \
+             patch.object(listener, "_maybe_deposit_agent_answer", return_value=True) as mock_dep, \
+             patch("api.services.telegram.send_typing_indicator", new_callable=AsyncMock), \
+             patch("api.services.telegram.chat_via_api", new_callable=AsyncMock) as mock_chat:
+            await listener._handle_update(update)
+
+        # Primary owns the reply threads; deposit short-circuits before chat.
+        mock_claude.assert_awaited_once()
+        mock_dep.assert_called_once()
+        mock_chat.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_chat_ignored_per_bot(self):
+        listener = self._listener("fitness", "999", persona="P")
+        update = {"message": {"text": "hi", "chat": {"id": 111}, "message_id": 3}}
+        with patch("api.services.telegram.send_typing_indicator", new_callable=AsyncMock), \
+             patch("api.services.telegram.chat_via_api", new_callable=AsyncMock) as mock_chat:
+            await listener._handle_update(update)
+        mock_chat.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_specialized_bot_prepends_reply_quote_context(self, monkeypatch):
+        monkeypatch.setattr("api.services.telegram.settings.hermes_backend_url", "http://hermes")
+        listener = self._listener("fitness", "999", persona="P")
+        update = {"message": {
+            "text": "no, that was 145",
+            "chat": {"id": 999},
+            "message_id": 7,
+            "reply_to_message": {"message_id": 6, "text": "Logged: Bench Press 135×8"},
+        }}
+        with patch("api.services.telegram.send_typing_indicator", new_callable=AsyncMock), \
+             patch("api.services.telegram.send_message_async", new_callable=AsyncMock), \
+             patch("api.services.telegram.TypingIndicator", _DummyTyping), \
+             patch("api.services.telegram.chat_via_api", new_callable=AsyncMock) as mock_chat:
+            mock_chat.return_value = {"answer": "Updated", "conversation_id": "c1"}
+            await listener._handle_update(update)
+        sent_text = mock_chat.call_args.args[0]
+        assert "replying to my earlier message" in sent_text
+        assert "Logged: Bench Press 135×8" in sent_text
+        assert "no, that was 145" in sent_text
+
+    @pytest.mark.asyncio
+    async def test_primary_bot_prepends_reply_quote_when_hooks_miss(self):
+        """A reply to an ordinary primary-bot message (not a
+        claude-code/agent-worker thread) carries the quoted text into chat."""
+        listener = self._listener("primary", "999")
+        update = {"message": {
+            "text": "what does the third bullet mean?",
+            "chat": {"id": 999},
+            "message_id": 10,
+            "reply_to_message": {"message_id": 9, "text": "Tonight's priorities:\n- a\n- b\n- c"},
+        }}
+        with patch.object(listener, "_maybe_handle_claude_code_reply", new_callable=AsyncMock, return_value=False), \
+             patch.object(listener, "_maybe_deposit_agent_answer", return_value=False), \
+             patch("api.services.telegram.send_typing_indicator", new_callable=AsyncMock), \
+             patch("api.services.telegram.send_message_async", new_callable=AsyncMock), \
+             patch("api.services.telegram.TypingIndicator", _DummyTyping), \
+             patch("api.services.telegram.chat_via_api", new_callable=AsyncMock) as mock_chat:
+            mock_chat.return_value = {"answer": "It means c", "conversation_id": "c1"}
+            await listener._handle_update(update)
+        sent_text = mock_chat.call_args.args[0]
+        assert "replying to my earlier message" in sent_text
+        assert "Tonight's priorities" in sent_text
+        assert "what does the third bullet mean?" in sent_text
+
+    @pytest.mark.asyncio
+    async def test_long_quoted_reply_is_truncated(self):
+        from api.services.telegram import MAX_QUOTED_REPLY_CHARS
+        listener = self._listener("primary", "999")
+        long_quote = "x" * (MAX_QUOTED_REPLY_CHARS + 500)
+        update = {"message": {
+            "text": "explain that",
+            "chat": {"id": 999},
+            "message_id": 11,
+            "reply_to_message": {"message_id": 9, "text": long_quote},
+        }}
+        with patch.object(listener, "_maybe_handle_claude_code_reply", new_callable=AsyncMock, return_value=False), \
+             patch.object(listener, "_maybe_deposit_agent_answer", return_value=False), \
+             patch("api.services.telegram.send_typing_indicator", new_callable=AsyncMock), \
+             patch("api.services.telegram.send_message_async", new_callable=AsyncMock), \
+             patch("api.services.telegram.TypingIndicator", _DummyTyping), \
+             patch("api.services.telegram.chat_via_api", new_callable=AsyncMock) as mock_chat:
+            mock_chat.return_value = {"answer": "ok", "conversation_id": "c1"}
+            await listener._handle_update(update)
+        sent_text = mock_chat.call_args.args[0]
+        assert "x" * MAX_QUOTED_REPLY_CHARS + "…" in sent_text
+        assert "x" * (MAX_QUOTED_REPLY_CHARS + 1) not in sent_text
+        assert "explain that" in sent_text
+
+    @pytest.mark.asyncio
+    async def test_plain_message_has_no_reply_context(self, monkeypatch):
+        monkeypatch.setattr("api.services.telegram.settings.hermes_backend_url", "http://hermes")
+        listener = self._listener("fitness", "999", persona="P")
+        update = {"message": {"text": "bench 135x8", "chat": {"id": 999}, "message_id": 8}}
+        with patch("api.services.telegram.send_typing_indicator", new_callable=AsyncMock), \
+             patch("api.services.telegram.send_message_async", new_callable=AsyncMock), \
+             patch("api.services.telegram.TypingIndicator", _DummyTyping), \
+             patch("api.services.telegram.chat_via_api", new_callable=AsyncMock) as mock_chat:
+            mock_chat.return_value = {"answer": "Logged", "conversation_id": "c1"}
+            await listener._handle_update(update)
+        assert mock_chat.call_args.args[0] == "bench 135x8"
+
+
+class TestPrimaryOnlyCommands:
+    """Agent/Claude-Code/Codex commands belong to the primary bot only."""
+
+    def _listener(self, name, chat_id):
+        from api.services.telegram import TelegramBotListener
+        from config.settings import TelegramBotConfig
+        return TelegramBotListener(TelegramBotConfig(name=name, token="TOK", chat_id=chat_id))
+
+    @pytest.mark.asyncio
+    async def test_specialized_bot_redirects_agent_command(self):
+        listener = self._listener("fitness", "999")
+        with patch("api.services.telegram.send_message_async", new_callable=AsyncMock) as mock_send, \
+             patch.object(listener, "_handle_agent_spawn", new_callable=AsyncMock) as mock_spawn:
+            handled = await listener._handle_command("/agent do a thing", "999")
+        assert handled is True
+        mock_spawn.assert_not_called()
+        mock_send.assert_awaited_once()
+        assert "main LifeOS bot" in mock_send.call_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_primary_bot_allows_agent_command(self):
+        listener = self._listener("primary", "999")
+        with patch.object(listener, "_handle_agent_spawn", new_callable=AsyncMock) as mock_spawn:
+            handled = await listener._handle_command("/agent do a thing", "999")
+        assert handled is True
+        mock_spawn.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_specialized_bot_redirects_on_engine_handoff(self, monkeypatch):
+        monkeypatch.setattr("api.services.telegram.settings.hermes_backend_url", "http://hermes")
+        listener = self._listener("fitness", "999")
+        update = {"message": {"text": "use claude code to fix x", "chat": {"id": 999}, "message_id": 5}}
+        with patch("api.services.telegram.send_typing_indicator", new_callable=AsyncMock), \
+             patch("api.services.telegram.send_message_async", new_callable=AsyncMock) as mock_send, \
+             patch("api.services.telegram.TypingIndicator", _DummyTyping), \
+             patch("api.services.telegram.chat_via_api", new_callable=AsyncMock) as mock_chat, \
+             patch.object(listener, "_handle_claude_command", new_callable=AsyncMock) as mock_claude:
+            mock_chat.return_value = {
+                "answer": "", "conversation_id": "c1",
+                "claude_intent": True, "engine": "claude_code", "task": "fix x",
+            }
+            await listener._handle_update(update)
+        # No background session spawned; a redirect was sent instead.
+        mock_claude.assert_not_called()
+        assert any(
+            c.args and "main" in c.args[0].lower() for c in mock_send.call_args_list
+        )
+
+
+class TestPersonaValidation:
+    def test_persona_within_cap_accepted(self):
+        from api.routes.chat import AskStreamRequest
+        req = AskStreamRequest(question="hi", persona="x" * 8000)
+        assert len(req.persona) == 8000
+
+    def test_persona_over_cap_rejected(self):
+        from api.routes.chat import AskStreamRequest
+        with pytest.raises(ValueError):
+            AskStreamRequest(question="hi", persona="x" * 8001)
+
+
+# ---------------------------------------------------------------------------
+# Persona threads through chat_via_api into the request body
+# ---------------------------------------------------------------------------
+
+class TestChatViaApiPersona:
+    @pytest.mark.asyncio
+    @patch("api.services.telegram.settings")
+    async def test_persona_added_to_request_body(self, mock_settings):
+        from api.services.telegram import chat_via_api
+        mock_settings.port = 8000
+        captured = {}
+
+        class MockStream:
+            status_code = 200
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *args):
+                pass
+            async def aiter_lines(self):
+                for ev in ['data: {"type": "content", "content": "ok"}', 'data: {"type": "done"}']:
+                    yield ev
+
+        class MockAsyncClient:
+            def __init__(self, **kwargs):
+                pass
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *args):
+                pass
+            def stream(self, method, url, **kwargs):
+                captured["json"] = kwargs.get("json")
+                return MockStream()
+
+        with patch("api.services.telegram.httpx.AsyncClient", MockAsyncClient):
+            await chat_via_api("hi", persona="FIT PERSONA")
+        assert captured["json"]["persona"] == "FIT PERSONA"
+
+    @pytest.mark.asyncio
+    @patch("api.services.telegram.settings")
+    async def test_no_persona_key_when_absent(self, mock_settings):
+        from api.services.telegram import chat_via_api
+        mock_settings.port = 8000
+        captured = {}
+
+        class MockStream:
+            status_code = 200
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *args):
+                pass
+            async def aiter_lines(self):
+                for ev in ['data: {"type": "done"}']:
+                    yield ev
+
+        class MockAsyncClient:
+            def __init__(self, **kwargs):
+                pass
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *args):
+                pass
+            def stream(self, method, url, **kwargs):
+                captured["json"] = kwargs.get("json")
+                return MockStream()
+
+        with patch("api.services.telegram.httpx.AsyncClient", MockAsyncClient):
+            await chat_via_api("hi")
+        assert "persona" not in captured["json"]
+
+
+# ---------------------------------------------------------------------------
+# chat_via_api's backend selection: persona_id, target URL, and the
+# HermesUnavailable signal a hermes-backend caller retries on.
+# ---------------------------------------------------------------------------
+
+def _mock_stream_client(captured: dict, status_code: int = 200, events: list[str] = None):
+    """A minimal httpx.AsyncClient stand-in for chat_via_api's own SSE loop.
+    Captures the requested URL/JSON body and replays `events` as SSE lines."""
+    events = events if events is not None else ['data: {"type": "done"}']
+
+    class MockStream:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+        async def aiter_lines(self):
+            for ev in events:
+                yield ev
+        async def aread(self):
+            return b"error body"
+
+    MockStream.status_code = status_code
+
+    class MockAsyncClient:
+        def __init__(self, **kwargs):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+        def stream(self, method, url, **kwargs):
+            captured["url"] = url
+            captured["json"] = kwargs.get("json")
+            return MockStream()
+
+    return MockAsyncClient
+
+
+class TestChatViaApiBackendSelection:
+    @pytest.mark.asyncio
+    @patch("api.services.telegram.settings")
+    async def test_persona_id_added_to_request_body(self, mock_settings):
+        from api.services.telegram import chat_via_api
+        mock_settings.port = 8000
+        captured = {}
+        with patch("api.services.telegram.httpx.AsyncClient", _mock_stream_client(captured)):
+            await chat_via_api("hi", persona_id="fitness")
+        assert captured["json"]["persona_id"] == "fitness"
+        assert "persona" not in captured["json"]
+
+    @pytest.mark.asyncio
+    @patch("api.services.telegram.settings")
+    async def test_lifeos_backend_targets_native_ask_stream(self, mock_settings):
+        from api.services.telegram import chat_via_api
+        mock_settings.port = 8000
+        captured = {}
+        with patch("api.services.telegram.httpx.AsyncClient", _mock_stream_client(captured)):
+            await chat_via_api("hi", persona_id="fitness", backend="lifeos")
+        assert captured["url"] == "http://localhost:8000/api/ask/stream"
+
+    @pytest.mark.asyncio
+    @patch("api.services.telegram.settings")
+    async def test_hermes_backend_targets_hermes_proxy(self, mock_settings):
+        from api.services.telegram import chat_via_api
+        mock_settings.port = 8000
+        captured = {}
+        with patch("api.services.telegram.httpx.AsyncClient", _mock_stream_client(captured)):
+            await chat_via_api("hi", persona_id="fitness", backend="hermes")
+        assert captured["url"] == "http://localhost:8000/api/hermes/ask/stream"
+
+    @pytest.mark.asyncio
+    @patch("api.services.telegram.settings")
+    async def test_hermes_503_raises_hermes_unavailable(self, mock_settings):
+        """An unconfigured Hermes backend (the router's 503, raised
+        before any side effect — e.g. journal capture — can have happened)
+        is a HermesUnavailable, not a generic RuntimeError, so a caller can
+        catch it and retry on backend="lifeos"."""
+        from api.services.telegram import HermesUnavailable, chat_via_api
+        mock_settings.port = 8000
+        captured = {}
+        client = _mock_stream_client(captured, status_code=503)
+        with patch("api.services.telegram.httpx.AsyncClient", client):
+            with pytest.raises(HermesUnavailable):
+                await chat_via_api("hi", persona_id="fitness", backend="hermes")
+
+    @pytest.mark.asyncio
+    @patch("api.services.telegram.settings")
+    async def test_hermes_502_raises_hermes_unavailable(self, mock_settings):
+        """A connect failure surfaces from the router as a 502 — also
+        HermesUnavailable, also raised before any side effect."""
+        from api.services.telegram import HermesUnavailable, chat_via_api
+        mock_settings.port = 8000
+        captured = {}
+        client = _mock_stream_client(captured, status_code=502)
+        with patch("api.services.telegram.httpx.AsyncClient", client):
+            with pytest.raises(HermesUnavailable):
+                await chat_via_api("hi", persona_id="fitness", backend="hermes")
+
+    @pytest.mark.asyncio
+    @patch("api.services.telegram.settings")
+    async def test_hermes_400_is_a_plain_runtime_error(self, mock_settings):
+        """A 400 (e.g. a malformed persona) is a real error, not a
+        backend-availability signal — it must not be mistaken for
+        HermesUnavailable, since retrying it natively would just fail the
+        same way."""
+        from api.services.telegram import HermesUnavailable, chat_via_api
+        mock_settings.port = 8000
+        captured = {}
+        client = _mock_stream_client(captured, status_code=400)
+        with patch("api.services.telegram.httpx.AsyncClient", client):
+            with pytest.raises(RuntimeError) as exc_info:
+                await chat_via_api("hi", persona_id="fitness", backend="hermes")
+        assert not isinstance(exc_info.value, HermesUnavailable)
+
+    @pytest.mark.asyncio
+    @patch("api.services.telegram.settings")
+    async def test_lifeos_backend_non_200_is_a_plain_runtime_error(self, mock_settings):
+        """A non-200 on the native path is unaffected by the Hermes backend switch — still the
+        original plain RuntimeError, never HermesUnavailable."""
+        from api.services.telegram import HermesUnavailable, chat_via_api
+        mock_settings.port = 8000
+        captured = {}
+        client = _mock_stream_client(captured, status_code=502)
+        with patch("api.services.telegram.httpx.AsyncClient", client):
+            with pytest.raises(RuntimeError) as exc_info:
+                await chat_via_api("hi", persona_id="fitness", backend="lifeos")
+        assert not isinstance(exc_info.value, HermesUnavailable)
+
+
+# ---------------------------------------------------------------------------
+# Listener-level Hermes fallback + one-time disclosure
+# ---------------------------------------------------------------------------
+
+class TestHermesFallback:
+    def _listener(self, name="fitness", chat_id="999", persona="P", orchestrates=False):
+        from api.services.telegram import TelegramBotListener
+        from config.settings import TelegramBotConfig
+        bot = TelegramBotConfig(
+            name=name, token="TOK", chat_id=chat_id, persona=persona,
+            orchestrates=orchestrates,
+        )
+        return TelegramBotListener(bot)
+
+    @pytest.mark.asyncio
+    async def test_unconfigured_hermes_falls_back_to_lifeos_with_disclosure(self, monkeypatch):
+        monkeypatch.setattr("api.services.telegram.settings.hermes_backend_url", "")
+        listener = self._listener()
+        with patch("api.services.telegram.send_message_async", new_callable=AsyncMock) as mock_send, \
+             patch("api.services.telegram.chat_via_api", new_callable=AsyncMock) as mock_chat:
+            mock_chat.return_value = {"answer": "ok", "conversation_id": "c1"}
+            result = await listener._run_chat_turn("bench 135x8", "999", None)
+
+        assert result["answer"] == "ok"
+        mock_chat.assert_awaited_once()
+        assert mock_chat.call_args.kwargs.get("backend") == "lifeos"
+        assert mock_chat.call_args.kwargs.get("persona_id") == "fitness"
+        # Disclosed once, in-channel.
+        mock_send.assert_awaited_once()
+        assert "native" in mock_send.call_args.args[0].lower()
+
+    @pytest.mark.asyncio
+    async def test_disclosure_is_one_time_not_per_message(self, monkeypatch):
+        monkeypatch.setattr("api.services.telegram.settings.hermes_backend_url", "")
+        listener = self._listener()
+        with patch("api.services.telegram.send_message_async", new_callable=AsyncMock) as mock_send, \
+             patch("api.services.telegram.chat_via_api", new_callable=AsyncMock) as mock_chat:
+            mock_chat.return_value = {"answer": "ok", "conversation_id": "c1"}
+            await listener._run_chat_turn("first", "999", None)
+            await listener._run_chat_turn("second", "999", None)
+
+        # Two turns fell back, but the in-channel notice went out only once.
+        assert mock_chat.await_count == 2
+        mock_send.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_connection_failure_falls_back_with_disclosure(self, monkeypatch):
+        """A configured-but-unreachable Hermes raises HermesUnavailable on the
+        first attempt; the listener retries the SAME turn on backend="lifeos"
+        and discloses once — never silently, and never surfaced as an error
+        to the user."""
+        from api.services.telegram import HermesUnavailable
+        monkeypatch.setattr("api.services.telegram.settings.hermes_backend_url", "http://hermes")
+        listener = self._listener()
+
+        calls = []
+
+        async def _fake_chat(text, conversation_id=None, persona=None, persona_id=None, backend="lifeos"):
+            calls.append(backend)
+            if backend == "hermes":
+                raise HermesUnavailable("connect failed")
+            return {"answer": "ok via native", "conversation_id": "c1"}
+
+        with patch("api.services.telegram.send_message_async", new_callable=AsyncMock) as mock_send, \
+             patch("api.services.telegram.chat_via_api", side_effect=_fake_chat):
+            result = await listener._run_chat_turn("bench 135x8", "999", None)
+
+        assert calls == ["hermes", "lifeos"]
+        assert result["answer"] == "ok via native"
+        mock_send.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_hermes_success_never_discloses(self, monkeypatch):
+        monkeypatch.setattr("api.services.telegram.settings.hermes_backend_url", "http://hermes")
+        listener = self._listener()
+        with patch("api.services.telegram.send_message_async", new_callable=AsyncMock) as mock_send, \
+             patch("api.services.telegram.chat_via_api", new_callable=AsyncMock) as mock_chat:
+            mock_chat.return_value = {"answer": "ok", "conversation_id": "c1"}
+            await listener._run_chat_turn("bench 135x8", "999", None)
+
+        mock_chat.assert_awaited_once()
+        assert mock_chat.call_args.kwargs.get("backend") == "hermes"
+        mock_send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_bot_configured_lifeos_backend_never_tries_hermes(self, monkeypatch):
+        """A registry entry pinned to backend="lifeos" never attempts
+        Hermes at all — no fallback, no disclosure, just the native call."""
+        monkeypatch.setattr("api.services.telegram.settings.hermes_backend_url", "http://hermes")
+        listener = self._listener()
+        listener._bot = replace_backend(listener._bot, "lifeos")
+        with patch("api.services.telegram.send_message_async", new_callable=AsyncMock) as mock_send, \
+             patch("api.services.telegram.chat_via_api", new_callable=AsyncMock) as mock_chat:
+            mock_chat.return_value = {"answer": "ok", "conversation_id": "c1"}
+            await listener._run_chat_turn("bench 135x8", "999", None)
+
+        mock_chat.assert_awaited_once()
+        assert mock_chat.call_args.kwargs.get("backend") == "lifeos"
+        mock_send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_primary_bot_never_touches_hermes_backend(self, monkeypatch):
+        """The primary bot is untouched by the Hermes backend switch regardless of Hermes state —
+        it always calls the raw-persona native path."""
+        monkeypatch.setattr("api.services.telegram.settings.hermes_backend_url", "http://hermes")
+        listener = self._listener(name="primary", persona="PRIMARY PERSONA")
+        with patch("api.services.telegram.send_message_async", new_callable=AsyncMock) as mock_send, \
+             patch("api.services.telegram.chat_via_api", new_callable=AsyncMock) as mock_chat:
+            mock_chat.return_value = {"answer": "ok", "conversation_id": "c1"}
+            await listener._run_chat_turn("hi", "999", None)
+
+        mock_chat.assert_awaited_once()
+        assert mock_chat.call_args.kwargs == {"conversation_id": None, "persona": "PRIMARY PERSONA"}
+        mock_send.assert_not_called()
+
+
+def replace_backend(bot, backend):
+    from dataclasses import replace
+    return replace(bot, backend=backend)

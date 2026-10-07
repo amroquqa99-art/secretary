@@ -1,0 +1,1134 @@
+"""
+Tests for Hybrid Retrieval (P5.2).
+
+Tests the BM25Index service and RRF fusion logic.
+"""
+import os
+import tempfile
+
+import pytest
+
+# Most tests in this file are fast unit tests (SQLite FTS5 + pure logic)
+pytestmark = pytest.mark.unit
+
+
+class TestBM25Index:
+    """Test the BM25 keyword index using SQLite FTS5."""
+
+    @pytest.fixture
+    def temp_db(self):
+        """Create a temporary database file."""
+        with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as f:
+            yield f.name
+        os.unlink(f.name)
+
+    def test_index_initialization(self, temp_db):
+        """Index should create FTS5 table on init."""
+        from api.services.bm25_index import BM25Index
+
+        BM25Index(db_path=temp_db)  # creates the FTS5 table as a side effect
+
+        # Check FTS5 table exists
+        import sqlite3
+        conn = sqlite3.connect(temp_db)
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='chunks_fts'"
+        )
+        result = cursor.fetchone()
+        conn.close()
+
+        assert result is not None
+
+    def test_add_document(self, temp_db):
+        """Should add document to FTS index."""
+        from api.services.bm25_index import BM25Index
+
+        index = BM25Index(db_path=temp_db)
+        index.add_document(
+            doc_id="doc1",
+            content="Meeting notes about Q4 budget planning",
+            file_name="Budget Review.md",
+            people=["Kevin", "Sarah"]
+        )
+
+        # Verify it is retrievable
+        results = index.search("budget")
+        assert len(results) == 1
+        assert results[0]["doc_id"] == "doc1"
+
+    def test_add_multiple_documents(self, temp_db):
+        """Should handle multiple documents."""
+        from api.services.bm25_index import BM25Index
+
+        index = BM25Index(db_path=temp_db)
+        index.add_document("doc1", "Q4 budget planning", "Budget.md")
+        index.add_document("doc2", "Team meeting notes", "Meeting.md")
+        index.add_document("doc3", "Budget review for Q3", "Q3 Budget.md")
+
+        results = index.search("budget")
+        assert len(results) == 2  # doc1 and doc3
+
+    def test_search_returns_ranked_results(self, temp_db):
+        """Search should return results ranked by relevance."""
+        from api.services.bm25_index import BM25Index
+
+        index = BM25Index(db_path=temp_db)
+        # Doc with more "budget" mentions should rank higher
+        index.add_document("doc1", "Budget budget budget planning", "Budget.md")
+        index.add_document("doc2", "Meeting about budget", "Meeting.md")
+
+        results = index.search("budget")
+        assert len(results) == 2
+        # doc1 should be first (more relevant)
+        assert results[0]["doc_id"] == "doc1"
+
+    def test_search_by_filename(self, temp_db):
+        """Should match on filename."""
+        from api.services.bm25_index import BM25Index
+
+        index = BM25Index(db_path=temp_db)
+        index.add_document("doc1", "Random content", "ML Infrastructure.md")
+        index.add_document("doc2", "Other content", "Meeting Notes.md")
+
+        results = index.search("ML Infrastructure")
+        assert len(results) == 1
+        assert results[0]["doc_id"] == "doc1"
+
+    def test_search_by_person(self, temp_db):
+        """Should match on people names."""
+        from api.services.bm25_index import BM25Index
+
+        index = BM25Index(db_path=temp_db)
+        index.add_document("doc1", "Meeting notes", "Meeting.md", people=["Kevin", "Sarah"])
+        index.add_document("doc2", "Other notes", "Other.md", people=["Mike"])
+
+        results = index.search("Kevin")
+        assert len(results) == 1
+        assert results[0]["doc_id"] == "doc1"
+
+    def test_update_document(self, temp_db):
+        """Should update existing document."""
+        from api.services.bm25_index import BM25Index
+
+        index = BM25Index(db_path=temp_db)
+        index.add_document("doc1", "Old content", "File.md")
+        index.add_document("doc1", "New updated content", "File.md")
+
+        results = index.search("updated")
+        assert len(results) == 1
+
+        results = index.search("Old")
+        assert len(results) == 0
+
+    def test_delete_document(self, temp_db):
+        """Should delete document from index."""
+        from api.services.bm25_index import BM25Index
+
+        index = BM25Index(db_path=temp_db)
+        index.add_document("doc1", "Test content", "Test.md")
+
+        index.delete_document("doc1")
+
+        results = index.search("Test")
+        assert len(results) == 0
+
+    def test_search_limit(self, temp_db):
+        """Should respect limit parameter."""
+        from api.services.bm25_index import BM25Index
+
+        index = BM25Index(db_path=temp_db)
+        for i in range(10):
+            index.add_document(f"doc{i}", f"Budget document number {i}", f"Doc{i}.md")
+
+        results = index.search("budget", limit=5)
+        assert len(results) == 5
+
+    def test_empty_search(self, temp_db):
+        """Should return empty list for no matches."""
+        from api.services.bm25_index import BM25Index
+
+        index = BM25Index(db_path=temp_db)
+        index.add_document("doc1", "Meeting notes", "Meeting.md")
+
+        results = index.search("xyz123nonexistent")
+        assert len(results) == 0
+
+
+class TestRRFFusion:
+    """Test Reciprocal Rank Fusion algorithm."""
+
+    def test_basic_fusion(self):
+        """Should merge two ranked lists correctly."""
+        from api.services.hybrid_search import reciprocal_rank_fusion
+
+        vector_results = ["doc1", "doc2", "doc3"]
+        bm25_results = ["doc2", "doc1", "doc4"]
+
+        fused = reciprocal_rank_fusion(vector_results, bm25_results)
+
+        # doc1 and doc2 appear in both lists, should rank higher
+        doc_ids = [doc_id for doc_id, score in fused]
+        assert "doc1" in doc_ids[:2]
+        assert "doc2" in doc_ids[:2]
+
+    def test_fusion_scores(self):
+        """Should calculate RRF scores correctly."""
+        from api.services.hybrid_search import reciprocal_rank_fusion
+
+        # doc1: rank 1 in vector (score = 1/61), rank 2 in bm25 (score = 1/62)
+        # doc2: rank 2 in vector (score = 1/62), rank 1 in bm25 (score = 1/61)
+        vector_results = ["doc1", "doc2"]
+        bm25_results = ["doc2", "doc1"]
+
+        fused = reciprocal_rank_fusion(vector_results, bm25_results, k=60)
+
+        # Both should have same score (symmetric)
+        scores = {doc_id: score for doc_id, score in fused}
+        assert abs(scores["doc1"] - scores["doc2"]) < 0.0001
+
+    def test_single_source_doc(self):
+        """Should handle docs appearing in only one list."""
+        from api.services.hybrid_search import reciprocal_rank_fusion
+
+        vector_results = ["doc1", "doc2"]
+        bm25_results = ["doc3", "doc4"]
+
+        fused = reciprocal_rank_fusion(vector_results, bm25_results)
+
+        doc_ids = [doc_id for doc_id, score in fused]
+        assert len(doc_ids) == 4
+        assert set(doc_ids) == {"doc1", "doc2", "doc3", "doc4"}
+
+    def test_empty_lists(self):
+        """Should handle empty lists gracefully."""
+        from api.services.hybrid_search import reciprocal_rank_fusion
+
+        fused = reciprocal_rank_fusion([], [])
+        assert fused == []
+
+        fused = reciprocal_rank_fusion(["doc1"], [])
+        assert len(fused) == 1
+
+    def test_duplicate_handling(self):
+        """Should not double-count duplicates within a list."""
+        from api.services.hybrid_search import reciprocal_rank_fusion
+
+        vector_results = ["doc1", "doc1", "doc2"]  # Duplicate
+        bm25_results = ["doc2"]
+
+        fused = reciprocal_rank_fusion(vector_results, bm25_results)
+
+        # Should handle gracefully (implementation may vary)
+        doc_ids = [doc_id for doc_id, score in fused]
+        assert "doc1" in doc_ids
+        assert "doc2" in doc_ids
+
+
+class TestHybridSearch:
+    """Test the hybrid search integration."""
+
+    @pytest.fixture
+    def temp_db(self):
+        """Create a temporary database file."""
+        with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as f:
+            yield f.name
+        os.unlink(f.name)
+
+    def test_hybrid_search_combines_results(self, temp_db):
+        """Hybrid search should combine vector and BM25 results."""
+        from api.services.hybrid_search import HybridSearch
+        from api.services.bm25_index import BM25Index
+        from unittest.mock import MagicMock
+
+        # Create BM25 index with test data
+        bm25 = BM25Index(db_path=temp_db)
+        bm25.add_document("chunk1", "Q4 budget planning meeting", "Budget.md")
+        bm25.add_document("chunk2", "Team standup notes", "Standup.md")
+        bm25.add_document("chunk3", "Budget review Q4", "Review.md")
+
+        # Mock vector store
+        mock_vector_store = MagicMock()
+        mock_vector_store.search.return_value = [
+            {"id": "chunk2", "content": "Team standup notes", "metadata": {}},
+            {"id": "chunk1", "content": "Q4 budget planning meeting", "metadata": {}},
+        ]
+
+        # Pass mock directly to constructor
+        hybrid = HybridSearch(vector_store=mock_vector_store, bm25_index=bm25)
+        results = hybrid.search("budget", top_k=5)
+
+        # Should return fused results
+        assert len(results) > 0
+        # Budget-related docs should be at top
+        doc_ids = [r.get("id") for r in results]
+        assert "chunk1" in doc_ids or "chunk3" in doc_ids
+
+    def test_hybrid_search_with_recency(self, temp_db):
+        """Recency boost must actually change ranking order.
+
+        Regression test for the silent-no-op bug: the boost read
+        ``metadata['date']`` but vectorstore.search spreads the date to the
+        top-level ``modified_date`` key, so the boost was always 0. This test
+        uses the REAL production result shape and asserts unconditionally — the
+        older, semantically-favored doc must be overtaken by the newer one.
+        """
+        from api.services.hybrid_search import HybridSearch
+        from api.services.bm25_index import BM25Index
+        from unittest.mock import MagicMock
+        from datetime import datetime, timedelta
+
+        bm25 = BM25Index(db_path=temp_db)
+        bm25.add_document("old_chunk", "Budget content old", "Old.md")
+        bm25.add_document("new_chunk", "Budget content new", "New.md")
+
+        old_date = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
+        new_date = datetime.now().strftime("%Y-%m-%d")
+
+        mock_vector_store = MagicMock()
+        # Both equally similar; the OLD one is listed first (better semantic
+        # rank) so only a working recency boost can flip the order. Date is at
+        # the top level, exactly as vectorstore.search returns it.
+        mock_vector_store.search.return_value = [
+            {"id": "old_chunk", "content": "Budget content old", "modified_date": old_date},
+            {"id": "new_chunk", "content": "Budget content new", "modified_date": new_date},
+        ]
+
+        hybrid = HybridSearch(vector_store=mock_vector_store, bm25_index=bm25)
+        results = hybrid.search("budget", top_k=5, use_reranker=False)
+
+        assert len(results) >= 2
+        assert results[0].get("id") == "new_chunk"
+
+    def test_recency_boost_disabled_keeps_semantic_order(self, temp_db):
+        """With recency boost off, the semantically-favored (older) doc stays on
+        top — proves the ordering in the prior test comes from the boost."""
+        from api.services.hybrid_search import HybridSearch
+        from api.services.bm25_index import BM25Index
+        from unittest.mock import MagicMock
+        from datetime import datetime, timedelta
+
+        bm25 = BM25Index(db_path=temp_db)
+        bm25.add_document("old_chunk", "Budget content old", "Old.md")
+        bm25.add_document("new_chunk", "Budget content new", "New.md")
+
+        old_date = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
+        new_date = datetime.now().strftime("%Y-%m-%d")
+        mock_vector_store = MagicMock()
+        mock_vector_store.search.return_value = [
+            {"id": "old_chunk", "content": "Budget content old", "modified_date": old_date},
+            {"id": "new_chunk", "content": "Budget content new", "modified_date": new_date},
+        ]
+
+        hybrid = HybridSearch(vector_store=mock_vector_store, bm25_index=bm25)
+        results = hybrid.search(
+            "budget", top_k=5, use_reranker=False, apply_recency_boost=False
+        )
+        assert results[0].get("id") == "old_chunk"
+
+    def test_hybrid_search_date_range_filter(self, temp_db):
+        """date_from/date_to must drop out-of-window docs (fused path)."""
+        from api.services.hybrid_search import HybridSearch
+        from api.services.bm25_index import BM25Index
+        from unittest.mock import MagicMock
+
+        bm25 = BM25Index(db_path=temp_db)
+        bm25.add_document("jan", "Budget January", "Jan.md", modified_date="2026-01-15")
+        bm25.add_document("jun", "Budget June", "Jun.md", modified_date="2026-06-05")
+
+        mock_vector_store = MagicMock()
+        mock_vector_store.search.return_value = [
+            {"id": "jan", "content": "Budget January", "modified_date": "2026-01-15"},
+            {"id": "jun", "content": "Budget June", "modified_date": "2026-06-05"},
+        ]
+
+        hybrid = HybridSearch(vector_store=mock_vector_store, bm25_index=bm25)
+        results = hybrid.search(
+            "budget", top_k=5, use_reranker=False,
+            date_from="2026-06-01", date_to="2026-06-30",
+        )
+        ids = [r.get("id") for r in results]
+        assert "jun" in ids
+        assert "jan" not in ids
+
+    def test_date_range_filter_vector_only_path(self, temp_db):
+        """Date filtering also applies on the BM25-empty (vector-only) path."""
+        from api.services.hybrid_search import HybridSearch
+        from api.services.bm25_index import BM25Index
+        from unittest.mock import MagicMock
+
+        empty_bm25 = BM25Index(db_path=temp_db)  # no docs → vector-only return
+        mock_vector_store = MagicMock()
+        mock_vector_store.search.return_value = [
+            {"id": "jan", "content": "old", "modified_date": "2026-01-15"},
+            {"id": "jun", "content": "new", "modified_date": "2026-06-05"},
+        ]
+
+        hybrid = HybridSearch(vector_store=mock_vector_store, bm25_index=empty_bm25)
+        results = hybrid.search(
+            "budget", top_k=5, date_from="2026-06-01", date_to="2026-06-30"
+        )
+        ids = [r.get("id") for r in results]
+        assert ids == ["jun"]
+
+    def test_undated_docs_survive_date_filter(self, temp_db):
+        """A doc with no extractable date is never silently dropped by a filter."""
+        from api.services.hybrid_search import HybridSearch
+        from api.services.bm25_index import BM25Index
+        from unittest.mock import MagicMock
+
+        empty_bm25 = BM25Index(db_path=temp_db)
+        mock_vector_store = MagicMock()
+        mock_vector_store.search.return_value = [
+            {"id": "undated", "content": "no date here"},
+        ]
+        hybrid = HybridSearch(vector_store=mock_vector_store, bm25_index=empty_bm25)
+        results = hybrid.search(
+            "budget", top_k=5, date_from="2026-06-01", date_to="2026-06-30"
+        )
+        assert [r.get("id") for r in results] == ["undated"]
+
+    def test_or_fallback_candidates_are_fused_and_keep_match_mode(self, temp_db):
+        """BM25 any-term candidates enter fusion and surface match_mode."""
+        from api.services.hybrid_search import HybridSearch
+        from api.services.bm25_index import BM25Index
+        from unittest.mock import MagicMock
+
+        bm25 = BM25Index(db_path=temp_db)
+        bm25.add_document("only_bm25", "hiring plans", "Hiring.md")
+        bm25.add_document("shared", "roadmap owner", "Roadmap.md")
+        mock_vector_store = MagicMock()
+        mock_vector_store.search.return_value = [
+            {"id": "shared", "content": "roadmap owner", "metadata": {}},
+            {"id": "vec_only", "content": "unrelated", "metadata": {}},
+        ]
+
+        hybrid = HybridSearch(vector_store=mock_vector_store, bm25_index=bm25)
+        # "hiring" and "roadmap" never co-occur, so BM25 answers in OR mode.
+        results = hybrid.search("hiring roadmap", top_k=5)
+
+        by_id = {r["id"]: r for r in results}
+        assert by_id["only_bm25"]["match_mode"] == "or"
+        assert by_id["shared"]["match_mode"] == "or"
+        assert "match_mode" not in by_id["vec_only"]
+        assert by_id["only_bm25"]["rrf_score"] > 0
+
+    def test_bm25_exception_records_degradation(self):
+        """A raising BM25 index degrades to vector-only and records it."""
+        from api.services.hybrid_search import HybridSearch
+        from unittest.mock import MagicMock, patch
+
+        mock_vector_store = MagicMock()
+        mock_vector_store.search.return_value = [
+            {"id": "chunk1", "content": "Test content", "metadata": {}},
+        ]
+        broken_bm25 = MagicMock()
+        broken_bm25.search.side_effect = RuntimeError("index unreadable")
+
+        hybrid = HybridSearch(vector_store=mock_vector_store, bm25_index=broken_bm25)
+        with patch("api.services.service_health.record_degradation") as record:
+            results = hybrid.search("test", top_k=5)
+
+        assert [r["id"] for r in results] == ["chunk1"]
+        record.assert_called_once()
+        assert record.call_args.args[:3] == ("bm25_index", "hybrid_search", "vector_only")
+
+    def test_fallback_to_vector_only(self, temp_db):
+        """Should fallback to vector search if BM25 returns no results."""
+        from api.services.hybrid_search import HybridSearch
+        from api.services.bm25_index import BM25Index
+        from unittest.mock import MagicMock
+
+        mock_vector_store = MagicMock()
+        mock_vector_store.search.return_value = [
+            {"id": "chunk1", "content": "Test content", "metadata": {}},
+        ]
+
+        # Use empty BM25 index (new temp db has no documents)
+        empty_bm25 = BM25Index(db_path=temp_db)
+
+        hybrid = HybridSearch(vector_store=mock_vector_store, bm25_index=empty_bm25)
+        results = hybrid.search("test", top_k=5)
+
+        assert len(results) == 1
+        assert results[0]["id"] == "chunk1"
+
+
+class TestHybridBenchmark:
+    """Benchmark tests for hybrid retrieval quality."""
+
+    BENCHMARK_QUERIES = [
+        # Exact match queries (should improve with BM25)
+        ("Q4 budget", "exact term match"),
+        ("ML infrastructure", "folder/topic match"),
+        ("Alex", "exact name match"),
+
+        # Semantic queries (should stay good with vector)
+        ("what are my priorities", "conceptual query"),
+        ("meeting preparation", "semantic similarity"),
+    ]
+
+    @pytest.fixture
+    def temp_db(self):
+        """Create a temporary database file."""
+        with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as f:
+            yield f.name
+        os.unlink(f.name)
+
+    def test_exact_match_improvement(self, temp_db):
+        """BM25 should improve exact match queries."""
+        from api.services.bm25_index import BM25Index
+
+        bm25 = BM25Index(db_path=temp_db)
+
+        # Add test documents
+        bm25.add_document("doc1", "Q4 budget planning for next fiscal year", "Q4 Budget.md")
+        bm25.add_document("doc2", "Annual financial review and forecasting", "Finance.md")
+        bm25.add_document("doc3", "Q4 budget approval process", "Budget Approval.md")
+
+        # Exact match query
+        results = bm25.search("Q4 budget")
+
+        # Should find exact matches
+        assert len(results) >= 2
+        doc_ids = [r["doc_id"] for r in results]
+        assert "doc1" in doc_ids
+        assert "doc3" in doc_ids
+
+    def test_name_match_improvement(self, temp_db):
+        """BM25 should find exact name matches."""
+        from api.services.bm25_index import BM25Index
+
+        bm25 = BM25Index(db_path=temp_db)
+
+        bm25.add_document("doc1", "Meeting with leadership team", "Meeting.md", people=["Alex", "Sarah"])
+        bm25.add_document("doc2", "1:1 discussion about roadmap", "1on1.md", people=["Kevin"])
+        bm25.add_document("doc3", "Alex mentioned the new strategy", "Notes.md")
+
+        results = bm25.search("Alex")
+
+        # Should find both docs mentioning Alex
+        assert len(results) >= 2
+        doc_ids = [r["doc_id"] for r in results]
+        assert "doc1" in doc_ids
+        assert "doc3" in doc_ids
+
+
+class TestChunkDeduplication:
+    """Test overlapping chunk deduplication (P9.3)."""
+
+    def test_removes_adjacent_chunks(self):
+        """Should remove adjacent chunks from same file, keeping higher scored."""
+        from api.services.hybrid_search import deduplicate_overlapping_chunks
+
+        results = [
+            {"id": "/path/file.md::0", "file_path": "/path/file.md", "hybrid_score": 0.9, "metadata": {"chunk_index": 0}},
+            {"id": "/path/file.md::1", "file_path": "/path/file.md", "hybrid_score": 0.8, "metadata": {"chunk_index": 1}},
+            {"id": "/path/other.md::0", "file_path": "/path/other.md", "hybrid_score": 0.7, "metadata": {"chunk_index": 0}},
+        ]
+
+        deduplicated = deduplicate_overlapping_chunks(results)
+
+        # chunk 1 from file.md should be removed (adjacent to chunk 0)
+        assert len(deduplicated) == 2
+        doc_ids = [r["id"] for r in deduplicated]
+        assert "/path/file.md::0" in doc_ids
+        assert "/path/other.md::0" in doc_ids
+        assert "/path/file.md::1" not in doc_ids
+
+    def test_keeps_non_adjacent_chunks(self):
+        """Should keep chunks that are not adjacent."""
+        from api.services.hybrid_search import deduplicate_overlapping_chunks
+
+        results = [
+            {"id": "/path/file.md::0", "file_path": "/path/file.md", "hybrid_score": 0.9, "metadata": {"chunk_index": 0}},
+            {"id": "/path/file.md::5", "file_path": "/path/file.md", "hybrid_score": 0.8, "metadata": {"chunk_index": 5}},
+        ]
+
+        deduplicated = deduplicate_overlapping_chunks(results)
+
+        # Both should be kept (not adjacent)
+        assert len(deduplicated) == 2
+
+    def test_handles_underscore_id_format(self):
+        """Should extract chunk index from underscore format IDs."""
+        from api.services.hybrid_search import deduplicate_overlapping_chunks
+
+        results = [
+            {"id": "/path/file.md_0", "file_path": "/path/file.md", "hybrid_score": 0.9, "metadata": {}},
+            {"id": "/path/file.md_1", "file_path": "/path/file.md", "hybrid_score": 0.8, "metadata": {}},
+        ]
+
+        deduplicated = deduplicate_overlapping_chunks(results)
+
+        # Second chunk should be removed (adjacent)
+        assert len(deduplicated) == 1
+        assert deduplicated[0]["id"] == "/path/file.md_0"
+
+    def test_handles_empty_results(self):
+        """Should return empty list for empty input."""
+        from api.services.hybrid_search import deduplicate_overlapping_chunks
+
+        deduplicated = deduplicate_overlapping_chunks([])
+        assert deduplicated == []
+
+    def test_handles_missing_file_path(self):
+        """Should include results without file_path."""
+        from api.services.hybrid_search import deduplicate_overlapping_chunks
+
+        results = [
+            {"id": "chunk1", "content": "test", "hybrid_score": 0.9, "metadata": {}},
+            {"id": "chunk2", "content": "test2", "hybrid_score": 0.8, "metadata": {}},
+        ]
+
+        deduplicated = deduplicate_overlapping_chunks(results)
+
+        # Both should be kept (no file_path to check)
+        assert len(deduplicated) == 2
+
+    def test_uses_metadata_file_path(self):
+        """Should fall back to metadata.file_path if top-level missing."""
+        from api.services.hybrid_search import deduplicate_overlapping_chunks
+
+        results = [
+            {"id": "chunk1", "metadata": {"file_path": "/path/file.md", "chunk_index": 0}, "hybrid_score": 0.9},
+            {"id": "chunk2", "metadata": {"file_path": "/path/file.md", "chunk_index": 1}, "hybrid_score": 0.8},
+        ]
+
+        deduplicated = deduplicate_overlapping_chunks(results)
+
+        # Second chunk should be removed (adjacent)
+        assert len(deduplicated) == 1
+
+
+class TestVectorFusionIdentity:
+    """HybridSearch fuses a chunk found by both vector and BM25 search into
+    one result, carrying semantic_score and vector-only metadata, by
+    matching each side's id through ``vector_fusion_id``. Vector chunks are
+    stored as "{file_path}::{chunk_index}"; BM25 stores the same logical
+    chunk as "{resolved_path}_{chunk_index}". ``vector_fusion_id`` maps the
+    former to the latter by splitting on the LAST "::" only (the separator
+    ``add_document`` appends), never a blind global replace, so a path
+    containing "::" or "_" is handled correctly.
+
+    Tests above (``test_hybrid_search_with_recency`` etc.) mock vector ids
+    as plain strings like "old_chunk" that already match their BM25
+    counterpart. Every test below instead uses the real id formats both
+    indexers actually produce.
+    """
+
+    @pytest.fixture
+    def temp_db(self):
+        with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as f:
+            yield f.name
+        os.unlink(f.name)
+
+    # -- vector_fusion_id unit coverage -----------------------------------
+
+    def test_fusion_id_normalizes_chunk_zero(self):
+        from api.services.hybrid_search import vector_fusion_id
+        assert vector_fusion_id("/vault/Notes.md::0") == "/vault/Notes.md_0"
+
+    def test_fusion_id_normalizes_a_later_chunk(self):
+        from api.services.hybrid_search import vector_fusion_id
+        assert vector_fusion_id("/vault/Notes.md::12") == "/vault/Notes.md_12"
+
+    def test_fusion_id_preserves_double_colon_inside_the_filename(self):
+        """Only the LAST "::" (the deliberate separator) is split on, so a
+        filename that itself contains "::" is never corrupted -- a global
+        str.replace("::", "_") would wrongly rewrite both occurrences."""
+        from api.services.hybrid_search import vector_fusion_id
+        assert vector_fusion_id("/vault/Section::Notes.md::3") == "/vault/Section::Notes.md_3"
+
+    def test_fusion_id_preserves_underscore_inside_the_filename(self):
+        from api.services.hybrid_search import vector_fusion_id
+        assert vector_fusion_id("/vault/Q4_Report.md::0") == "/vault/Q4_Report.md_0"
+
+    def test_fusion_id_leaves_a_non_numeric_suffix_unchanged(self):
+        """No vector chunk is ever stored with a non-numeric suffix today
+        (summary records are BM25-only), but a non-numeric trailing segment
+        after "::" has nothing safe to normalize, so it is left as-is
+        rather than guessing."""
+        from api.services.hybrid_search import vector_fusion_id
+        assert vector_fusion_id("/vault/Doc.md::summary") == "/vault/Doc.md::summary"
+
+    def test_fusion_id_leaves_an_id_without_a_separator_unchanged(self):
+        from api.services.hybrid_search import vector_fusion_id
+        assert vector_fusion_id("no-separator-here") == "no-separator-here"
+
+    # -- integration: fusion + metadata retention with real id formats ----
+
+    def test_semantic_score_and_metadata_survive_when_bm25_also_matches(self, temp_db):
+        """semantic_score and vector-only metadata (note_type) must survive
+        fusion when BM25 also returns a match for the same logical chunk —
+        the two id representations fuse into exactly one result, sourced
+        from the vector side, regardless of which side's own recency date
+        is more recent (the BM25 side is deliberately given the more
+        recent date here specifically to rule that out as a factor).
+        """
+        from api.services.hybrid_search import HybridSearch
+        from api.services.bm25_index import BM25Index
+        from unittest.mock import MagicMock
+        from datetime import datetime, timedelta
+
+        file_path = "/vault/Budget Review.md"
+        bm25 = BM25Index(db_path=temp_db)
+        bm25.add_document(
+            f"{file_path}_0", "Q4 budget planning meeting", "Budget Review.md",
+            modified_date=datetime.now().strftime("%Y-%m-%d"),
+        )
+
+        mock_vector_store = MagicMock()
+        mock_vector_store.search.return_value = [{
+            "id": f"{file_path}::0",  # the actual Chroma-native format
+            "content": "Q4 budget planning meeting",
+            "file_path": file_path,
+            "file_name": "Budget Review.md",
+            "note_type": "Work",
+            "modified_date": (datetime.now() - timedelta(days=1000)).strftime("%Y-%m-%d"),
+            "semantic_score": 0.87,
+            "recency_score": 0.5,
+            "chunk_index": 0,
+        }]
+
+        hybrid = HybridSearch(vector_store=mock_vector_store, bm25_index=bm25)
+        results = hybrid.search("budget", top_k=5, use_reranker=False)
+
+        assert len(results) == 1, "the same logical chunk found by both indexes must fuse into ONE result"
+        assert results[0].get("semantic_score") == 0.87, "semantic score must survive when BM25 also matches"
+        assert results[0].get("note_type") == "Work", "vector-only metadata must survive when BM25 also matches"
+        # Both lists rank this chunk #1 (only candidate in each), so a TRUE
+        # fusion accumulates both contributions: 1/(60+1) + 1/(60+1) = 2/61.
+        # A single unfused representation would show only one list's
+        # contribution (1/61).
+        assert results[0].get("rrf_score") == pytest.approx(2 / 61), (
+            "the same chunk must accumulate rank contributions from both lists"
+        )
+
+    def test_distinct_chunks_of_the_same_file_do_not_incorrectly_fuse(self, temp_db):
+        """Two DIFFERENT (non-adjacent, so overlap dedup doesn't also
+        remove one) chunks of the same file must never collapse into one
+        result just because they share a file_path prefix."""
+        from api.services.hybrid_search import HybridSearch
+        from api.services.bm25_index import BM25Index
+        from unittest.mock import MagicMock
+
+        file_path = "/vault/Notes.md"
+        bm25 = BM25Index(db_path=temp_db)
+        bm25.add_document(f"{file_path}_0", "chunk zero content", "Notes.md")
+        bm25.add_document(f"{file_path}_5", "chunk five content", "Notes.md")
+
+        mock_vector_store = MagicMock()
+        mock_vector_store.search.return_value = [
+            {"id": f"{file_path}::0", "content": "chunk zero content", "file_path": file_path, "semantic_score": 0.9, "chunk_index": 0},
+            {"id": f"{file_path}::5", "content": "chunk five content", "file_path": file_path, "semantic_score": 0.8, "chunk_index": 5},
+        ]
+        hybrid = HybridSearch(vector_store=mock_vector_store, bm25_index=bm25)
+        results = hybrid.search("chunk content", top_k=5, use_reranker=False)
+
+        ids = {r["id"] for r in results}
+        assert ids == {f"{file_path}::0", f"{file_path}::5"}
+
+    def test_vector_only_match_retains_metadata_when_bm25_has_unrelated_results(self, temp_db):
+        """A chunk found ONLY by vector search (absent from BM25's result
+        set entirely) must still surface with its semantic score and
+        metadata intact, even though BM25 found OTHER, different chunks
+        for the SAME query — i.e. this must actually exercise the fusion
+        branch, not accidentally take the "no BM25 results at all" early
+        return (``HybridSearch.search``'s ``if not bm25_doc_ids: return
+        vector_results[:top_k]`` path), which would prove nothing about
+        fusion."""
+        from api.services.hybrid_search import HybridSearch
+        from api.services.bm25_index import BM25Index
+        from unittest.mock import MagicMock
+
+        vector_only_path = "/vault/Semantic Only.md"
+        bm25_path = "/vault/Keyword Match.md"
+        bm25 = BM25Index(db_path=temp_db)
+        bm25.add_document(f"{bm25_path}_0", "keyword heavy content", "Keyword Match.md")
+
+        mock_vector_store = MagicMock()
+        mock_vector_store.search.return_value = [{
+            "id": f"{vector_only_path}::0",
+            "content": "conceptually related content",
+            "file_path": vector_only_path,
+            "semantic_score": 0.91,
+            "note_type": "Personal",
+            "chunk_index": 0,
+        }]
+        hybrid = HybridSearch(vector_store=mock_vector_store, bm25_index=bm25)
+        results = hybrid.search("keyword content", top_k=5, use_reranker=False)
+
+        ids = {r["id"] for r in results}
+        assert f"{bm25_path}_0" in ids, "the BM25 branch must actually be exercised (nonempty), not the vector-only early return"
+
+        vector_only_result = next(r for r in results if r["id"] == f"{vector_only_path}::0")
+        assert vector_only_result["semantic_score"] == 0.91
+        assert vector_only_result["note_type"] == "Personal"
+
+    def test_summary_id_stays_bm25_only_and_never_falsely_fuses(self, temp_db):
+        """Summary chunks exist only in BM25 (an "::summary" suffix; they
+        are never indexed into the vector store — see
+        IndexerService.index_file) and must never be mistaken for a
+        numbered vector chunk of the same file. The query is chosen to
+        match BOTH BM25 documents under BM25Index's own OR semantics
+        (each document contributes distinct terms), so this genuinely
+        exercises the fusion branch for the real chunk while the summary
+        stays a real, independent BM25 hit alongside it."""
+        from api.services.hybrid_search import HybridSearch
+        from api.services.bm25_index import BM25Index
+        from unittest.mock import MagicMock
+
+        file_path = "/vault/Doc.md"
+        bm25 = BM25Index(db_path=temp_db)
+        bm25.add_document(f"{file_path}::summary", "a generated summary of the document", "Doc.md")
+        bm25.add_document(f"{file_path}_0", "the real chunk content", "Doc.md")
+
+        mock_vector_store = MagicMock()
+        mock_vector_store.search.return_value = [{
+            "id": f"{file_path}::0", "content": "the real chunk content",
+            "file_path": file_path, "semantic_score": 0.8, "chunk_index": 0,
+        }]
+        hybrid = HybridSearch(vector_store=mock_vector_store, bm25_index=bm25)
+        results = hybrid.search("summary document chunk content", top_k=5, use_reranker=False)
+
+        ids = {r["id"] for r in results}
+        assert f"{file_path}::summary" in ids, "the BM25-only summary result must survive, unfused"
+        real_chunk = next(r for r in results if r["id"] == f"{file_path}::0")
+        assert real_chunk["semantic_score"] == 0.8, "the numbered chunk must still fuse and keep its semantic score"
+
+    def test_summary_file_path_not_corrupted_when_filename_contains_underscore(self, temp_db):
+        """A summary id whose filename itself contains an underscore
+        ("/vault/my_note.md::summary") must resolve to the full filename,
+        not get cut at the underscore inside it."""
+        from api.services.hybrid_search import HybridSearch
+        from api.services.bm25_index import BM25Index
+        from unittest.mock import MagicMock
+
+        file_path = "/vault/my_note.md"
+        bm25 = BM25Index(db_path=temp_db)
+        bm25.add_document(f"{file_path}::summary", "a generated summary of my note", "my_note.md")
+
+        empty_vector_store = MagicMock()
+        empty_vector_store.search.return_value = []
+        hybrid = HybridSearch(vector_store=empty_vector_store, bm25_index=bm25)
+        results = hybrid.search("generated summary", top_k=5, use_reranker=False)
+
+        assert len(results) == 1
+        assert results[0]["file_path"] == file_path
+        assert results[0]["metadata"]["file_path"] == file_path
+
+    def test_fusion_handles_a_filename_containing_an_underscore(self, temp_db):
+        from api.services.hybrid_search import HybridSearch
+        from api.services.bm25_index import BM25Index
+        from unittest.mock import MagicMock
+
+        file_path = "/vault/Q4_Report.md"  # the filename itself contains an underscore
+        bm25 = BM25Index(db_path=temp_db)
+        bm25.add_document(f"{file_path}_0", "quarterly numbers", "Q4_Report.md")
+
+        mock_vector_store = MagicMock()
+        mock_vector_store.search.return_value = [{
+            "id": f"{file_path}::0", "content": "quarterly numbers",
+            "file_path": file_path, "semantic_score": 0.75, "chunk_index": 0,
+        }]
+        hybrid = HybridSearch(vector_store=mock_vector_store, bm25_index=bm25)
+        results = hybrid.search("quarterly", top_k=5, use_reranker=False)
+
+        assert len(results) == 1
+        assert results[0]["semantic_score"] == 0.75
+
+    def test_recency_changes_ordering_with_the_actual_vector_id_format(self, temp_db):
+        """Same pairwise-recency proof as test_hybrid_search_with_recency /
+        test_recency_boost_disabled_keeps_semantic_order above, but with
+        BOTH documents present in BOTH indexes using their real,
+        differently-formatted ids — proving the id-fusion fix and the
+        recency boost compose correctly, not just each in isolation.
+
+        The second (unboosted) call is the mutation check: if recency
+        boosting silently became a no-op, the FIRST assertion below would
+        fail (the older, semantically-favored-by-listing-order doc would
+        stay on top), so this test only passes when recency demonstrably
+        changes the ordering.
+        """
+        from api.services.hybrid_search import HybridSearch
+        from api.services.bm25_index import BM25Index
+        from unittest.mock import MagicMock
+        from datetime import datetime, timedelta
+
+        old_path, new_path = "/vault/Old.md", "/vault/New.md"
+        bm25 = BM25Index(db_path=temp_db)
+        bm25.add_document(f"{old_path}_0", "Budget content old", "Old.md")
+        bm25.add_document(f"{new_path}_0", "Budget content new", "New.md")
+
+        old_date = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
+        new_date = datetime.now().strftime("%Y-%m-%d")
+        mock_vector_store = MagicMock()
+        mock_vector_store.search.return_value = [
+            {"id": f"{old_path}::0", "content": "Budget content old", "file_path": old_path, "modified_date": old_date, "chunk_index": 0},
+            {"id": f"{new_path}::0", "content": "Budget content new", "file_path": new_path, "modified_date": new_date, "chunk_index": 0},
+        ]
+        hybrid = HybridSearch(vector_store=mock_vector_store, bm25_index=bm25)
+
+        boosted = hybrid.search("budget", top_k=5, use_reranker=False, apply_recency_boost=True)
+        assert boosted[0]["id"] == f"{new_path}::0", "recency boost must promote the newer, equally-relevant doc"
+
+        unboosted = hybrid.search("budget", top_k=5, use_reranker=False, apply_recency_boost=False)
+        assert unboosted[0]["id"] == f"{old_path}::0", (
+            "mutation check: without the boost, the doc listed first (better raw rank) must stay on "
+            "top — proving the boosted assertion above actually depends on recency, not coincidence"
+        )
+
+
+class TestQueryAwareReranking:
+    """Test query-aware reranking in hybrid search."""
+
+    @pytest.fixture
+    def temp_db(self):
+        """Create a temporary database file."""
+        with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as f:
+            yield f.name
+        os.unlink(f.name)
+
+    def test_factual_query_preserves_bm25_matches(self, temp_db):
+        """Factual queries should preserve top BM25 exact matches."""
+        from api.services.hybrid_search import HybridSearch, find_protected_indices
+        from api.services.bm25_index import BM25Index
+        from unittest.mock import MagicMock
+
+        bm25 = BM25Index(db_path=temp_db)
+        bm25.add_document("jane_ktn", "Jane's KTN: TT11YZS7J", "Jane.md")
+        bm25.add_document("travel_1", "General travel tips", "Travel.md")
+        bm25.add_document("travel_2", "Airport information", "Airport.md")
+
+        mock_vector_store = MagicMock()
+        mock_vector_store.search.return_value = [
+            {"id": "travel_1", "content": "General travel tips", "metadata": {}},
+            {"id": "travel_2", "content": "Airport information", "metadata": {}},
+            {"id": "jane_ktn", "content": "Jane's KTN: TT11YZS7J", "metadata": {}},
+        ]
+
+        HybridSearch(vector_store=mock_vector_store, bm25_index=bm25)
+
+        # find_protected_indices should identify Jane.md for factual query
+        results = [
+            {"id": "jane_ktn", "content": "Jane's KTN: TT11YZS7J"},
+            {"id": "travel_1", "content": "General travel tips"},
+        ]
+        protected = find_protected_indices("Jane's KTN", results, max_protected=3)
+
+        # Should protect the exact match
+        assert 0 in protected
+
+    def test_semantic_query_no_protection(self, temp_db):
+        """Semantic queries should not protect any results."""
+        from api.services.hybrid_search import find_protected_indices
+
+        results = [
+            {"id": "doc1", "content": "Meeting with Sarah about project"},
+            {"id": "doc2", "content": "Sarah's feedback on design"},
+        ]
+
+        protected = find_protected_indices(
+            "prepare me for meeting with Sarah",
+            results,
+            max_protected=3
+        )
+
+        # Semantic query = no protection
+        assert len(protected) == 0
+
+    def test_find_protected_indices_checks_content(self, temp_db):
+        """Should only protect results that contain query keywords."""
+        from api.services.hybrid_search import find_protected_indices
+
+        results = [
+            {"id": "doc1", "content": "Random unrelated content"},
+            {"id": "doc2", "content": "Alex's phone: 555-1234"},
+            {"id": "doc3", "content": "More unrelated stuff"},
+        ]
+
+        protected = find_protected_indices("Alex's phone", results, max_protected=3)
+
+        # Should only protect doc2 (contains "Alex" and "phone")
+        assert 1 in protected
+        assert 0 not in protected
+        assert 2 not in protected
+
+
+class TestSearchAttribution:
+    """Each search records the tool query and per-arm attribution of the
+    returned results in a ``search_attribution`` span, and tags every result
+    with ``found_by``."""
+
+    @pytest.fixture
+    def temp_db(self):
+        with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as f:
+            yield f.name
+        os.unlink(f.name)
+
+    @pytest.fixture
+    def trace(self):
+        from api.services import perf_trace
+        t = perf_trace.start_trace("conv", "synthetic question", "test")
+        yield t
+        perf_trace._current_trace.set(None)
+
+    @staticmethod
+    def _attribution_span(trace):
+        spans = [s for s in trace.spans if s.name == "search_attribution"]
+        assert len(spans) == 1
+        assert spans[0].parent == "tool_search_vault"
+        return spans[0].metadata
+
+    @staticmethod
+    def _vector_store(ids):
+        from unittest.mock import MagicMock
+        store = MagicMock()
+        store.search.return_value = [
+            {"id": i, "content": f"content {i}", "metadata": {}} for i in ids
+        ]
+        return store
+
+    def _bm25(self, temp_db):
+        from api.services.bm25_index import BM25Index
+        bm25 = BM25Index(db_path=temp_db)
+        bm25.add_document("both_chunk", "zebra budget notes", "Both.md")
+        bm25.add_document("bm25_chunk", "zebra budget ledger", "Bm25.md")
+        return bm25
+
+    def test_found_by_and_span_metadata(self, temp_db, trace):
+        from api.services.hybrid_search import HybridSearch
+        hybrid = HybridSearch(
+            vector_store=self._vector_store(["both_chunk", "vec_chunk"]),
+            bm25_index=self._bm25(temp_db),
+        )
+        results = hybrid.search("zebra budget", top_k=10, use_reranker=False)
+
+        found_by = {r["id"]: r["found_by"] for r in results}
+        assert found_by == {"both_chunk": "both", "vec_chunk": "vector", "bm25_chunk": "bm25"}
+
+        meta = self._attribution_span(trace)
+        assert meta["query"] == "zebra budget"
+        assert meta["vector_candidates"] == 2
+        assert meta["bm25_candidates"] == 2
+        assert meta["bm25_match_mode"] == {"and": 2}
+        assert meta["attribution"] == {"vector_only": 1, "bm25_only": 1, "both": 1}
+        assert meta["top_k"] == 10
+
+    def test_or_fallback_mode_is_recorded(self, temp_db, trace):
+        from api.services.hybrid_search import HybridSearch
+        hybrid = HybridSearch(
+            vector_store=self._vector_store(["vec_chunk"]),
+            bm25_index=self._bm25(temp_db),
+        )
+        hybrid.search("zebra nonexistentterm", top_k=10, use_reranker=False)
+        assert self._attribution_span(trace)["bm25_match_mode"] == {"or": 2}
+
+    def test_mixed_match_modes_are_counted(self, trace):
+        from unittest.mock import MagicMock
+        from api.services.hybrid_search import HybridSearch
+        bm25 = MagicMock()
+        bm25.search.return_value = [
+            {"doc_id": "a", "content": "a", "file_name": "A.md", "match_mode": "and"},
+            {"doc_id": "b", "content": "b", "file_name": "B.md", "match_mode": "or"},
+            {"doc_id": "c", "content": "c", "file_name": "C.md", "match_mode": "or"},
+        ]
+        hybrid = HybridSearch(vector_store=self._vector_store(["a"]), bm25_index=bm25)
+        hybrid.search("anything", top_k=10, use_reranker=False)
+        meta = self._attribution_span(trace)
+        assert meta["bm25_match_mode"] == {"and": 1, "or": 2}
+        assert meta["bm25_candidates"] == 3
+
+    def test_vector_only_early_return_records_attribution(self, temp_db, trace):
+        from api.services.hybrid_search import HybridSearch
+        hybrid = HybridSearch(
+            vector_store=self._vector_store(["v1", "v2", "v3"]),
+            bm25_index=self._bm25(temp_db),
+        )
+        results = hybrid.search("qqqunmatched", top_k=2, use_reranker=False)
+
+        assert [r["found_by"] for r in results] == ["vector", "vector"]
+        meta = self._attribution_span(trace)
+        assert meta["bm25_candidates"] == 0
+        assert meta["vector_candidates"] == 3
+        assert meta["bm25_match_mode"] == "none"
+        assert meta["attribution"] == {"vector_only": 2, "bm25_only": 0, "both": 0}
+        assert meta["top_k"] == 2
+
+    def test_bm25_error_is_recorded(self, trace):
+        from unittest.mock import MagicMock
+        from api.services.hybrid_search import HybridSearch
+        bm25 = MagicMock()
+        bm25.search.side_effect = RuntimeError("boom")
+        hybrid = HybridSearch(vector_store=self._vector_store(["v1"]), bm25_index=bm25)
+        results = hybrid.search("anything", top_k=5, use_reranker=False)
+
+        assert results[0]["found_by"] == "vector"
+        meta = self._attribution_span(trace)
+        assert meta["bm25_match_mode"] == "error"
+        assert meta["attribution"]["vector_only"] == 1
+
+    def test_attribution_counts_only_returned_results(self, temp_db, trace):
+        """Attribution covers the list actually returned, after truncation."""
+        from api.services.hybrid_search import HybridSearch
+        hybrid = HybridSearch(
+            vector_store=self._vector_store(["both_chunk", "vec_chunk"]),
+            bm25_index=self._bm25(temp_db),
+        )
+        results = hybrid.search("zebra budget", top_k=1, use_reranker=False)
+
+        assert len(results) == 1
+        meta = self._attribution_span(trace)
+        assert sum(meta["attribution"].values()) == 1
+
+    def test_attribution_counts_after_rerank(self, temp_db, trace, monkeypatch):
+        """When the reranker truncates, attribution follows the reranked list."""
+        from unittest.mock import MagicMock
+        from api.services import reranker as reranker_mod
+        from api.services.hybrid_search import HybridSearch
+
+        hybrid = HybridSearch(
+            vector_store=self._vector_store(["both_chunk", "vec_chunk"]),
+            bm25_index=self._bm25(temp_db),
+        )
+        fake = MagicMock()
+        # Keep only the vector-only result, whatever the fused order was.
+        fake.rerank.side_effect = lambda query, results, top_k, **kw: [
+            r for r in results if r["found_by"] == "vector"
+        ][:top_k]
+        monkeypatch.setattr(reranker_mod, "get_reranker", lambda: fake)
+
+        results = hybrid.search("zebra budget", top_k=1, use_reranker=True)
+        assert [r["found_by"] for r in results] == ["vector"]
+        assert self._attribution_span(trace)["attribution"] == {
+            "vector_only": 1, "bm25_only": 0, "both": 0,
+        }
+
+    def test_metadata_round_trips_through_trace_store(self, temp_db, trace, tmp_path):
+        from api.services.hybrid_search import HybridSearch
+        from api.services.perf_trace import PerfTraceStore
+        hybrid = HybridSearch(
+            vector_store=self._vector_store(["both_chunk"]),
+            bm25_index=self._bm25(temp_db),
+        )
+        hybrid.search("zebra budget", top_k=5, use_reranker=False)
+
+        store = PerfTraceStore(str(tmp_path / "traces.db"))
+        store.save_trace(trace)
+        saved = store.get_trace(trace.trace_id)
+        spans = [s for s in saved["spans"] if s["name"] == "search_attribution"]
+        assert spans[0]["metadata"]["attribution"] == {
+            "vector_only": 0, "bm25_only": 1, "both": 1,
+        }
+        assert spans[0]["metadata"]["query"] == "zebra budget"
+
+    def test_no_active_trace_leaves_behaviour_unchanged(self, temp_db):
+        from api.services import perf_trace
+        from api.services.hybrid_search import HybridSearch
+        perf_trace._current_trace.set(None)
+        hybrid = HybridSearch(
+            vector_store=self._vector_store(["both_chunk"]),
+            bm25_index=self._bm25(temp_db),
+        )
+        results = hybrid.search("zebra budget", top_k=5, use_reranker=False)
+        assert {r["found_by"] for r in results} == {"both", "bm25"}
