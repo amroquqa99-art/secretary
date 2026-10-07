@@ -29,7 +29,8 @@
         "embedding": 1.19,
         "reranker": 1.19
       },
-      "hardware_note": "First candidate for the 6 GB VRAM profile; benchmark latency and peak memory before making it a default."
+      "hardware_note": "First candidate for the 6 GB VRAM profile; benchmark latency and peak memory before making it a default.",
+      "min_sentence_transformers": "5.4.0"
     },
     "bge_m3": {
       "description": "Heavier multilingual reference candidate with long-context embedding and a multilingual cross-encoder.",
