@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+from importlib import metadata
 import math
 import os
 import tempfile
@@ -70,6 +72,9 @@ def apply_profile(args: argparse.Namespace) -> argparse.Namespace:
             args.modes = profile.get("modes", "bm25")
         if args.query_template is None:
             args.query_template = profile.get("query_template", "{query}")
+        args.min_sentence_transformers = profile.get("min_sentence_transformers")
+    if not hasattr(args, "min_sentence_transformers"):
+        args.min_sentence_transformers = None
     if args.modes is None:
         args.modes = "bm25"
     if args.query_template is None:
@@ -81,6 +86,27 @@ def apply_profile(args: argparse.Namespace) -> argparse.Namespace:
 
 def format_query(query: str, template: str) -> str:
     return template.replace("{query}", query)
+
+
+def _version_tuple(value: str) -> tuple[int, ...]:
+    parts = [int(part) for part in re.findall(r"\\d+", value)]
+    return tuple(parts[:3])
+
+
+def require_sentence_transformers(minimum: str | None) -> None:
+    if not minimum:
+        return
+    try:
+        installed = metadata.version("sentence-transformers")
+    except metadata.PackageNotFoundError as exc:
+        raise SystemExit(
+            f"sentence-transformers>={minimum} is required by this profile"
+        ) from exc
+    if _version_tuple(installed) < _version_tuple(minimum):
+        raise SystemExit(
+            f"sentence-transformers>={minimum} is required by this profile; "
+            f"found {installed}"
+        )
 
 
 def validate_dataset(data: dict) -> None:
@@ -318,6 +344,8 @@ def main() -> int:
     unknown = modes - {"bm25", "vector", "hybrid", "rerank"}
     if unknown:
         raise SystemExit(f"unknown modes: {', '.join(sorted(unknown))}")
+    if {"vector", "hybrid", "rerank"} & modes:
+        require_sentence_transformers(args.min_sentence_transformers)
     if {"vector", "hybrid", "rerank"} & modes and not args.embedding_model:
         raise SystemExit("--embedding-model is required for vector/hybrid/rerank")
     if "rerank" in modes and not args.reranker_model:
