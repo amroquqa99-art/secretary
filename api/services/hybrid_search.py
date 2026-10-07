@@ -55,7 +55,7 @@ def _search_tokens(text: str) -> list[str]:
         ch for ch in folded if unicodedata.category(ch) != "Mn"
     )
     folded = re.sub(r"['’]s\\b", "", folded)
-    return re.findall(r"[^\\W_]+", folded, flags=re.UNICODE)
+    return re.findall(r"[^\W_]+", folded, flags=re.UNICODE)
 
 
 def find_protected_indices(
