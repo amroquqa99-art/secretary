@@ -59,7 +59,7 @@ class _SequentialAsyncClient:
 
 def _done(finish_reason, *, prompt=0, completion=0):
     # Several OpenAI-compatible providers emit a literal null delta in the
-    # terminal choice. This shape reproduced the NoneType.get failure.
+    # terminal choice. The client must treat that shape as an empty delta.
     return {
         "choices": [{"delta": None, "finish_reason": finish_reason}],
         "usage": {
