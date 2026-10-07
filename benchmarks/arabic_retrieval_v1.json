@@ -1,0 +1,373 @@
+{
+  "version": 1,
+  "name": "LifeOS Arabic Retrieval Benchmark v1",
+  "description": "Synthetic multilingual retrieval set with no personal, credential, financial, or medical data.",
+  "documents": [
+    {
+      "id": "d01",
+      "title": "اجتماع مشروع أطلس",
+      "language": "ar",
+      "text": "اجتماع مشروع أطلس يوم الثلاثاء الساعة الرابعة مساءً لمراجعة الواجهة وخطة التنفيذ."
+    },
+    {
+      "id": "d02",
+      "title": "Atlas design review",
+      "language": "en",
+      "text": "The Atlas design review covers navigation, accessibility, and the implementation sequence."
+    },
+    {
+      "id": "d03",
+      "title": "خطة مشروع نور",
+      "language": "ar",
+      "text": "مشروع نور يحتاج إنهاء التصميم الأولي ثم مراجعة تجربة المستخدم قبل بدء البرمجة."
+    },
+    {
+      "id": "d04",
+      "title": "Nour project deployment",
+      "language": "en",
+      "text": "The Nour project deployment is planned after QA approval and the security review."
+    },
+    {
+      "id": "d05",
+      "title": "مرجع إصدار البناء",
+      "language": "ar",
+      "text": "معرّف نسخة البناء التجريبية هو BUILD-77Q9، ويستخدم فقط لربط نتائج الاختبار بالإصدار."
+    },
+    {
+      "id": "d06",
+      "title": "Build troubleshooting",
+      "language": "en",
+      "text": "Build troubleshooting: inspect the failing workflow, compare logs, then verify the fix with regression tests."
+    },
+    {
+      "id": "d07",
+      "title": "ملاحظات اجتماع الجامعة",
+      "language": "ar",
+      "text": "ناقشنا في اجتماع الجامعة مشروع التشريح، تقسيم المهام، وموعد تسليم التقرير النهائي."
+    },
+    {
+      "id": "d08",
+      "title": "Anatomy study checklist",
+      "language": "en",
+      "text": "Anatomy study checklist: atlas review, identification cards, and practical-station practice."
+    },
+    {
+      "id": "d09",
+      "title": "مهمة شراء شاشة",
+      "language": "ar",
+      "text": "لازم أشتري شاشة 24 بوصة مناسبة للبرمجة، ويفضل تكون IPS وبدقة 1080p على الأقل."
+    },
+    {
+      "id": "d10",
+      "title": "Monitor calibration",
+      "language": "en",
+      "text": "Monitor calibration notes for creative work: use a neutral white point and avoid excessive sharpening."
+    },
+    {
+      "id": "d11",
+      "title": "نسخة احتياطية تجريبية",
+      "language": "ar",
+      "text": "النسخة الاحتياطية الأسبوعية تشمل الملاحظات والمهام والمرفقات، وتُحفظ مشفرة قبل أي استعادة."
+    },
+    {
+      "id": "d12",
+      "title": "Backup restore procedure",
+      "language": "en",
+      "text": "Restore procedure: verify archive integrity, create a rollback copy, then restore atomically."
+    },
+    {
+      "id": "d13",
+      "title": "مكالمة فريق التسويق",
+      "language": "ar",
+      "text": "ناقش الفريق خطة التسويق، واتفق على مراجعة العرض يوم الخميس بعد العصر."
+    },
+    {
+      "id": "d14",
+      "title": "Marketing proposal",
+      "language": "en",
+      "text": "Marketing proposal draft includes positioning, target segments, pricing strategy, and launch channels."
+    },
+    {
+      "id": "d15",
+      "title": "ملاحظة باللهجة الفلسطينية",
+      "language": "ar",
+      "text": "بكرا بدي أخلص شغل الجامعة بكير وبعدها أمرّ عالسوق أجيب شاحن للموبايل."
+    },
+    {
+      "id": "d16",
+      "title": "Phone charger specs",
+      "language": "en",
+      "text": "USB-C charger notes: prefer USB Power Delivery and verify supported wattage before purchase."
+    },
+    {
+      "id": "d17",
+      "title": "بحث عن الذكاء الاصطناعي",
+      "language": "ar",
+      "text": "ورقة البحث تقارن بين الاستدلال المحلي والسحابي من ناحية الخصوصية والتكلفة وزمن الاستجابة."
+    },
+    {
+      "id": "d18",
+      "title": "AI inference benchmark",
+      "language": "en",
+      "text": "The inference benchmark compares local and hosted models on latency, cost, tool use, and memory."
+    },
+    {
+      "id": "d19",
+      "title": "موعد تسليم التصميم",
+      "language": "ar",
+      "text": "تسليم تصميم الهوية يوم ٢١ أكتوبر الساعة ١١ صباحًا، والمراجعة الداخلية قبلها بيوم."
+    },
+    {
+      "id": "d20",
+      "title": "Design delivery",
+      "language": "en",
+      "text": "Brand identity delivery is scheduled for October 21 at 11:00 AM, with an internal review one day earlier."
+    },
+    {
+      "id": "d21",
+      "title": "خطة دراسة",
+      "language": "ar",
+      "text": "خطة الدراسة: مراجعة التشريح لمدة تسعين دقيقة، استراحة قصيرة، ثم حل أسئلة تدريبية."
+    },
+    {
+      "id": "d22",
+      "title": "Study plan",
+      "language": "en",
+      "text": "Study plan: review anatomy for ninety minutes, take a short break, then solve practice questions."
+    },
+    {
+      "id": "d23",
+      "title": "كود مشروع",
+      "language": "mixed",
+      "text": "مشكلة الـ CI في المشروع مرتبطة بـ weighted-approval و persistence catalog، ولازم نراجع GitHub Actions."
+    },
+    {
+      "id": "d24",
+      "title": "CI troubleshooting",
+      "language": "en",
+      "text": "GitHub Actions troubleshooting for weighted approval and persistence catalog failures in the project pipeline."
+    },
+    {
+      "id": "d25",
+      "title": "ملاحظة مُشكّلة",
+      "language": "ar",
+      "text": "مُراجَعَةُ التَّصميمِ النِّهائيَّة ستكون يوم الأربعاء، وهذه جملة اصطناعية للاختبار."
+    },
+    {
+      "id": "d26",
+      "title": "رحلة تجريبية",
+      "language": "ar",
+      "text": "خطة الرحلة التجريبية تشمل زيارة المتحف صباحًا ثم المشي في الحديقة بعد الظهر."
+    }
+  ],
+  "queries": [
+    {
+      "id": "q01",
+      "text": "متى اجتماع مشروع أطلس؟",
+      "category": "msa",
+      "relevance": {
+        "d01": 3
+      }
+    },
+    {
+      "id": "q02",
+      "text": "شو موعد اجتماع أطلس؟",
+      "category": "palestinian_dialect",
+      "relevance": {
+        "d01": 3
+      }
+    },
+    {
+      "id": "q03",
+      "text": "BUILD-77Q9",
+      "category": "identifier",
+      "relevance": {
+        "d05": 3
+      }
+    },
+    {
+      "id": "q04",
+      "text": "خطة مشروع نور قبل البرمجة",
+      "category": "msa",
+      "relevance": {
+        "d03": 3,
+        "d04": 1
+      }
+    },
+    {
+      "id": "q05",
+      "text": "شو كنت ناوي أعمل بكرا بعد الجامعة؟",
+      "category": "palestinian_dialect",
+      "relevance": {
+        "d15": 3
+      }
+    },
+    {
+      "id": "q06",
+      "text": "مواصفات charger للموبايل",
+      "category": "code_switch",
+      "relevance": {
+        "d16": 3,
+        "d15": 1
+      }
+    },
+    {
+      "id": "q07",
+      "text": "كيف بنعمل restore آمن للنسخة الاحتياطية؟",
+      "category": "code_switch",
+      "relevance": {
+        "d12": 3,
+        "d11": 2
+      }
+    },
+    {
+      "id": "q08",
+      "text": "atomic encrypted backup rollback",
+      "category": "cross_lingual_en_to_ar",
+      "relevance": {
+        "d11": 3,
+        "d12": 2
+      }
+    },
+    {
+      "id": "q09",
+      "text": "مقارنة local vs cloud inference",
+      "category": "code_switch",
+      "relevance": {
+        "d17": 3,
+        "d18": 3
+      }
+    },
+    {
+      "id": "q10",
+      "text": "privacy cost latency for local and hosted AI",
+      "category": "cross_lingual_en_to_ar",
+      "relevance": {
+        "d18": 3,
+        "d17": 2
+      }
+    },
+    {
+      "id": "q11",
+      "text": "موعد تسليم الهوية ٢١ أكتوبر",
+      "category": "arabic_numerals",
+      "relevance": {
+        "d19": 3,
+        "d20": 2
+      }
+    },
+    {
+      "id": "q12",
+      "text": "October 21 brand identity delivery",
+      "category": "cross_lingual_en_to_ar",
+      "relevance": {
+        "d20": 3,
+        "d19": 2
+      }
+    },
+    {
+      "id": "q13",
+      "text": "خطة مذاكرة التشريح",
+      "category": "msa",
+      "relevance": {
+        "d21": 3,
+        "d22": 2
+      }
+    },
+    {
+      "id": "q14",
+      "text": "90 minute anatomy study plan",
+      "category": "cross_lingual_en_to_ar",
+      "relevance": {
+        "d22": 3,
+        "d21": 2
+      }
+    },
+    {
+      "id": "q15",
+      "text": "weighted-approval persistence catalog",
+      "category": "code_switch_identifier",
+      "relevance": {
+        "d23": 3,
+        "d24": 3
+      }
+    },
+    {
+      "id": "q16",
+      "text": "مشكلة CI و GitHub Actions",
+      "category": "code_switch",
+      "relevance": {
+        "d23": 3,
+        "d24": 2
+      }
+    },
+    {
+      "id": "q17",
+      "text": "مُراجَعَةُ التَّصميم",
+      "category": "arabic_diacritics",
+      "relevance": {
+        "d25": 3
+      }
+    },
+    {
+      "id": "q18",
+      "text": "مراجعة التصميم النهائية الأربعاء",
+      "category": "arabic_no_diacritics",
+      "relevance": {
+        "d25": 3
+      }
+    },
+    {
+      "id": "q19",
+      "text": "شراء شاشة IPS للبرمجة",
+      "category": "msa",
+      "relevance": {
+        "d09": 3
+      }
+    },
+    {
+      "id": "q20",
+      "text": "monitor for programming IPS 1080p",
+      "category": "cross_lingual_en_to_ar",
+      "relevance": {
+        "d09": 3,
+        "d10": 1
+      }
+    },
+    {
+      "id": "q21",
+      "text": "ملاحظات اجتماع مشروع التشريح",
+      "category": "msa",
+      "relevance": {
+        "d07": 3,
+        "d08": 1
+      }
+    },
+    {
+      "id": "q22",
+      "text": "anatomy project meeting notes",
+      "category": "cross_lingual_en_to_ar",
+      "relevance": {
+        "d07": 3,
+        "d08": 1
+      }
+    },
+    {
+      "id": "q23",
+      "text": "شو خطة الرحلة بعد الظهر؟",
+      "category": "palestinian_dialect",
+      "relevance": {
+        "d26": 3
+      }
+    },
+    {
+      "id": "q24",
+      "text": "marketing positioning launch channels",
+      "category": "cross_lingual_en_to_ar",
+      "relevance": {
+        "d14": 3,
+        "d13": 1
+      }
+    }
+  ]
+}
