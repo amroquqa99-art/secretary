@@ -230,10 +230,10 @@ def test_candidate_workflow_caches_the_test_environment_from_a_trusted_job_only(
     assert prepare["steps"][0]["name"] == "Bind the environment builder to protected workflow provenance"
     assert "key: ${{ steps.env-cache.outputs.cache-primary-key }}" in prepare_text
     assert "actions/cache/save" not in workflow[workflow.index("  execute-candidate:"):]
+    execute_text = workflow[workflow.index("  execute-candidate:"):workflow.index("  publish-aggregate:")]
     candidate_setup = execute_text[execute_text.index("actions/setup-python"):]
     candidate_setup = candidate_setup[:candidate_setup.index("\n      - ")]
     assert "cache:" not in candidate_setup, "untrusted execution must not get setup-python cache write scope"
-    execute_text = workflow[workflow.index("  execute-candidate:"):workflow.index("  publish-aggregate:")]
     restore_at = execute_text.index("name: Restore the installed CPU test environment")
     install_at = execute_text.index("name: Install the declared CPU test environment")
     verify_at = execute_text.index("name: Verify the retained lanes")
