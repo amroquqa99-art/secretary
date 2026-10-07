@@ -154,6 +154,22 @@ class TestBidirectionalChatContent:
         assert content.get_attribute("dir") == "auto"
         assert content.evaluate("el => getComputedStyle(el).textAlign") in ("start", "right")
 
+    def test_arabic_prepaint_bootstrap_avoids_cross_screen_transition(self, page: Page, locale_chat_base_url):
+        page.set_viewport_size({"width": 390, "height": 844})
+        page.goto(f"{locale_chat_base_url}/chat?lang=ar", wait_until="domcontentloaded")
+        snapshot = page.locator(".sidebar").evaluate("""el => {
+            const style = getComputedStyle(el);
+            const matrix = new DOMMatrixReadOnly(style.transform);
+            return {
+                htmlDir: document.documentElement.dir,
+                right: style.right,
+                translateX: matrix.m41,
+            };
+        }""")
+        assert snapshot["htmlDir"] == "rtl"
+        assert snapshot["right"] == "0px"
+        assert snapshot["translateX"] > 0
+
     def test_mobile_sidebar_opens_from_the_inline_start_edge(self, page: Page, locale_chat_base_url):
         page.set_viewport_size({"width": 390, "height": 844})
         _open(page, locale_chat_base_url, "?lang=ar")
