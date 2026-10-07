@@ -654,10 +654,10 @@ async def run_agent_loop(
         # slot is an operator-flippable model id (Fireworks today, anything
         # OpenAI-compatible tomorrow) -- a static dict keyed by literal model
         # id would need a code change on every flip, which is exactly what
-        # the picker was built to avoid. Gated on force_remote (not just
-        # "is this model in PRICING") so an upstream model id that happens
-        # to collide with a first-party key can't accidentally borrow that
-        # key's rate.
+        # the provider slot was built to avoid. Gated on the resolved remote
+        # backend path (not just "is this model in PRICING") so an upstream
+        # model id that happens to collide with a first-party key cannot
+        # accidentally borrow that key's rate.
         if remote_backend_turn:
             input_price = settings.remote_llm_input_price_per_mtok
             output_price = settings.remote_llm_output_price_per_mtok
