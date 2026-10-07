@@ -92,7 +92,9 @@ def test_model_profiles_are_valid_and_include_multilingual_candidates():
     data = load_profiles(PROFILES)
     profiles = data["profiles"]
 
-    assert {"current_lifeos", "qwen3_0_6b", "bge_m3"} <= set(profiles)
+    assert {"current_lifeos", "mxbai_recommended", "qwen3_0_6b", "bge_m3"} <= set(profiles)
+    assert profiles["current_lifeos"]["query_template"] == "{query}"
+    assert profiles["mxbai_recommended"]["query_template"].startswith("Represent this sentence")
     assert profiles["qwen3_0_6b"]["embedding_model"] == "Qwen/Qwen3-Embedding-0.6B"
     assert profiles["qwen3_0_6b"]["reranker_model"] == "Qwen/Qwen3-Reranker-0.6B"
     assert "{query}" in profiles["qwen3_0_6b"]["query_template"]
