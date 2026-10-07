@@ -25,6 +25,7 @@ Reciprocal Rank Fusion (RRF).
 """
 import re
 import logging
+import unicodedata
 from collections import Counter, defaultdict
 from datetime import datetime
 from typing import Optional, TYPE_CHECKING
@@ -40,6 +41,21 @@ if TYPE_CHECKING:
     from api.services.bm25_index import BM25Index
 
 logger = logging.getLogger(__name__)
+
+
+def _search_tokens(text: str) -> list[str]:
+    """Return case-folded Unicode word tokens for exact-match protection.
+
+    NFKC folds compatibility forms, combining marks are ignored so optional
+    diacritics do not change identity, and the token pattern keeps Unicode
+    letters and numbers while excluding punctuation and underscores.
+    """
+    folded = unicodedata.normalize("NFKC", (text or "").casefold())
+    folded = "".join(
+        ch for ch in folded if unicodedata.category(ch) != "Mn"
+    )
+    folded = re.sub(r"['’]s\\b", "", folded)
+    return re.findall(r"[^\\W_]+", folded, flags=re.UNICODE)
 
 
 def find_protected_indices(
@@ -66,17 +82,12 @@ def find_protected_indices(
     if query_type == "semantic":
         return []
 
-    # Factual query: find results containing query keywords
-    query_lower = query.lower()
-
-    # Extract significant keywords (skip common words)
+    # Factual query: find results containing significant query tokens.
     stop_words = {"what", "is", "the", "a", "an", "of", "for", "to", "s"}
-    keywords = []
-    for word in query_lower.split():
-        clean = re.sub(r"[''`]s?$", "", word)  # Remove possessive
-        clean = re.sub(r"[^a-z0-9]", "", clean)  # Remove punctuation
-        if clean and clean not in stop_words and len(clean) >= 2:
-            keywords.append(clean)
+    keywords = [
+        token for token in _search_tokens(query)
+        if token not in stop_words and len(token) >= 2
+    ]
 
     if not keywords:
         return []
