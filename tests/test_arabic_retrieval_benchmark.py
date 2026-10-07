@@ -10,6 +10,7 @@ pytestmark = pytest.mark.unit
 
 ROOT = Path(__file__).resolve().parent.parent
 DATASET = ROOT / "benchmarks" / "arabic_retrieval_v1.json"
+PROFILES = ROOT / "benchmarks" / "arabic_retrieval_profiles.json"
 
 
 def test_dataset_is_valid_and_contains_required_arabic_slices():
@@ -86,6 +87,7 @@ def test_dataset_file_is_utf8_json():
     decoded = json.loads(DATASET.read_text(encoding="utf-8"))
     assert decoded["name"] == "LifeOS Arabic Retrieval Benchmark v1"
 
+
 def test_model_profiles_are_valid_and_include_multilingual_candidates():
     from scripts.benchmark_arabic_retrieval import load_profiles
 
@@ -103,6 +105,7 @@ def test_model_profiles_are_valid_and_include_multilingual_candidates():
 
 def test_profile_resolution_applies_defaults_but_preserves_explicit_overrides():
     from argparse import Namespace
+
     from scripts.benchmark_arabic_retrieval import apply_profile
 
     args = Namespace(
@@ -150,6 +153,7 @@ def test_profile_validation_rejects_template_without_query_placeholder(tmp_path:
 
     with pytest.raises(ValueError, match="must contain"):
         load_profiles(bad)
+
 
 def test_version_tuple_handles_release_suffixes():
     from scripts.benchmark_arabic_retrieval import _version_tuple
