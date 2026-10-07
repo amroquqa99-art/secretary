@@ -89,7 +89,7 @@ def format_query(query: str, template: str) -> str:
 
 
 def _version_tuple(value: str) -> tuple[int, ...]:
-    parts = [int(part) for part in re.findall(r"\\d+", value)]
+    parts = [int(part) for part in re.findall(r"\d+", value)]
     return tuple(parts[:3])
 
 
