@@ -1,0 +1,515 @@
+name: Candidate verification
+
+# This file is evaluated from the protected base branch for both events below
+# (pull_request_target always resolves workflow YAML from the base ref, and
+# workflow_dispatch resolves it from whatever --ref it is invoked against —
+# the publisher always dispatches against main). Candidate code is checked
+# out only in the unprivileged job below; the status publisher never checks
+# out or runs it.
+#
+# There are two independent purposes here, never conflated:
+#   - pull_request_target publishes `candidate-verification-shadow` for fast,
+#     visible PR feedback. It is diagnostic only and must never be required.
+#   - workflow_dispatch (input: candidate_sha) verifies the EXACT normalized
+#     two-parent candidate the publisher (scripts/candidate_publisher.py)
+#     constructed, and publishes the actual required check,
+#     `candidate-verification`, bound to a dedicated GitHub App id so a
+#     candidate-controlled workflow cannot forge a matching check under the
+#     generic Actions app. GitHub merge queue (`merge_group`) and Enterprise
+#     "required workflow" rules are both organization/Enterprise-only
+#     features and are structurally unavailable on this User-owned
+#     repository, so neither is used here.
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, reopened, synchronize]
+  workflow_dispatch:
+    inputs:
+      candidate_sha:
+        description: "Exact candidate commit SHA to verify (constructed by scripts/candidate_publisher.py)"
+        required: true
+        type: string
+      pr_number:
+        description: "The PR this candidate was built for, so a superseded candidate for the same PR is cancelled rather than racing"
+        required: true
+        type: string
+      trusted_runner_sha:
+        description: "Exact protected-base commit containing the verifier and lane registry"
+        required: true
+        type: string
+
+concurrency:
+  # Keyed on stable PR identity, not the ephemeral candidate SHA: a second
+  # candidate built for the same PR (e.g. after a rebuild) must cancel the
+  # still-running verification of the one it supersedes, which a SHA-keyed
+  # group could never do since each candidate has a distinct SHA.
+  group: candidate-verification-${{ github.event.pull_request.number || github.event.inputs.pr_number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+# The Actions cache token is read-only for every job unless a job says
+# otherwise; only prepare-environment below, which never touches the
+# candidate, declares write. (`pull_request_target` would be read-only by
+# default anyway; `workflow_dispatch` would not, and the execution job runs
+# candidate code, so the default is pinned here rather than left to the
+# trigger.)
+cache-mode: read
+
+jobs:
+  prepare-environment:
+    # Builds and saves the cached CPU test environment from the PROTECTED
+    # runner checkout alone. It never checks out, installs from, or runs
+    # anything of the candidate, and it is the only job whose cache token
+    # may write (`cache-mode: write`): the execution job below can only
+    # restore. Wheels only (`--only-binary`), keyed on exactly what
+    # determines the environment plus the ISO week, so a candidate whose
+    # requirements file equals the protected one restores the same key.
+    name: environment-cache
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    cache-mode: write
+    env:
+      TRUSTED_RUNNER_SHA: ${{ github.event.pull_request.base.sha || github.event.inputs.trusted_runner_sha }}
+      TORCH_CPU_VERSION: "2.14.0+cpu"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PIP_NO_INPUT: "1"
+    steps:
+      # A dispatched run's trusted_runner_sha is caller input. This job is
+      # the one that may write the shared cache, so before it checks out or
+      # builds anything it requires that input to be the immutable commit
+      # the workflow itself was resolved from -- the same binding the
+      # execution job applies. pull_request_target's base.sha is GitHub-set.
+      - name: Bind the environment builder to protected workflow provenance
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          if [ "$EVENT_NAME" = workflow_dispatch ]; then
+            test "$TRUSTED_RUNNER_SHA" = "$WORKFLOW_SHA"
+          fi
+      - name: Checkout the protected runner definition
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ env.TRUSTED_RUNNER_SHA }}
+          path: trusted-runner
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        id: python
+        with:
+          python-version: "3.12"
+      - name: Bound the cached environment's age
+        id: cache-window
+        run: echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
+      - name: Look up the installed CPU test environment
+        id: env-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          lookup-only: true
+          path: |
+            ${{ runner.temp }}/lifeos-venv
+            ~/.cache/ms-playwright
+          key: lifeos-test-env-v1-${{ runner.os }}-py${{ steps.python.outputs.python-version }}-torch${{ env.TORCH_CPU_VERSION }}-${{ hashFiles('trusted-runner/requirements.txt') }}-${{ steps.cache-window.outputs.week }}
+      - name: Build the CPU test environment from the protected requirements
+        if: ${{ steps.env-cache.outputs.cache-hit != 'true' }}
+        run: |
+          VENV="$RUNNER_TEMP/lifeos-venv"
+          python -m venv "$VENV"
+          . "$VENV/bin/activate"
+          python -m pip install --upgrade pip
+          printf 'torch==%s\n' "$TORCH_CPU_VERSION" > "$RUNNER_TEMP/cpu-torch-constraints.txt"
+          python -m pip install --only-binary=:all: --index-url https://download.pytorch.org/whl/cpu -c "$RUNNER_TEMP/cpu-torch-constraints.txt" "torch==$TORCH_CPU_VERSION"
+          python -m pip install --only-binary=:all: --extra-index-url https://download.pytorch.org/whl/cpu -c "$RUNNER_TEMP/cpu-torch-constraints.txt" -r trusted-runner/requirements.txt
+          python -m playwright install --with-deps chromium
+          python -m pip freeze --all | LC_ALL=C sort | sha256sum > "$VENV/lifeos-installed-dependencies.sha256"
+          python - <<'PY'
+          import os
+          import torch
+          assert torch.__version__ == os.environ["TORCH_CPU_VERSION"], torch.__version__
+          assert torch.version.cuda is None and torch.version.hip is None, torch.__version__
+          PY
+      - name: Save the installed CPU test environment
+        if: ${{ steps.env-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ${{ runner.temp }}/lifeos-venv
+            ~/.cache/ms-playwright
+          key: ${{ steps.env-cache.outputs.cache-primary-key }}
+
+  execute-candidate:
+    name: candidate-execution
+    runs-on: ubuntu-latest
+    strategy:
+      # A failing part must never cancel its siblings: each part's own
+      # result feeds the same aggregate below, so cancelling early would
+      # hide which other parts would also have failed without changing
+      # the published conclusion.
+      fail-fast: false
+      matrix:
+        # Whole module scopes are assigned across these parts by recorded
+        # duration. `strategy.job-total` below derives the part count from
+        # this list rather than restating it, so the two cannot disagree
+        # and leave a part's tests unrun while every other part reports
+        # success.
+        part: [0, 1, 2, 3]
+    # Each part runs its own share of the retained lanes at the runner's
+    # full width, with the capacity headroom the step below establishes.
+    # The ceiling exists to fail a genuinely stuck part, so it sits above
+    # the slowest healthy part observed with enough margin for dependency
+    # and Chromium setup, rather than near the middle of the range.
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      checks: read
+    # Every part computes the same selection from the same two commits, so
+    # whichever part reports last carries the mode the publisher records.
+    outputs:
+      verification_mode: ${{ steps.reuse.outputs.mode || steps.select.outputs.mode }}
+      verification_tree: ${{ steps.select.outputs.tree }}
+      verification_lanes: ${{ steps.select.outputs.lanes }}
+      reused_check_id: ${{ steps.reuse.outputs.reused_check_id }}
+      reused_candidate: ${{ steps.reuse.outputs.reused_candidate }}
+    env:
+      CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.event.inputs.candidate_sha }}
+      TRUSTED_RUNNER_SHA: ${{ github.event.pull_request.base.sha || github.event.inputs.trusted_runner_sha }}
+      TORCH_CPU_VERSION: "2.14.0+cpu"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PIP_NO_INPUT: "1"
+      HIP_VISIBLE_DEVICES: ""
+      ROCR_VISIBLE_DEVICES: ""
+      CUDA_VISIBLE_DEVICES: ""
+    steps:
+      - name: Checkout the protected runner definition
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ env.TRUSTED_RUNNER_SHA }}
+          path: trusted-runner
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Checkout the untrusted candidate
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+          path: candidate
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Bind dispatched runner to protected workflow provenance
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          if [ "$EVENT_NAME" = workflow_dispatch ]; then
+            test "$TRUSTED_RUNNER_SHA" = "$WORKFLOW_SHA"
+            FIRST_PARENT="$(git -C candidate cat-file commit "$CANDIDATE_SHA" | awk '$1 == "parent" { print $2; exit }')"
+            test "$FIRST_PARENT" = "$TRUSTED_RUNNER_SHA"
+          fi
+      - name: Select the lanes this candidate's changes can affect
+        id: select
+        run: |
+          # Fails closed: any doubt about the changed set runs every retained
+          # lane. The changed set is the diff from the merge base when the
+          # checkout can compute one, so a branch behind the base is judged
+          # on its own changes; otherwise the two-commit diff, a superset.
+          # The decision itself is the runner's candidate_lanes.py, which
+          # mirrors scripts/test.sh's docs-only rule, so a docs-only
+          # candidate executes nothing and is published as such.
+          # The candidate checkout is a depth-1 clone of the candidate alone,
+          # so the base commit is fetched into it before either diff can run.
+          CHANGED="$(git -C candidate fetch --no-tags --depth=1 origin "$TRUSTED_RUNNER_SHA" 2>/dev/null \
+            && { git -C candidate diff --name-only --merge-base "$TRUSTED_RUNNER_SHA" "$CANDIDATE_SHA" 2>/dev/null \
+                 || git -C candidate diff --name-only "$TRUSTED_RUNNER_SHA" "$CANDIDATE_SHA" 2>/dev/null; } \
+            || true)"
+          echo "changed files:"; printf '%s\n' "$CHANGED" | sed 's/^/  /'
+          printf '%s\n' "$CHANGED" > "$RUNNER_TEMP/lifeos-changed-files"
+          printf '%s\n' "$CHANGED" | python3 trusted-runner/scripts/candidate_lanes.py | tee "$RUNNER_TEMP/lifeos-lane-selection"
+          cat "$RUNNER_TEMP/lifeos-lane-selection" >> "$GITHUB_OUTPUT"
+          echo "tree=$(git -C candidate rev-parse "$CANDIDATE_SHA^{tree}")" >> "$GITHUB_OUTPUT"
+          sed -n 's/^lanes=/LANES=/p' "$RUNNER_TEMP/lifeos-lane-selection" >> "$GITHUB_ENV"
+      # A dispatched candidate whose tree is byte-for-byte its head's tree has
+      # already been verified by this same runner in the head's shadow run.
+      # Reuse that verdict instead of executing the lanes again -- only when
+      # the shadow check was published by the dedicated App, names this exact
+      # trusted-runner commit and tree, and covered every selected lane
+      # (scripts/candidate_reuse.py). Any doubt executes the lanes as usual.
+      # Everything read here is git object identity or App-published check
+      # data; no candidate-authored text takes part in the decision.
+      - name: Reuse a passing shadow verification of this exact tree
+        id: reuse
+        if: ${{ github.event_name == 'workflow_dispatch' && steps.select.outputs.mode == 'executed' && vars.LIFEOS_CANDIDATE_APP_ID != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APP_ID: ${{ vars.LIFEOS_CANDIDATE_APP_ID }}
+          TREE: ${{ steps.select.outputs.tree }}
+        run: |
+          HEAD_SHA="$(git -C candidate cat-file commit "$CANDIDATE_SHA" | awk '$1 == "parent" { print $2 }' | sed -n 2p)"
+          if [ -z "$HEAD_SHA" ] \
+            || ! git -C candidate fetch --quiet --depth=1 origin "$HEAD_SHA" \
+            || [ "$(git -C candidate rev-parse "$HEAD_SHA^{tree}")" != "$TREE" ]; then
+            echo "candidate tree differs from its head's tree (or the head is unavailable): executing the lanes"
+            echo "reused_check_id=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/check-runs?per_page=100" 2>/dev/null \
+            | python3 trusted-runner/scripts/candidate_reuse.py \
+                --tree "$TREE" --trusted-runner "$TRUSTED_RUNNER_SHA" --app-id "$APP_ID" --lanes "$LANES" \
+            | tee -a "$GITHUB_OUTPUT"
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        id: python
+        if: ${{ steps.select.outputs.mode == 'executed' && steps.reuse.outputs.mode != 'reused' }}
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: candidate/requirements.txt
+      # The installed environment is restored from a cache keyed on what
+      # determines it -- runner image, interpreter, the declared torch CPU
+      # build, the requirements file -- plus the ISO week, because most
+      # requirements are open ranges: a restored environment is whatever
+      # those ranges resolved to when the key was first built, so the week
+      # bounds how stale that resolution can get. This job only restores:
+      # the cache is written by the prepare-environment job above, which
+      # never checks out or runs candidate code and is the only job whose
+      # cache token may write, so what any run restores is the product of wheel
+      # installation from the protected requirements file and nothing else.
+      # A candidate that changes requirements.txt misses and installs fresh.
+      - name: Bound the cached environment's age
+        id: cache-window
+        if: ${{ steps.select.outputs.mode == 'executed' && steps.reuse.outputs.mode != 'reused' }}
+        run: echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
+      - name: Restore the installed CPU test environment
+        id: env-cache
+        if: ${{ steps.select.outputs.mode == 'executed' && steps.reuse.outputs.mode != 'reused' }}
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ${{ runner.temp }}/lifeos-venv
+            ~/.cache/ms-playwright
+          key: lifeos-test-env-v1-${{ runner.os }}-py${{ steps.python.outputs.python-version }}-torch${{ env.TORCH_CPU_VERSION }}-${{ hashFiles('candidate/requirements.txt') }}-${{ steps.cache-window.outputs.week }}
+      - name: Install the declared CPU test environment
+        if: ${{ steps.select.outputs.mode == 'executed' && steps.reuse.outputs.mode != 'reused' }}
+        env:
+          CACHE_HIT: ${{ steps.env-cache.outputs.cache-hit }}
+        run: |
+          VENV="$RUNNER_TEMP/lifeos-venv"
+          FINGERPRINT="$VENV/lifeos-installed-dependencies.sha256"
+          if [ "$CACHE_HIT" != "true" ]; then
+            python -m venv "$VENV"
+            . "$VENV/bin/activate"
+            python -m pip install --upgrade pip
+            printf 'torch==%s\n' "$TORCH_CPU_VERSION" > "$RUNNER_TEMP/cpu-torch-constraints.txt"
+            python -m pip install --only-binary=:all: --index-url https://download.pytorch.org/whl/cpu -c "$RUNNER_TEMP/cpu-torch-constraints.txt" "torch==$TORCH_CPU_VERSION"
+            python -m pip install --only-binary=:all: --extra-index-url https://download.pytorch.org/whl/cpu -c "$RUNNER_TEMP/cpu-torch-constraints.txt" -r candidate/requirements.txt
+            python -m playwright install --with-deps chromium
+            python -m pip freeze --all | LC_ALL=C sort | sha256sum > "$FINGERPRINT"
+          else
+            . "$VENV/bin/activate"
+            # Browsers are restored with the venv; their system packages are
+            # not part of the cache and are installed every run.
+            python -m playwright install-deps chromium
+            # The restored environment must be the one the miss path built
+            # for this key, package for package.
+            test "$(python -m pip freeze --all | LC_ALL=C sort | sha256sum)" = "$(cat "$FINGERPRINT")"
+          fi
+          echo "$VENV/bin" >> "$GITHUB_PATH"
+          cat "$FINGERPRINT" | tee "$RUNNER_TEMP/lifeos-installed-dependencies.sha256"
+          python - <<'PY'
+          import os
+          import torch
+          assert torch.__version__ == os.environ["TORCH_CPU_VERSION"], torch.__version__
+          assert torch.version.cuda is None and torch.version.hip is None, torch.__version__
+          PY
+      - name: Prove checkout identity
+        run: |
+          test "$(git -C trusted-runner rev-parse HEAD)" = "$TRUSTED_RUNNER_SHA"
+          test "$(git -C candidate rev-parse HEAD)" = "$CANDIDATE_SHA"
+      - name: Verify the retained lanes this candidate's changes can affect
+        if: ${{ steps.select.outputs.mode == 'executed' && steps.reuse.outputs.mode != 'reused' }}
+        run: |
+          # The run width must stay strictly below the host capacity total.
+          # Two fast-unit tests dispatch their own nested verifier runs, and
+          # those acquire capacity slots of their own; when the outer run is
+          # allowed to hold every slot, they wait for one that never frees
+          # and the lane hangs until the ceiling rather than failing. Give
+          # the run the runner's full width and the total twice that, so the
+          # nested runs always have slots to take.
+          WORKERS="$(nproc)"
+          python trusted-runner/scripts/test_capacity.py configure \
+            --total-workers "$((WORKERS * 2))" --max-run-workers "$WORKERS"
+          echo "runner reports $(nproc) logical processors; using $WORKERS test workers"
+          free -h || true
+          python trusted-runner/scripts/verify_candidate.py pushed-ref \
+            --repository "$GITHUB_WORKSPACE/candidate" \
+            --sha "$CANDIDATE_SHA" \
+            --base "$TRUSTED_RUNNER_SHA" \
+            --evidence-root "$RUNNER_TEMP/lifeos-verification-evidence" \
+            --lanes "$LANES" \
+            --workers "$WORKERS" \
+            --capacity-max-run-workers "$WORKERS" \
+            --lane-log-dir "$RUNNER_TEMP/lifeos-lane-logs" \
+            --part-index "${{ matrix.part }}" \
+            --part-count "${{ strategy.job-total }}" \
+            --parallel-browser-free
+
+      # Measurement only: what an import-graph selector would have run for
+      # this candidate, recorded next to what actually ran and whether any
+      # failing module fell outside it. Nothing above reads this; the gate
+      # executed every retained lane regardless. The runner's own script
+      # parses the candidate tree and never imports it.
+      - name: Record the shadow test-impact selection
+        if: ${{ always() && steps.select.outputs.mode == 'executed' && steps.reuse.outputs.mode != 'reused' }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/lifeos-impact"
+          python3 trusted-runner/scripts/test_impact.py \
+            --root candidate \
+            --changed-files "$RUNNER_TEMP/lifeos-changed-files" \
+            --durations trusted-runner/scripts/lane_scope_durations.json \
+            --receipts "$RUNNER_TEMP/lifeos-lane-logs" \
+            --output "$RUNNER_TEMP/lifeos-impact/impact_selection.json" \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+      # The step above prints only its summary JSON; pytest's own output goes
+      # to the lane log. Without this a failing lane names no test, so the
+      # log is retained on failure and nowhere else — a passing lane's log
+      # has no reader. This is candidate-produced diagnostic output: the
+      # status publisher below never reads it, and nothing consumes it as
+      # authorization.
+      - name: Retain the lane log from a failed verification
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: lane-logs-${{ env.CANDIDATE_SHA }}-part${{ matrix.part }}
+          path: ${{ runner.temp }}/lifeos-lane-logs
+          if-no-files-found: warn
+          retention-days: 14
+
+      # The lane-execution receipts — per-test outcomes and per-module
+      # durations, never test output — are retained from every part whatever
+      # its result, so a later reader can regenerate the duration record from
+      # a green run or compare one test's outcome across runs. Like the lane
+      # log this is candidate-produced diagnostic output: the status publisher
+      # never reads it, and nothing consumes it as authorization.
+      - name: Retain the lane-execution receipts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: lane-receipts-${{ env.CANDIDATE_SHA }}-part${{ matrix.part }}
+          path: ${{ runner.temp }}/lifeos-lane-logs/*.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      # Its own artifact, not a second path on the receipts one: an artifact
+      # is rooted at the common ancestor of every path it lists, so sharing
+      # would push the receipts a level down and out of reach of the
+      # documented `record-scope-durations` regeneration.
+      - name: Retain the shadow test-impact selection
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: impact-selection-${{ env.CANDIDATE_SHA }}-part${{ matrix.part }}
+          path: ${{ runner.temp }}/lifeos-impact/impact_selection.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+  publish-aggregate:
+    # This job never checks out, runs, or consumes an artifact from the
+    # candidate; it only reports the result of the job above for the
+    # event's exact candidate SHA. It authenticates as a dedicated GitHub
+    # App (installation token, minted fresh in this job and never
+    # persisted) whose credentials are never given to any
+    # candidate-influenceable workflow.
+    #
+    # The App's private key is stored as an ENVIRONMENT secret, not a
+    # repository secret: a repository secret is available to any same-repo
+    # (non-fork) workflow run regardless of which workflow file defines it,
+    # so a candidate-authored `pull_request`-triggered workflow could
+    # otherwise reference it directly and mint a valid App token itself,
+    # completely defeating the point of a dedicated issuer. An environment
+    # secret is exposed only to a job that declares `environment:` AND only
+    # when that environment's deployment branch policy matches the run's
+    # actual ref — configure the `candidate-verification-publish`
+    # environment's deployment branch policy to exactly `main` (no tags, no
+    # `refs/pull/*`, no "protected branches" fallback if none are actually
+    # protected), so a `pull_request`-triggered run (whose ref is the PR
+    # head/merge ref, never `main`) is denied the secret even if it tries
+    # to declare the same environment name itself. `execute-candidate`
+    # above never declares this environment and never sees this credential.
+    # Until LIFEOS_CANDIDATE_APP_ID / LIFEOS_CANDIDATE_APP_PRIVATE_KEY exist
+    # in that environment, this job falls back to the default token, and
+    # the resulting check must NOT be treated as the required gate — it is
+    # advisory only until the App-issued token path is active.
+    name: candidate-verification-publisher
+    needs: [execute-candidate]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    environment: candidate-verification-publish
+    permissions:
+      checks: write
+    env:
+      CHECK_NAME: ${{ github.event_name == 'workflow_dispatch' && 'candidate-verification' || 'candidate-verification-shadow' }}
+      TRUSTED_RUNNER_SHA: ${{ github.event.pull_request.base.sha || github.event.inputs.trusted_runner_sha }}
+    steps:
+      - name: Mint a dedicated-App installation token, if configured
+        id: app-token
+        if: ${{ vars.LIFEOS_CANDIDATE_APP_ID != '' }}
+        uses: actions/create-github-app-token@5d869da34e18e7287c1daad50e0b8ea0f506ce69 # v1.11.0
+        with:
+          app-id: ${{ vars.LIFEOS_CANDIDATE_APP_ID }}
+          private-key: ${{ secrets.LIFEOS_CANDIDATE_APP_PRIVATE_KEY }}
+      - uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        env:
+          RESULT: ${{ needs.execute-candidate.result }}
+          VERIFICATION_MODE: ${{ needs.execute-candidate.outputs.verification_mode }}
+          VERIFICATION_TREE: ${{ needs.execute-candidate.outputs.verification_tree }}
+          VERIFICATION_LANES: ${{ needs.execute-candidate.outputs.verification_lanes }}
+          REUSED_CHECK_ID: ${{ needs.execute-candidate.outputs.reused_check_id }}
+          REUSED_CANDIDATE: ${{ needs.execute-candidate.outputs.reused_candidate }}
+          CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.event.inputs.candidate_sha }}
+          TRUSTED_RUNNER_SHA: ${{ github.event.pull_request.base.sha || github.event.inputs.trusted_runner_sha }}
+        with:
+          github-token: ${{ steps.app-token.outputs.token || github.token }}
+          script: |
+            // Success is an explicit trusted outcome: the execution job passed
+            // AND recorded how it verified -- by executing the retained lanes
+            // the changed set can affect, or by finding the candidate docs-only
+            // so no lane could observe it. A job that reports neither (never
+            // reached its selection step) is a failed verification.
+            const mode = process.env.VERIFICATION_MODE;
+            const explicit = mode === 'executed' || mode === 'docs-only' || mode === 'reused';
+            const conclusion = process.env.RESULT === 'success' && explicit ? 'success' : 'failure';
+            const how = mode === 'docs-only'
+              ? ' (docs-only: every changed file is documentation and none is a dependency manifest, so no retained lane can be affected; nothing executed)'
+              : mode === 'executed'
+                ? ' (executed the retained lanes the changed set can affect)'
+                : mode === 'reused'
+                  ? ` (reused shadow check ${process.env.REUSED_CHECK_ID}: this App's candidate-verification-shadow of ${process.env.REUSED_CANDIDATE}, the identical tree verified by this same runner)`
+                  : ' (no verification mode recorded)';
+            // Structured, App-published record of what was verified. The tree
+            // and lanes were computed by the trusted runner's selection step
+            // before any candidate code ran; the runner commit is event data.
+            // A later dispatched run may reuse this verdict only on an exact
+            // match of every field (scripts/candidate_reuse.py).
+            const text = JSON.stringify({
+              candidate: process.env.CANDIDATE_SHA,
+              tree: process.env.VERIFICATION_TREE,
+              trusted_runner: process.env.TRUSTED_RUNNER_SHA,
+              mode,
+              lanes: (process.env.VERIFICATION_LANES || '').split(',').filter(Boolean),
+              conclusion,
+            });
+            await github.rest.checks.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: process.env.CHECK_NAME,
+              head_sha: process.env.CANDIDATE_SHA,
+              status: 'completed',
+              conclusion,
+              output: {
+                title: 'Candidate verification',
+                summary: `Candidate ${process.env.CANDIDATE_SHA} verified by runner ${process.env.TRUSTED_RUNNER_SHA}: ${process.env.RESULT}${how}`,
+                text,
+              },
+            });
