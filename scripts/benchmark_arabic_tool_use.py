@@ -99,11 +99,12 @@ def score_case(case: dict, tool_calls: list[dict], final_text: str) -> dict:
         if not candidates:
             failures.append(f"no input available for {tool}")
             continue
-        best = (0, len(expected_input), [])
+        best = None
         for candidate in candidates:
             scored = _score_input(candidate, expected_input)
-            if scored[0] > best[0]:
+            if best is None or scored[0] > best[0]:
                 best = scored
+        assert best is not None
         earned += best[0]
         failures.extend(f"{tool}: {failure}" for failure in best[2])
 
