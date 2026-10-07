@@ -77,7 +77,7 @@ def test_confirmation_text_requirement_is_scored():
         "expect": {
             "required_tools": [],
             "forbidden_tools": ["create_calendar_event"],
-            "assistant_must_contain_any": ["تأكيد", "confirm"],
+            "assistant_must_contain_any": ["تأكيد", "تؤكد", "confirm"],
         }
     }
     assert score_case(case, [], "هل تؤكد إنشاء الموعد؟")["score"] == 1.0
