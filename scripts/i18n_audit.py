@@ -10,19 +10,19 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_WEB = ROOT / "web"
 
-TEXT_RE = re.compile(r">([^<>\\n]{2,160})<")
-ATTR_RE = re.compile(r"\\b(placeholder|title|aria-label)=[\\\"\\\'](.*?)[\\\"\\\']", re.I)
-HTML_LANG_RE = re.compile(r"<html\\b[^>]*\\blang=[\\\"\\\']([^\\\"\\\']+)", re.I)
-PHYSICAL_CSS_RE = re.compile(r"\\b(left|right|margin-left|margin-right|padding-left|padding-right|border-left|border-right|text-align)\\s*:\\s*([^;}{]+)", re.I)
-FIXED_LOCALE_RE = re.compile(r"[\\\"\\\'](en-US|en-GB|ar-SA|ar-EG|ar-PS)[\\\"\\\']", re.I)
+TEXT_RE = re.compile(r">([^<>\n]{2,160})<")
+ATTR_RE = re.compile(r"""\b(placeholder|title|aria-label)=["\'](.*?)["\']""", re.I)
+HTML_LANG_RE = re.compile(r"""<html\b[^>]*\blang=["\']([^"\']+)""", re.I)
+PHYSICAL_CSS_RE = re.compile(r"\b(left|right|margin-left|margin-right|padding-left|padding-right|border-left|border-right|text-align)\s*:\s*([^;}{]+)", re.I)
+FIXED_LOCALE_RE = re.compile(r"""["\'](en-US|en-GB|ar-SA|ar-EG|ar-PS)["\']""", re.I)
 
 
 def line_number(text: str, offset: int) -> int:
-    return text.count("\\n", 0, offset) + 1
+    return text.count("\n", 0, offset) + 1
 
 
 def likely_visible(value: str) -> bool:
-    value = re.sub(r"\\s+", " ", value).strip()
+    value = re.sub(r"\s+", " ", value).strip()
     if not value or not any(ch.isalpha() for ch in value):
         return False
     if value.startswith(("http://", "https://", "//", "/*", "*")):
@@ -44,7 +44,7 @@ def audit_file(path: Path, web_root: Path) -> dict:
         report["html_lang"].append({"line": line_number(text, match.start()), "value": match.group(1)})
     if path.suffix.lower() == ".html":
         for match in TEXT_RE.finditer(text):
-            value = re.sub(r"\\s+", " ", match.group(1)).strip()
+            value = re.sub(r"\s+", " ", match.group(1)).strip()
             if likely_visible(value):
                 report["hardcoded_text"].append({"line": line_number(text, match.start()), "value": value})
         for match in ATTR_RE.finditer(text):
