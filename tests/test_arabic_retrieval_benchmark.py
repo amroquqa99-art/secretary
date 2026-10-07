@@ -2,6 +2,9 @@
 
 import copy
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -86,6 +89,23 @@ def test_bm25_benchmark_runs_without_model_or_network():
 def test_dataset_file_is_utf8_json():
     decoded = json.loads(DATASET.read_text(encoding="utf-8"))
     assert decoded["name"] == "LifeOS Arabic Retrieval Benchmark v1"
+
+
+def test_bm25_cli_runs_from_another_directory_without_pythonpath(tmp_path: Path):
+    output = tmp_path / "report.json"
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "benchmark_arabic_retrieval.py"),
+         "--profile", "current_lifeos", "--modes", "bm25", "--output", str(output)],
+        cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert report["profile"] == "current_lifeos"
+    assert set(report["results"]) == {"bm25"}
+    assert report["query_count"] > 0
+    assert report["allow_download"] is False
 
 
 def test_model_profiles_are_valid_and_include_multilingual_candidates():

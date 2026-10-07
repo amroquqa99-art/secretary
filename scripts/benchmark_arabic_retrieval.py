@@ -17,15 +17,16 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
-from importlib import metadata
 import math
 import os
+import re
+import sys
 import tempfile
 import time
 from collections import defaultdict
+from collections.abc import Iterable
+from importlib import metadata
 from pathlib import Path
-from typing import Iterable
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATASET = ROOT / "benchmarks" / "arabic_retrieval_v1.json"
@@ -47,7 +48,7 @@ def load_profiles(path: Path) -> dict:
         raise ValueError("profiles must be a non-empty object")
     for name, profile in profiles.items():
         if not isinstance(profile, dict):
-            raise ValueError(f"profile {name} must be an object")
+            raise TypeError(f"profile {name} must be an object")
         if not profile.get("embedding_model"):
             raise ValueError(f"profile {name} has no embedding_model")
         template = profile.get("query_template", "{query}")
@@ -434,4 +435,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    sys.path.insert(0, str(ROOT))
     raise SystemExit(main())
