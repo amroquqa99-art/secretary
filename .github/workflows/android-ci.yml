@@ -1,66 +1,75 @@
-name: Android CI
+name: Import LifeOS baseline
 
 on:
   push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
+    branches:
+      - migration/lifeos-baseline
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
-  group: android-ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: lifeos-baseline-import
+  cancel-in-progress: false
 
 jobs:
-  verify:
+  import:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-    env:
-      ANDROID_HOME: /usr/local/lib/android/sdk
-      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
-
+    timeout-minutes: 15
     steps:
-      - name: Checkout
+      - name: Checkout secretary history
         uses: actions/checkout@v4
-
-      - name: Set up JDK 21
-        uses: actions/setup-java@v5
         with:
-          distribution: temurin
-          java-version: "21"
-          cache: gradle
+          fetch-depth: 0
+          ref: migration/lifeos-baseline
 
-      - name: Install current Android CLI and toolchain
+      - name: Fetch pinned LifeOS baseline
         shell: bash
         run: |
-          CLI_ZIP="$RUNNER_TEMP/android-command-line-tools.zip"
-          curl --fail --location --retry 3 \
-            "https://dl.google.com/android/repository/commandlinetools-linux-15859902_latest.zip" \
-            --output "$CLI_ZIP"
-          echo "4e4c464f145a7512b57d088ac6c278c03c9eea610886b35a5e0804e74eedf583  $CLI_ZIP" | sha256sum --check -
-          rm -rf "$RUNNER_TEMP/android-cli"
-          mkdir -p "$RUNNER_TEMP/android-cli"
-          unzip -q "$CLI_ZIP" -d "$RUNNER_TEMP/android-cli"
-          ANDROID_CLI="$RUNNER_TEMP/android-cli/cmdline-tools/bin/android"
-          test -x "$ANDROID_CLI"
-          "$ANDROID_CLI" --sdk="$ANDROID_HOME" sdk install --canary \
-            platforms/android-37 \
-            build-tools/36.0.0 \
-            ndk/30.0.16248370 \
-            cmake/3.22.1
+          set -euo pipefail
+          rm -rf /tmp/lifeos
+          git init -q /tmp/lifeos
+          git -C /tmp/lifeos remote add origin https://github.com/nbramia/LifeOS.git
+          git -C /tmp/lifeos fetch -q --depth 1 origin bae2bfba66c542e17c4aa08aaebae6509b4a3e69
+          git -C /tmp/lifeos checkout -q --detach FETCH_HEAD
+          test "$(git -C /tmp/lifeos rev-parse HEAD)" = "bae2bfba66c542e17c4aa08aaebae6509b4a3e69"
 
-      - name: Verify database migrations and server
+      - name: Replace working tree except temporary migration workflow
         shell: bash
         run: |
-          python3 checks/verify_migration.py
-          python3 checks/verify_v4.py
-          python3 checks/verify_v5.py
-          python3 -m unittest discover -s server -p 'test_*.py' -v
+          set -euo pipefail
+          find . -mindepth 1 -maxdepth 1 ! -name .git ! -name .github -exec rm -rf -- {} +
+          rsync -a --delete --exclude='.git' --exclude='.github' /tmp/lifeos/ ./
 
-      - name: Unit tests, APK and lint
+          git add -A
+          while IFS= read -r -d '' path; do
+            case "$path" in
+              .github/workflows/*) continue ;;
+            esac
+            git add -f -- "$path"
+          done < <(git -C /tmp/lifeos ls-files -z)
+
+      - name: Verify imported bytes before commit
         shell: bash
         run: |
-          chmod +x gradlew
-          ./gradlew --no-daemon --stacktrace :app:testDebugUnitTest :app:assembleDebug :app:lintDebug
+          set -euo pipefail
+          drift="$(rsync -ainc --delete --exclude='.git' --exclude='.github' /tmp/lifeos/ ./)"
+          if [ -n "$drift" ]; then
+            printf '%s\n' "$drift"
+            echo "LifeOS import verification failed." >&2
+            exit 1
+          fi
+          test -n "$(git diff --cached --name-only)"
+          echo "Pinned upstream SHA: $(git -C /tmp/lifeos rev-parse HEAD)"
+          echo "Pinned upstream tree: $(git -C /tmp/lifeos rev-parse HEAD^{tree})"
+          echo "Imported tracked files (excluding temporary workflow): $(git -C /tmp/lifeos ls-files | grep -vc '^.github/workflows/')"
+
+      - name: Commit baseline on migration branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "LifeOS Baseline Import"
+          git config user.email "actions@users.noreply.github.com"
+          git commit -m "chore: replace working tree with LifeOS upstream bae2bfba" \
+            -m "Preserves the complete secretary history as the parent chain. Upstream source: nbramia/LifeOS@bae2bfba66c542e17c4aa08aaebae6509b4a3e69. The temporary migration workflow is intentionally preserved for this commit and is removed after external verification."
+          git push origin HEAD:migration/lifeos-baseline
