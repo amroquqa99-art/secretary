@@ -31,8 +31,9 @@ def test_audit_file_finds_localization_and_direction_risks(tmp_path: Path):
 
     report = audit_file(page, web)
 
-    assert report["html_lang"][0]["value"] == "en"
-    assert any(item["value"] == "Hello world" for item in report["hardcoded_text"])
+    assert report["html_lang"][0] == {"line": 2, "value": "en"}
+    hello = next(item for item in report["hardcoded_text"] if item["value"] == "Hello world")
+    assert hello["line"] == 7
     assert any(
         item["attribute"] == "placeholder" and item["value"] == "Search notes"
         for item in report["hardcoded_attributes"]
