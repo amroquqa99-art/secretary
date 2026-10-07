@@ -2,6 +2,35 @@
 
 **Your personal operating system, built from the digital exhaust of your life.**
 
+## Arabic and Android fork status
+
+This repository is an independent development fork of LifeOS. The original
+Secretary history remains reachable on `archive/pre-lifeos-2026-10-07`.
+Upstream contributions are held until the fork passes integrated acceptance.
+
+| Capability | Current state |
+| --- | --- |
+| Arabic chat copy, language selection, RTL and mixed-direction messages | Available on `main`; broader product localization is incomplete. |
+| Arabic retrieval and tool-use benchmark harnesses | Available on `main` with synthetic fixtures; real-model quality is unmeasured. |
+| Shared locale runtime and Arabic Home | [Candidate implementation](https://github.com/amroquqa99-art/secretary/pull/18); focused browser checks pass, hosted acceptance is pending. |
+| Retrieval model profiles and standalone benchmark CLI | [Candidate implementation](https://github.com/amroquqa99-art/secretary/pull/17); Qwen3 and BGE profiles are evaluation candidates, not selected production defaults. |
+| Mobile sidebar gestures for Arabic and English | [Candidate implementation](https://github.com/amroquqa99-art/secretary/pull/19); synthetic Chromium touch scenarios pass, hosted acceptance is pending. |
+| Locale-aware conversation dates and live label refresh | [Candidate implementation](https://github.com/amroquqa99-art/secretary/pull/20); Arabic/English browser checks pass, hosted acceptance is pending. |
+| Native Android companion, offline operation and Arabic voice | Not delivered by this fork. Pairing and companion design documents do not constitute an Android implementation. |
+
+The combined candidate passes 48 focused tests: 36 browser scenarios and 12
+retrieval-harness tests. Eight adjacent localization-audit/tool-use-harness
+tests also pass. These checks do not replace the retained hosted test lanes or
+real-device and real-model acceptance.
+
+The next gate is to resolve hosted verification and integrate the candidate
+branches. Remaining work includes other UI surfaces, Arabic retrieval/model
+measurement, voice, and Android. See the [Arabic and Android roadmap](docs/roadmap/arabic-android-fork.md),
+[model provider strategy](docs/roadmap/model-provider-strategy.md), and
+[mobile pairing protocol](docs/roadmap/mobile-pairing-protocol.md).
+
+---
+
 LifeOS is a self-hosted AI assistant that connects to your Gmail, Google Calendar, Google Docs/Sheets/Drive, iMessage, phone calls, WhatsApp, Slack, Obsidian vault, Granola meeting transcripts, iPhotos, LinkedIn, Apple contacts, Monarch finances, and Apple Health — then makes all of it **available and actionable through natural language.**
 
 **Front doors:** a web chat, Telegram, voice (wake word or push-to-talk, from a browser or an iOS Home Screen app), any MCP client (Claude Desktop, Claude Code), or a [Hermes](docs/specs/technical/client-surfaces.md) gateway that fronts your persona bots and falls back to LifeOS's native pipeline if Hermes is unreachable. It can answer from your data, take action on your behalf (draft email, schedule things, edit files), and hand long tasks to an autonomous agent that works while you don't — and reports back with a pull request when the work touches code.
