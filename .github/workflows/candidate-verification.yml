@@ -263,11 +263,6 @@ jobs:
         if: ${{ steps.select.outputs.mode == 'executed' && steps.reuse.outputs.mode != 'reused' }}
         with:
           python-version: "3.12"
-          cache: pip
-          cache-dependency-path: candidate/requirements.txt
-      - name: Ensure setup-python's pip cache path exists
-        if: ${{ steps.select.outputs.mode == 'executed' && steps.reuse.outputs.mode != 'reused' }}
-        run: mkdir -p "$(python -m pip cache dir)"
       # The installed environment is restored from a cache keyed on what
       # determines it -- runner image, interpreter, the declared torch CPU
       # build, the requirements file -- plus the ISO week, because most
