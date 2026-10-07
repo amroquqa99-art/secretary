@@ -85,3 +85,66 @@ def test_bm25_benchmark_runs_without_model_or_network():
 def test_dataset_file_is_utf8_json():
     decoded = json.loads(DATASET.read_text(encoding="utf-8"))
     assert decoded["name"] == "LifeOS Arabic Retrieval Benchmark v1"
+
+def test_model_profiles_are_valid_and_include_multilingual_candidates():
+    from scripts.benchmark_arabic_retrieval import load_profiles
+
+    data = load_profiles(PROFILES)
+    profiles = data["profiles"]
+
+    assert {"current_lifeos", "qwen3_0_6b", "bge_m3"} <= set(profiles)
+    assert profiles["qwen3_0_6b"]["embedding_model"] == "Qwen/Qwen3-Embedding-0.6B"
+    assert profiles["qwen3_0_6b"]["reranker_model"] == "Qwen/Qwen3-Reranker-0.6B"
+    assert "{query}" in profiles["qwen3_0_6b"]["query_template"]
+
+
+def test_profile_resolution_applies_defaults_but_preserves_explicit_overrides():
+    from argparse import Namespace
+    from scripts.benchmark_arabic_retrieval import apply_profile
+
+    args = Namespace(
+        profile="qwen3_0_6b",
+        profiles_file=PROFILES,
+        embedding_model=None,
+        reranker_model="custom/reranker",
+        modes=None,
+        query_template=None,
+    )
+
+    resolved = apply_profile(args)
+
+    assert resolved.embedding_model == "Qwen/Qwen3-Embedding-0.6B"
+    assert resolved.reranker_model == "custom/reranker"
+    assert resolved.modes == "bm25,vector,hybrid,rerank"
+    assert resolved.query_template.startswith("Instruct:")
+
+
+def test_query_template_is_applied_only_to_queries():
+    from scripts.benchmark_arabic_retrieval import format_query
+
+    template = "Instruct: retrieve relevant notes\\nQuery:{query}"
+    assert format_query("خطة المشروع", template) == (
+        "Instruct: retrieve relevant notes\\nQuery:خطة المشروع"
+    )
+
+
+def test_profile_validation_rejects_template_without_query_placeholder(tmp_path: Path):
+    from scripts.benchmark_arabic_retrieval import load_profiles
+
+    bad = tmp_path / "profiles.json"
+    bad.write_text(
+        json.dumps({
+            "version": 1,
+            "profiles": {
+                "broken": {
+                    "embedding_model": "example/model",
+                    "query_template": "fixed text only",
+                }
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="must contain"):
+        load_profiles(bad)
+
