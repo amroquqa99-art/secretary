@@ -79,6 +79,9 @@ function init() {
   }
 
   document.addEventListener('keydown', (event) => {
+    if (event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return;
+    if (event.target instanceof Element &&
+        event.target.closest('input, textarea, select, button, [contenteditable]')) return;
     if (event.key === '1') window.location.href = '/chat';
     if (event.key === '2') window.location.href = '/crm';
     if (event.key === '3') window.location.href = '/agents';

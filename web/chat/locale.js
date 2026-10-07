@@ -1,9 +1,8 @@
 // Locale and writing-direction state for the chat surface.
 //
 // English remains the default. A locale changes only when the operator selects
-// one explicitly (currently through ?lang=<locale> or setLocale()). This keeps
-// existing installs stable while providing a deterministic seam for the
-// language picker and translated resources added in later phases.
+// one explicitly through the language picker, ?lang=<locale>, or setLocale().
+// Locale resolution and persistence are shared with the home surface.
 
 import {
   applyDocumentLocale,
