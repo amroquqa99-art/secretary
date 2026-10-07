@@ -119,6 +119,31 @@ class TestLocaleSelection:
         }
 
 
+    def test_arabic_copy_is_applied_to_primary_chat_controls(self, page: Page, locale_chat_base_url):
+        _open(page, locale_chat_base_url, "?lang=ar")
+        assert page.locator("#localePicker").input_value() == "ar"
+        assert page.locator(".welcome h2").inner_text() == "مرحبًا بك في LifeOS"
+        assert page.locator(".welcome p").inner_text().startswith("مساعدك الشخصي للمعرفة")
+        assert page.locator("#inputField").get_attribute("placeholder") == "اكتب سؤالك..."
+        assert page.locator("#modeTextBtn").inner_text() == "نص"
+        assert page.locator("#modeVoiceBtn").inner_text() == "صوت"
+        assert page.locator("#modelPicker option[value='gemma']").inner_text() == "Gemma (محلي)"
+        assert page.locator("#voiceAuto").locator("xpath=..").inner_text().strip().endswith("تلقائي")
+
+    def test_language_picker_switches_copy_without_navigation(self, page: Page, locale_chat_base_url):
+        _open(page, locale_chat_base_url, "?lang=en")
+        page.locator("#localePicker").select_option("ar")
+        assert page.evaluate("window.lifeChat.locale") == "ar"
+        assert page.evaluate("document.documentElement.dir") == "rtl"
+        assert page.locator("#inputField").get_attribute("placeholder") == "اكتب سؤالك..."
+        assert page.locator("#localePicker").get_attribute("title") == "اللغة"
+
+        page.locator("#localePicker").select_option("en")
+        assert page.evaluate("window.lifeChat.locale") == "en"
+        assert page.evaluate("document.documentElement.dir") == "ltr"
+        assert page.locator("#inputField").get_attribute("placeholder") == "Ask a question..."
+
+
 class TestBidirectionalChatContent:
     def test_composer_and_messages_use_content_aware_direction(self, page: Page, locale_chat_base_url):
         _open(page, locale_chat_base_url, "?lang=ar")
