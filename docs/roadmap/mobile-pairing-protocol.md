@@ -104,7 +104,10 @@ Properties:
 - invalidated after success, explicit cancellation, or expiry.
 
 The operator sees a QR code or short transfer payload containing the public
-pairing data and secret.
+pairing data and secret. This payload is a short-lived bootstrap capability,
+not sufficient by itself to activate a device. Final activation requires an
+explicit approval from the already-trusted operator session after device-key
+proof is verified.
 
 ### Step 2 — device validates target
 
@@ -139,21 +142,64 @@ The Android app generates its device key pair and sends:
 }
 ```
 
-The server consumes the pairing challenge atomically and returns the device id
-plus a server nonce/challenge.
+The server validates the pairing secret and creates a **pending** device
+registration. It does not activate the device or treat possession of the QR
+payload as sufficient authorization. The pending record binds:
 
-The device signs a canonical challenge containing at least:
+```text
+pairing_id
+device_id
+device_public_key_hash
+client_nonce
+requested_scopes
+expires_at
+```
+
+A pairing id has at most one live pending registration. Competing submissions
+are rejected or require the operator to cancel/regenerate the challenge. Failed
+proof attempts are rate-limited and never activate a device.
+
+The server returns a fresh server nonce/challenge. The device signs a canonical
+challenge containing at least:
 
 ```text
 protocol_version
 server_instance_id
+pairing_id
 device_id
+device_public_key_hash
 client_nonce
 server_nonce
+granted_scopes
 issued_at
+expires_at
 ```
 
-The server verifies the signature before activating the device.
+The server verifies the signature and marks the pending registration as
+`proof_verified`, but it is still inactive.
+
+### Step 4 — trusted operator approves the pending device
+
+The already-trusted LifeOS session displays:
+
+- device name;
+- public-key fingerprint;
+- requested/granted scopes;
+- expiry;
+- a short verification code derived from the canonical pairing transcript.
+
+The Android app displays the same fingerprint/code. The operator explicitly
+approves the matching pending device from the trusted session.
+
+Approval atomically:
+
+1. confirms the pending registration is unexpired and proof-verified;
+2. consumes the pairing challenge;
+3. activates the device and its granted scopes;
+4. invalidates every other pending attempt for that pairing id.
+
+A leaked QR/bootstrap secret therefore cannot silently activate a device
+without the final trusted-session approval.
 
 ## 6. Session credentials
 
@@ -174,10 +220,16 @@ Suggested flow:
 Access-token requirements:
 
 - short lifetime (for example 10–30 minutes);
-- contains device id and scopes;
+- contains or resolves to device id and scopes;
 - audience bound to the LifeOS API;
 - rejected for revoked devices;
-- refresh requires fresh proof of device-key possession.
+- refresh requires fresh proof of device-key possession;
+- never accepted from URL/query parameters;
+- never written to application logs.
+
+Mobile API authentication uses an `Authorization` header (or an equivalently
+explicit non-cookie transport). Mobile bearer credentials are not stored in
+browser cookies and do not inherit ambient browser sessions.
 
 Exact token format (opaque server session vs signed token) is an implementation
 choice. Opaque server-side sessions are preferred initially because immediate
@@ -195,8 +247,15 @@ Initial scope groups:
 - `tasks.propose`
 - `calendar.read`
 - `calendar.propose`
+- `email.read`
+- `email.draft`
+- `email.send`
 - `notifications.receive`
 - `voice.use`
+
+`email.send` is intentionally separate from `email.draft`. Possessing the
+transport scope never bypasses LifeOS's draft → explicit confirmation → send
+gate; the server-side action policy remains authoritative.
 
 High-impact server operations remain behind LifeOS's existing action policy and
 confirmation gates even if a device has the corresponding transport scope.
@@ -272,7 +331,10 @@ Public-Internet deployment remains disabled until:
 - mobile authentication is implemented;
 - rate limiting exists;
 - pairing brute-force controls exist;
+- pending-device operator approval is implemented;
 - origin/CORS/CSRF boundaries are documented and tested;
+- mobile endpoints reject ambient cookie authentication where bearer/device
+  authentication is required;
 - security headers are configured;
 - server endpoints are audited for mobile scopes.
 
@@ -342,6 +404,9 @@ The implementation is incomplete until tests cover:
 
 - expired pairing secret;
 - reused pairing secret;
+- stolen pairing payload without trusted-session approval;
+- competing pending registration for one pairing id;
+- mismatched operator/device verification code;
 - wrong device signature;
 - malformed/oversized QR payload;
 - server-origin substitution;
