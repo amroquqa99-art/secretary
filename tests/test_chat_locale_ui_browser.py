@@ -61,7 +61,7 @@ def _open(page: Page, base_url: str, suffix: str = ""):
                 "remote_model_label": "",
                 "local_model_available": False,
             }
-        elif url.endswith("/api/hermes/status") or url.endswith("/api/agent/status"):
+        elif url.endswith(("/api/hermes/status", "/api/agent/status")):
             body = {"available": False, "configured": False, "reachable": False}
         elif "/api/conversations" in url:
             body = []
@@ -187,3 +187,59 @@ class TestBidirectionalChatContent:
         assert metrics["right"] == "0px"
         assert metrics["translateX"] > 0
         assert metrics["rectLeft"] >= metrics["viewportWidth"] - 1
+
+
+@pytest.mark.parametrize("locale", ["en", "ar"])
+def test_conversation_dates_follow_locale_with_english_parity(page: Page, locale_chat_base_url, locale):
+    # Playwright's Python clock accepts epoch seconds; JS Date returns milliseconds.
+    page.clock.install(time=page.evaluate("new Date(2026, 9, 7, 15, 30).getTime()") / 1000)
+    assert page.evaluate("new Date().getFullYear()") == 2026
+    _open(page, locale_chat_base_url, f"?lang={locale}")
+    labels = page.evaluate("""async () => {
+        const { formatDate } = await import('/static/chat/conversations.js');
+        const now = Date.now();
+        return {
+            empty: formatDate(''),
+            fresh: formatDate(new Date(now - 30000).toISOString()),
+            minutes: formatDate(new Date(now - 5 * 60000).toISOString()),
+            hours: formatDate(new Date(now - 2 * 3600000).toISOString()),
+            yesterday: formatDate(new Date(now - 86400000).toISOString()),
+            older: formatDate(new Date(now - 20 * 86400000).toISOString()),
+            lastYear: formatDate('2025-06-10T12:00:00Z'),
+        };
+    }""")
+    assert labels["empty"] == ""
+    if locale == "en":
+        assert labels["fresh"] == "Just now"
+        assert labels["minutes"] == "5m ago"
+        assert labels["hours"] == "2h ago"
+        assert labels["yesterday"].startswith("Yesterday ")
+        assert "Sep" in labels["older"]
+        assert "2025" in labels["lastYear"]
+    else:
+        assert labels["fresh"] == "الآن"
+        five = page.evaluate("new Intl.NumberFormat('ar').format(5)")
+        assert labels["minutes"] == f"قبل {five} دقائق"
+        assert labels["hours"] == "قبل ساعتين"
+        assert labels["yesterday"].startswith("أمس ")
+        assert "سبتمبر" in labels["older"]
+        year = page.evaluate("new Intl.NumberFormat('ar', {useGrouping: false}).format(2025)")
+        assert year in labels["lastYear"]
+
+
+def test_language_picker_refreshes_existing_sidebar_dates(page: Page, locale_chat_base_url):
+    _open(page, locale_chat_base_url, "?lang=en")
+    page.evaluate("""() => {
+        window.lifeChat.state.allConversations = [{
+            id: 'synthetic-locale-test', title: 'Synthetic conversation',
+            updated_at: new Date(Date.now() - 5 * 60000).toISOString(),
+        }];
+        window.filterConversations();
+    }""")
+    label = page.locator(".conversation-date").first
+    assert label.inner_text() == "5m ago"
+    page.locator("#localePicker").select_option("ar")
+    five = page.evaluate("new Intl.NumberFormat('ar').format(5)")
+    assert label.inner_text() == f"قبل {five} دقائق"
+    page.locator("#localePicker").select_option("en")
+    assert label.inner_text() == "5m ago"

@@ -40,6 +40,7 @@ export function initChat({ elements: els, endpoints: eps, hooks: hks } = {}) {
   const { inputField } = elements;
   initLocalePicker(elements.localePicker);
   translateChatUi();
+  document.addEventListener('lifeos:localechange', filterConversations);
   // User-authored text may mix Arabic, English, URLs, and code. Let the
   // browser resolve direction from the actual content instead of forcing the
   // surrounding UI locale onto the composer.

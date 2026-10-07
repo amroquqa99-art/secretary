@@ -106,6 +106,8 @@ CLI handoffs run as async worker sessions and report results via Telegram and `/
 **Features:**
 - Conversations stored in SQLite with full message history
 - List all conversations with timestamps
+- Sidebar timestamps follow the selected Arabic or English locale. Changing
+  language refreshes visible relative-time labels and dates without reloading.
 - Resume previous conversations
 - Delete conversations
 - Search across conversation history

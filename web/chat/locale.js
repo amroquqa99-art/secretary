@@ -10,6 +10,8 @@ const SUPPORTED_LOCALES = new Set(['en', 'ar']);
 
 const TRANSLATIONS = {
   en: {
+    just_now: 'Just now',
+    yesterday: 'Yesterday',
     new_chat: 'New chat',
     search_conversations: 'Search conversations...',
     no_conversations: 'No conversations yet',
@@ -60,6 +62,8 @@ const TRANSLATIONS = {
     language: 'Language',
   },
   ar: {
+    just_now: 'الآن',
+    yesterday: 'أمس',
     new_chat: 'محادثة جديدة',
     search_conversations: 'ابحث في المحادثات...',
     no_conversations: 'لا توجد محادثات بعد',
@@ -208,6 +212,7 @@ export function setLocale(locale) {
   applyLocale(normalized, { persist: true });
   translateChatUi();
   if (localePicker) localePicker.value = normalized;
+  document.dispatchEvent(new CustomEvent('lifeos:localechange'));
   return true;
 }
 

@@ -5,6 +5,7 @@
 import { state, config, elements, endpoints } from './session.js';
 import { addMessage, escapeHtml } from './thread.js';
 import { startPendingQuestionPolling, stopPendingQuestionPolling } from './pending-question.js';
+import { localeState, t } from './locale.js';
 
 export function toggleSidebar() {
   elements.sidebar.classList.toggle('open');
@@ -266,19 +267,27 @@ export function formatDate(dateStr) {
   const date = new Date(dateStr);
   const now = new Date();
   const diff = now - date;
+  const locale = localeState.locale === 'ar' ? 'ar' : 'en-US';
+  const relative = (amount, unit, english) => locale === 'ar'
+    ? new Intl.RelativeTimeFormat(locale, { numeric: 'always' }).format(-amount, unit)
+    : english;
 
   // Under 1 minute: "Just now"
-  if (diff < 60000) return 'Just now';
+  if (diff < 60000) return t('just_now');
 
   // Under 1 hour: "5m ago", "23m ago"
-  if (diff < 3600000) return Math.floor(diff / 60000) + 'm ago';
+  if (diff < 3600000) {
+    const minutes = Math.floor(diff / 60000);
+    return relative(minutes, 'minute', minutes + 'm ago');
+  }
 
   // Check if date is today (same calendar day in local timezone)
   const isToday = date.toDateString() === now.toDateString();
 
   // Under 24 hours AND today: "2h ago", "11h ago"
   if (diff < 86400000 && isToday) {
-    return Math.floor(diff / 3600000) + 'h ago';
+    const hours = Math.floor(diff / 3600000);
+    return relative(hours, 'hour', hours + 'h ago');
   }
 
   // Check if date is yesterday
@@ -286,20 +295,20 @@ export function formatDate(dateStr) {
   yesterday.setDate(yesterday.getDate() - 1);
   const isYesterday = date.toDateString() === yesterday.toDateString();
 
-  // Format time as "3:15 PM"
-  const timeStr = date.toLocaleTimeString('en-US', {
+  // Format wall-clock time in the selected locale.
+  const timeStr = date.toLocaleTimeString(locale, {
     hour: 'numeric',
     minute: '2-digit',
     hour12: true
   });
 
-  // Yesterday: "Yesterday 3:15 PM"
+  // The localized yesterday label includes wall-clock time.
   if (isYesterday) {
-    return 'Yesterday ' + timeStr;
+    return t('yesterday') + ' ' + timeStr;
   }
 
-  // Format month and day as "Jan 8"
-  const monthDay = date.toLocaleDateString('en-US', {
+  // Older dates use the selected locale's month and numeral conventions.
+  const monthDay = date.toLocaleDateString(locale, {
     month: 'short',
     day: 'numeric'
   });
@@ -311,14 +320,14 @@ export function formatDate(dateStr) {
   if (isSameYear) {
     // For dates within the last week, include time
     if (diff < 604800000) {
-      return monthDay + ', ' + timeStr;
+      return monthDay + (locale === 'ar' ? '، ' : ', ') + timeStr;
     }
     // Older this-year dates: just "Jan 8"
     return monthDay;
   }
 
   // Older (different year): "Jan 8, 2025"
-  return date.toLocaleDateString('en-US', {
+  return date.toLocaleDateString(locale, {
     month: 'short',
     day: 'numeric',
     year: 'numeric'
