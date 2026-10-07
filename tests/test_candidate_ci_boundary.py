@@ -61,6 +61,11 @@ def test_candidate_workflow_separates_untrusted_execution_from_status_publisher(
     assert 'git -C candidate cat-file commit "$CANDIDATE_SHA"' in workflow
     assert 'test "$FIRST_PARENT" = "$TRUSTED_RUNNER_SHA"' in workflow
     assert execute.index("name: Bind dispatched runner") < execute.index("name: Install the declared CPU test environment")
+    assert execute.index("actions/setup-python") < execute.index("name: Ensure setup-python's pip cache path exists") < execute.index("name: Install the declared CPU test environment")
+    cache_path_step = execute[execute.index("name: Ensure setup-python's pip cache path exists"):]
+    cache_path_step = cache_path_step[:cache_path_step.index("\n      - ")]
+    assert 'mkdir -p "$(python -m pip cache dir)"' in cache_path_step
+    assert executed in cache_path_step
 
     # Lane selection is a trusted decision taken before any environment is
     # built: a docs-only candidate installs and executes nothing, and the
