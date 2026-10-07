@@ -155,7 +155,7 @@ async def test_global_remote_backend_completes_tool_turn_with_null_terminal_delt
 
 
 def test_force_local_still_overrides_global_remote_backend(monkeypatch):
-    """The fix must not weaken an explicit local per-turn choice."""
+    """An explicit local per-turn choice overrides the global remote backend."""
     from api.services import agent_loop, llm_client
 
     llm_client.reset_local_llm()
