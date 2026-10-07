@@ -7,12 +7,11 @@ models unless --allow-download is passed explicitly.
 
 Examples:
     python scripts/benchmark_arabic_retrieval.py
+    python scripts/benchmark_arabic_retrieval.py --profile qwen3_0_6b
+    python scripts/benchmark_arabic_retrieval.py --profile bge_m3 --allow-download
     python scripts/benchmark_arabic_retrieval.py \
         --modes bm25,vector,hybrid \
-        --embedding-model Alibaba-NLP/gte-multilingual-base
-    python scripts/benchmark_arabic_retrieval.py \
-        --modes bm25,vector,hybrid,rerank \
-        --embedding-model <model> --reranker-model <model> --allow-download
+        --embedding-model <model> --query-template '{query}'
 """
 from __future__ import annotations
 
@@ -28,12 +27,60 @@ from typing import Iterable
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATASET = ROOT / "benchmarks" / "arabic_retrieval_v1.json"
+DEFAULT_PROFILES = ROOT / "benchmarks" / "arabic_retrieval_profiles.json"
 
 
 def load_dataset(path: Path) -> dict:
     data = json.loads(path.read_text(encoding="utf-8"))
     validate_dataset(data)
     return data
+
+
+def load_profiles(path: Path) -> dict:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if data.get("version") != 1:
+        raise ValueError("unsupported profile version")
+    profiles = data.get("profiles")
+    if not isinstance(profiles, dict) or not profiles:
+        raise ValueError("profiles must be a non-empty object")
+    for name, profile in profiles.items():
+        if not isinstance(profile, dict):
+            raise ValueError(f"profile {name} must be an object")
+        if not profile.get("embedding_model"):
+            raise ValueError(f"profile {name} has no embedding_model")
+        template = profile.get("query_template", "{query}")
+        if "{query}" not in template:
+            raise ValueError(f"profile {name} query_template must contain {{query}}")
+    return data
+
+
+def apply_profile(args: argparse.Namespace) -> argparse.Namespace:
+    if args.profile:
+        profiles = load_profiles(args.profiles_file)["profiles"]
+        if args.profile not in profiles:
+            raise SystemExit(
+                f"unknown profile {args.profile!r}; available: {', '.join(sorted(profiles))}"
+            )
+        profile = profiles[args.profile]
+        if args.embedding_model is None:
+            args.embedding_model = profile.get("embedding_model")
+        if args.reranker_model is None:
+            args.reranker_model = profile.get("reranker_model")
+        if args.modes is None:
+            args.modes = profile.get("modes", "bm25")
+        if args.query_template is None:
+            args.query_template = profile.get("query_template", "{query}")
+    if args.modes is None:
+        args.modes = "bm25"
+    if args.query_template is None:
+        args.query_template = "{query}"
+    if "{query}" not in args.query_template:
+        raise SystemExit("--query-template must contain {query}")
+    return args
+
+
+def format_query(query: str, template: str) -> str:
+    return template.replace("{query}", query)
 
 
 def validate_dataset(data: dict) -> None:
@@ -175,6 +222,7 @@ def vector_rankings(
     model_name: str,
     limit: int,
     allow_download: bool,
+    query_template: str = "{query}",
 ) -> dict[str, list[str]]:
     import numpy as np
 
@@ -191,7 +239,7 @@ def vector_rankings(
     rankings = {}
     for query in dataset["queries"]:
         query_vector = model.encode(
-            query["text"],
+            format_query(query["text"], query_template),
             convert_to_numpy=True,
             normalize_embeddings=True,
             show_progress_bar=False,
@@ -247,9 +295,15 @@ def print_summary(name: str, result: dict) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
-    parser.add_argument("--modes", default="bm25")
+    parser.add_argument("--profiles-file", type=Path, default=DEFAULT_PROFILES)
+    parser.add_argument("--profile")
+    parser.add_argument("--modes")
     parser.add_argument("--embedding-model")
     parser.add_argument("--reranker-model")
+    parser.add_argument(
+        "--query-template",
+        help="Embedding-query template containing {query}; documents stay unmodified.",
+    )
     parser.add_argument("--candidate-limit", type=int, default=20)
     parser.add_argument("--top-k", type=int, default=10)
     parser.add_argument("--allow-download", action="store_true")
@@ -258,7 +312,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
-    args = parse_args()
+    args = apply_profile(parse_args())
     dataset = load_dataset(args.dataset)
     modes = {mode.strip() for mode in args.modes.split(",") if mode.strip()}
     unknown = modes - {"bm25", "vector", "hybrid", "rerank"}
@@ -287,6 +341,7 @@ def main() -> int:
             args.embedding_model,
             args.candidate_limit,
             args.allow_download,
+            args.query_template,
         )
         rankings["vector"] = vector
         if "vector" in modes:
@@ -325,8 +380,10 @@ def main() -> int:
         "dataset_version": dataset["version"],
         "document_count": len(dataset["documents"]),
         "query_count": len(dataset["queries"]),
+        "profile": args.profile,
         "embedding_model": args.embedding_model,
         "reranker_model": args.reranker_model,
+        "query_template": args.query_template,
         "allow_download": args.allow_download,
         "elapsed_seconds": round(time.perf_counter() - started, 3),
         "results": results,
