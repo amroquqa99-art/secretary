@@ -61,7 +61,7 @@ def _open(page: Page, base_url: str, suffix: str = ""):
                 "remote_model_label": "",
                 "local_model_available": False,
             }
-        elif url.endswith("/api/hermes/status") or url.endswith("/api/agent/status"):
+        elif url.endswith(("/api/hermes/status", "/api/agent/status")):
             body = {"available": False, "configured": False, "reachable": False}
         elif "/api/conversations" in url:
             body = []
@@ -187,3 +187,72 @@ class TestBidirectionalChatContent:
         assert metrics["right"] == "0px"
         assert metrics["translateX"] > 0
         assert metrics["rectLeft"] >= metrics["viewportWidth"] - 1
+
+
+def _swipe(page: Page, start_x: int, end_x: int, end_y: int = 240):
+    page.evaluate("""({startX, endX, endY}) => {
+        const target = document.body;
+        const start = new Touch({identifier: 1, target, clientX: startX, clientY: 240});
+        const end = new Touch({identifier: 1, target, clientX: endX, clientY: endY});
+        target.dispatchEvent(new TouchEvent('touchstart', {touches: [start], bubbles: true}));
+        target.dispatchEvent(new TouchEvent('touchend', {changedTouches: [end], bubbles: true}));
+    }""", {"startX": start_x, "endX": end_x, "endY": end_y})
+
+
+@pytest.mark.parametrize("locale, edge, inward", [("en", 5, 100), ("ar", 385, 290)])
+def test_mobile_sidebar_opens_from_locale_start_edge(page: Page, locale_chat_base_url, locale, edge, inward):
+    page.set_viewport_size({"width": 390, "height": 844})
+    _open(page, locale_chat_base_url, f"?lang={locale}")
+    _swipe(page, edge, inward)
+    assert page.locator(".sidebar").evaluate("el => el.classList.contains('open')")
+    assert page.locator("#overlay").evaluate("el => el.classList.contains('visible')")
+
+    _swipe(page, inward, edge)
+    assert not page.locator(".sidebar").evaluate("el => el.classList.contains('open')")
+    assert not page.locator("#overlay").evaluate("el => el.classList.contains('visible')")
+
+
+@pytest.mark.parametrize("locale, edge, inward", [("en", 385, 290), ("ar", 5, 100)])
+def test_mobile_sidebar_ignores_opposite_edge(page: Page, locale_chat_base_url, locale, edge, inward):
+    page.set_viewport_size({"width": 390, "height": 844})
+    _open(page, locale_chat_base_url, f"?lang={locale}")
+    _swipe(page, edge, inward)
+    assert not page.locator(".sidebar").evaluate("el => el.classList.contains('open')")
+
+
+@pytest.mark.parametrize("locale, edge, inward", [("en", 5, 100), ("ar", 385, 290)])
+def test_mobile_sidebar_ignores_vertical_and_short_swipes(page: Page, locale_chat_base_url, locale, edge, inward):
+    page.set_viewport_size({"width": 390, "height": 844})
+    _open(page, locale_chat_base_url, f"?lang={locale}")
+    _swipe(page, edge, inward, end_y=400)
+    assert not page.locator(".sidebar").evaluate("el => el.classList.contains('open')")
+    _swipe(page, edge, (edge + inward) // 2)
+    assert not page.locator(".sidebar").evaluate("el => el.classList.contains('open')")
+
+
+def test_mobile_sidebar_swipe_follows_live_locale_switch(page: Page, locale_chat_base_url):
+    page.set_viewport_size({"width": 390, "height": 844})
+    _open(page, locale_chat_base_url, "?lang=en")
+    page.evaluate("window.lifeChat.setLocale('ar')")
+    _swipe(page, 385, 290)
+    assert page.locator(".sidebar").evaluate("el => el.classList.contains('open')")
+
+
+@pytest.mark.parametrize("interruption", ["cancel", "multitouch"])
+def test_mobile_sidebar_discards_interrupted_gestures(page: Page, locale_chat_base_url, interruption):
+    page.set_viewport_size({"width": 390, "height": 844})
+    _open(page, locale_chat_base_url, "?lang=ar")
+    page.evaluate("""interruption => {
+        const target = document.body;
+        const start = new Touch({identifier: 1, target, clientX: 385, clientY: 240});
+        const end = new Touch({identifier: 1, target, clientX: 290, clientY: 240});
+        target.dispatchEvent(new TouchEvent('touchstart', {touches: [start], bubbles: true}));
+        if (interruption === 'cancel') {
+            target.dispatchEvent(new TouchEvent('touchcancel', {bubbles: true}));
+        } else {
+            const second = new Touch({identifier: 2, target, clientX: 350, clientY: 250});
+            target.dispatchEvent(new TouchEvent('touchstart', {touches: [start, second], bubbles: true}));
+        }
+        target.dispatchEvent(new TouchEvent('touchend', {changedTouches: [end], bubbles: true}));
+    }""", interruption)
+    assert not page.locator(".sidebar").evaluate("el => el.classList.contains('open')")

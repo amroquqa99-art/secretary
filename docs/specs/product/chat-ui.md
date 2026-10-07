@@ -124,6 +124,14 @@ CLI handoffs run as async worker sessions and report results via Telegram and `/
 | `Ctrl/Cmd+/` | Toggle sidebar |
 | `Esc` | Cancel/close modal |
 
+### Mobile sidebar gestures
+
+Swipe inward from the screen's start edge to open the conversation sidebar:
+the left edge in English, the right edge in Arabic. Swipe outward to close it.
+The gesture follows the selected language without reloading. Vertical scrolls,
+short swipes, cancelled touches, and multi-finger gestures leave the sidebar
+unchanged.
+
 ### P4.3: Cost Tracking
 
 **Status:** Complete
