@@ -11,7 +11,7 @@
 // handler runs — so the bridge exists by the time any shell code touches it.
 
 import { state, config, elements, endpoints, hooks } from './session.js';
-import { localeState, setLocale } from './locale.js';
+import { localeState, setLocale, initLocalePicker, translateChatUi, t } from './locale.js';
 import { addMessage, toggleSources, setStatus } from './thread.js';
 import { setupAttachmentHandlers, openFilePicker, removeAttachment } from './attachments.js';
 import {
@@ -38,6 +38,8 @@ export function initChat({ elements: els, endpoints: eps, hooks: hks } = {}) {
   Object.assign(hooks, hks || {});
 
   const { inputField } = elements;
+  initLocalePicker(elements.localePicker);
+  translateChatUi();
   // User-authored text may mix Arabic, English, URLs, and code. Let the
   // browser resolve direction from the actual content instead of forcing the
   // surrounding UI locale onto the composer.
@@ -91,7 +93,7 @@ export function initChat({ elements: els, endpoints: eps, hooks: hks } = {}) {
   window.lifeChat.backendReady.then(() => { maybeOpenDeepLinkedConversation(); });
   initModel();  // restore the per-turn model picker (Auto/Sonnet/Opus/Gemma)
   initVoice();  // restore Voice|Text mode + wire the hold-to-talk dock
-  setStatus('', 'Ready');
+  setStatus('', t('ready'));
   inputField.focus();
 }
 
