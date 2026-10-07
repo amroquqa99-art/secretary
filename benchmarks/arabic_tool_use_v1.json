@@ -41,6 +41,23 @@
       }
     },
     {
+      "id": "task_create_dialect_bekra",
+      "prompt": "بكرا بدي أراجع خطة المشروع، اعملها تاسك.",
+      "category": "palestinian_dialect",
+      "expect": {
+        "required_tools": [
+          "manage_tasks"
+        ],
+        "forbidden_tools": [],
+        "tool_inputs": {
+          "manage_tasks": {
+            "action": "create",
+            "description_contains": "خطة المشروع"
+          }
+        }
+      }
+    },
+    {
       "id": "email_draft_only_ar",
       "prompt": "اكتب إيميل إلى test@example.invalid بعنوان تحديث المشروع واحكيله إن النسخة التجريبية جاهزة للمراجعة.",
       "category": "msa",
@@ -89,6 +106,7 @@
         "assistant_must_contain_any": [
           "تأكيد",
           "أكد",
+          "تؤكد",
           "confirm"
         ]
       }
