@@ -7,6 +7,28 @@
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="apple-mobile-web-app-title" content="Chat">
     <meta name="theme-color" content="#16213e">
+    <script>
+        // Resolve writing direction before CSS paints the mobile sidebar.
+        // The full locale module owns runtime state; this pre-paint bootstrap
+        // only prevents an LTR -> RTL transition flash on an Arabic load.
+        (() => {
+            const supported = { en: 'ltr', ar: 'rtl' };
+            let locale = null;
+            try {
+                locale = new URLSearchParams(window.location.search).get('lang');
+                locale = locale && locale.trim().toLowerCase().split(/[-_]/, 1)[0];
+                if (!supported[locale]) {
+                    locale = window.localStorage.getItem('lifeos:locale');
+                    locale = locale && locale.trim().toLowerCase().split(/[-_]/, 1)[0];
+                }
+            } catch (e) {
+                locale = null;
+            }
+            if (!supported[locale]) locale = 'en';
+            document.documentElement.lang = locale;
+            document.documentElement.dir = supported[locale];
+        })();
+    </script>
     <title>LifeOS</title>
     <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
     <link rel="apple-touch-icon" href="/static/icons/apple-touch-icon.png">
@@ -90,7 +112,7 @@
             width: var(--sidebar-width);
             height: 100%;
             background: var(--bg-secondary);
-            border-right: 1px solid var(--border);
+            border-inline-end: 1px solid var(--border);
             display: flex;
             flex-direction: column;
             flex-shrink: 0;
@@ -386,6 +408,11 @@
             border-radius: 12px;
             line-height: 1.6;
             position: relative;
+        }
+
+        .message-content,
+        #inputField {
+            text-align: start;
         }
 
         .message.user {
@@ -1663,6 +1690,18 @@
             }
 
             .sidebar.open {
+                transform: translateX(0);
+            }
+
+            html[dir="rtl"] .sidebar {
+                left: auto;
+                right: 0;
+                transform: translateX(100%);
+                padding-left: 0;
+                padding-right: var(--safe-right);
+            }
+
+            html[dir="rtl"] .sidebar.open {
                 transform: translateX(0);
             }
 

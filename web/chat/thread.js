@@ -47,6 +47,8 @@ export function addMessage(content, type, sources = [], messageId = null, target
   }
 
   msg.innerHTML = html;
+  const contentEl = msg.querySelector('.message-content');
+  if (contentEl) contentEl.setAttribute('dir', 'auto');
   // When rendering into a detached target (e.g. bulk thread render),
   // append there and skip the per-message scroll; the caller scrolls
   // once after the batch lands.
@@ -62,6 +64,7 @@ export function updateMessage(messageId, content) {
     const contentEl = msg.querySelector('.message-content');
     if (contentEl) {
       contentEl.innerHTML = formatContent(content);
+      contentEl.setAttribute('dir', 'auto');
     }
   }
 }
