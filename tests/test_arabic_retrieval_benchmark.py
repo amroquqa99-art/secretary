@@ -97,6 +97,7 @@ def test_model_profiles_are_valid_and_include_multilingual_candidates():
     assert profiles["mxbai_recommended"]["query_template"].startswith("Represent this sentence")
     assert profiles["qwen3_0_6b"]["embedding_model"] == "Qwen/Qwen3-Embedding-0.6B"
     assert profiles["qwen3_0_6b"]["reranker_model"] == "Qwen/Qwen3-Reranker-0.6B"
+    assert profiles["qwen3_0_6b"]["min_sentence_transformers"] == "5.4.0"
     assert "{query}" in profiles["qwen3_0_6b"]["query_template"]
 
 
@@ -149,4 +150,10 @@ def test_profile_validation_rejects_template_without_query_placeholder(tmp_path:
 
     with pytest.raises(ValueError, match="must contain"):
         load_profiles(bad)
+
+def test_version_tuple_handles_release_suffixes():
+    from scripts.benchmark_arabic_retrieval import _version_tuple
+
+    assert _version_tuple("5.4.0") == (5, 4, 0)
+    assert _version_tuple("5.4.1.dev2") == (5, 4, 1)
 
