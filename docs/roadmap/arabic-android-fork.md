@@ -51,8 +51,8 @@ same as the pinned upstream tree SHA:
 830ddf96b14f54a69059ac0f47ad4972dde55cb2
 ```
 
-All future work should branch from a verified main commit. Do not rewrite the
-archive branch and do not force-push main as part of routine development.
+Fork development branches originate from a verified main commit. The archive
+branch is immutable, and routine development updates main without force-pushes.
 
 ## 4. Audit findings
 
