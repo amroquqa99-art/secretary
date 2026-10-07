@@ -546,6 +546,13 @@ async def run_agent_loop(
         "status", or "result".
     """
     client = _select_client(model, force_local=force_local, force_remote=force_remote)
+    configured_backend = getattr(settings, "llm_backend", "anthropic").lower()
+    # The remote provider can be selected explicitly for one turn, or as the
+    # configured global backend. Keep that distinction in one derived flag so
+    # remote pricing and llama-server-only request fields stay consistent.
+    remote_backend_turn = force_remote or (
+        not force_local and configured_backend == "remote"
+    )
     # The turn's actual served model -- LocalLLMClient.model is
     # "local" by default or the configured remote provider's id when
     # force_remote built it (LocalLLMClient.model docstring);
@@ -568,12 +575,12 @@ async def run_agent_loop(
     # a single kwarg on a two-class module. settings.local_agent_enable_thinking
     # defaults True (current behaviour) -> mapped to None so the request body
     # stays byte-identical until an operator opts out.
-    # `not force_remote`: the remote provider is also a LocalLLMClient
-    # instance (same OpenAI-compatible plumbing) but isn't llama-server —
-    # it doesn't understand llama-server's chat_template_kwargs switch, so
-    # this local-only knob must never reach it regardless of the setting.
+    # The remote provider is also a LocalLLMClient instance (same
+    # OpenAI-compatible plumbing) but is not llama-server. Whether selected
+    # explicitly or by LIFEOS_LLM_BACKEND=remote, it must never receive
+    # llama-server's chat_template_kwargs switch.
     astream_kwargs: dict = {}
-    if isinstance(client, LocalLLMClient) and not force_remote:
+    if isinstance(client, LocalLLMClient) and not remote_backend_turn:
         astream_kwargs["enable_thinking"] = None if settings.local_agent_enable_thinking else False
 
     # Bind a fresh per-turn email-draft set. The send gate uses this to refuse
@@ -641,7 +648,9 @@ async def run_agent_loop(
         # budget-enforcement Opus-rate fallback.
         #
         # The one exception: the configured remote provider's rates
-        # come from settings, not pricing.PRICING. The whole point of that
+        # come from settings, not pricing.PRICING. This applies whether the
+        # provider is the global backend or an explicit per-turn selection.
+        # The whole point of that
         # slot is an operator-flippable model id (Fireworks today, anything
         # OpenAI-compatible tomorrow) -- a static dict keyed by literal model
         # id would need a code change on every flip, which is exactly what
@@ -649,7 +658,7 @@ async def run_agent_loop(
         # "is this model in PRICING") so an upstream model id that happens
         # to collide with a first-party key can't accidentally borrow that
         # key's rate.
-        if force_remote:
+        if remote_backend_turn:
             input_price = settings.remote_llm_input_price_per_mtok
             output_price = settings.remote_llm_output_price_per_mtok
             if input_price is None or output_price is None:
