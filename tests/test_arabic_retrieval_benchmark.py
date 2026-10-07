@@ -2,6 +2,9 @@
 
 import copy
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -10,6 +13,7 @@ pytestmark = pytest.mark.unit
 
 ROOT = Path(__file__).resolve().parent.parent
 DATASET = ROOT / "benchmarks" / "arabic_retrieval_v1.json"
+PROFILES = ROOT / "benchmarks" / "arabic_retrieval_profiles.json"
 
 
 def test_dataset_is_valid_and_contains_required_arabic_slices():
@@ -85,3 +89,95 @@ def test_bm25_benchmark_runs_without_model_or_network():
 def test_dataset_file_is_utf8_json():
     decoded = json.loads(DATASET.read_text(encoding="utf-8"))
     assert decoded["name"] == "LifeOS Arabic Retrieval Benchmark v1"
+
+
+def test_bm25_cli_runs_from_another_directory_without_pythonpath(tmp_path: Path):
+    output = tmp_path / "report.json"
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "benchmark_arabic_retrieval.py"),
+         "--profile", "current_lifeos", "--modes", "bm25", "--output", str(output)],
+        cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert report["profile"] == "current_lifeos"
+    assert set(report["results"]) == {"bm25"}
+    assert report["query_count"] > 0
+    assert report["allow_download"] is False
+
+
+def test_model_profiles_are_valid_and_include_multilingual_candidates():
+    from scripts.benchmark_arabic_retrieval import load_profiles
+
+    data = load_profiles(PROFILES)
+    profiles = data["profiles"]
+
+    assert {"current_lifeos", "mxbai_recommended", "qwen3_0_6b", "bge_m3"} <= set(profiles)
+    assert profiles["current_lifeos"]["query_template"] == "{query}"
+    assert profiles["mxbai_recommended"]["query_template"].startswith("Represent this sentence")
+    assert profiles["qwen3_0_6b"]["embedding_model"] == "Qwen/Qwen3-Embedding-0.6B"
+    assert profiles["qwen3_0_6b"]["reranker_model"] == "Qwen/Qwen3-Reranker-0.6B"
+    assert profiles["qwen3_0_6b"]["min_sentence_transformers"] == "5.4.0"
+    assert "{query}" in profiles["qwen3_0_6b"]["query_template"]
+
+
+def test_profile_resolution_applies_defaults_but_preserves_explicit_overrides():
+    from argparse import Namespace
+
+    from scripts.benchmark_arabic_retrieval import apply_profile
+
+    args = Namespace(
+        profile="qwen3_0_6b",
+        profiles_file=PROFILES,
+        embedding_model=None,
+        reranker_model="custom/reranker",
+        modes=None,
+        query_template=None,
+    )
+
+    resolved = apply_profile(args)
+
+    assert resolved.embedding_model == "Qwen/Qwen3-Embedding-0.6B"
+    assert resolved.reranker_model == "custom/reranker"
+    assert resolved.modes == "bm25,vector,hybrid,rerank"
+    assert resolved.query_template.startswith("Instruct:")
+
+
+def test_query_template_is_applied_only_to_queries():
+    from scripts.benchmark_arabic_retrieval import format_query
+
+    template = "Instruct: retrieve relevant notes\\nQuery:{query}"
+    assert format_query("خطة المشروع", template) == (
+        "Instruct: retrieve relevant notes\\nQuery:خطة المشروع"
+    )
+
+
+def test_profile_validation_rejects_template_without_query_placeholder(tmp_path: Path):
+    from scripts.benchmark_arabic_retrieval import load_profiles
+
+    bad = tmp_path / "profiles.json"
+    bad.write_text(
+        json.dumps({
+            "version": 1,
+            "profiles": {
+                "broken": {
+                    "embedding_model": "example/model",
+                    "query_template": "fixed text only",
+                }
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="must contain"):
+        load_profiles(bad)
+
+
+def test_version_tuple_handles_release_suffixes():
+    from scripts.benchmark_arabic_retrieval import _version_tuple
+
+    assert _version_tuple("5.4.0") == (5, 4, 0)
+    assert _version_tuple("5.4.1.dev2") == (5, 4, 1)
+
