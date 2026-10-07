@@ -61,11 +61,10 @@ def test_candidate_workflow_separates_untrusted_execution_from_status_publisher(
     assert 'git -C candidate cat-file commit "$CANDIDATE_SHA"' in workflow
     assert 'test "$FIRST_PARENT" = "$TRUSTED_RUNNER_SHA"' in workflow
     assert execute.index("name: Bind dispatched runner") < execute.index("name: Install the declared CPU test environment")
-    assert execute.index("actions/setup-python") < execute.index("name: Ensure setup-python's pip cache path exists") < execute.index("name: Install the declared CPU test environment")
-    cache_path_step = execute[execute.index("name: Ensure setup-python's pip cache path exists"):]
-    cache_path_step = cache_path_step[:cache_path_step.index("\n      - ")]
-    assert 'mkdir -p "$(python -m pip cache dir)"' in cache_path_step
-    assert "steps.select.outputs.mode == 'executed'" in cache_path_step
+    setup_python = execute[execute.index("actions/setup-python"):]
+    setup_python = setup_python[:setup_python.index("\n      - ")]
+    assert "cache:" not in setup_python
+    assert "cache-dependency-path:" not in setup_python
 
     # Lane selection is a trusted decision taken before any environment is
     # built: a docs-only candidate installs and executes nothing, and the
@@ -231,6 +230,9 @@ def test_candidate_workflow_caches_the_test_environment_from_a_trusted_job_only(
     assert prepare["steps"][0]["name"] == "Bind the environment builder to protected workflow provenance"
     assert "key: ${{ steps.env-cache.outputs.cache-primary-key }}" in prepare_text
     assert "actions/cache/save" not in workflow[workflow.index("  execute-candidate:"):]
+    candidate_setup = execute_text[execute_text.index("actions/setup-python"):]
+    candidate_setup = candidate_setup[:candidate_setup.index("\n      - ")]
+    assert "cache:" not in candidate_setup, "untrusted execution must not get setup-python cache write scope"
     execute_text = workflow[workflow.index("  execute-candidate:"):workflow.index("  publish-aggregate:")]
     restore_at = execute_text.index("name: Restore the installed CPU test environment")
     install_at = execute_text.index("name: Install the declared CPU test environment")
