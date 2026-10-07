@@ -115,8 +115,8 @@ function maybeOpenDeepLinkedConversation() {
 // directly as module functions.
 window.lifeChat = {
   state, config, initChat, personaOrchestrates, personaSupportsHandoff,
-  locale: localeState.locale,
-  direction: localeState.direction,
+  get locale() { return localeState.locale; },
+  get direction() { return localeState.direction; },
   setLocale,
 };
 
