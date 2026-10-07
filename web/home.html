@@ -7,6 +7,8 @@
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="apple-mobile-web-app-title" content="LifeOS">
     <meta name="theme-color" content="#16213e">
+    <script src="/static/i18n/prepaint.js"></script>
+    <script type="module" src="/static/home.js"></script>
     <title>LifeOS</title>
     <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
     <link rel="apple-touch-icon" href="/static/icons/apple-touch-icon.png">
@@ -64,6 +66,24 @@
             align-items: center;
             justify-content: center;
             padding: 2rem;
+        }
+
+        .locale-picker {
+            position: fixed;
+            inset-block-start: 1rem;
+            inset-inline-end: 1rem;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            background: var(--bg-card);
+            color: var(--text-primary);
+            padding: 0.5rem 0.75rem;
+            font: inherit;
+            cursor: pointer;
+        }
+
+        .locale-picker:focus-visible {
+            outline: 2px solid var(--accent);
+            outline-offset: 2px;
         }
 
         /* Sized so four cards sit at roughly the width three had at 600px.
@@ -173,27 +193,33 @@
     </style>
 </head>
 <body>
+    <select class="locale-picker" id="localePicker" title="Language" aria-label="Language"
+            data-i18n-title="language" data-i18n-aria-label="language">
+        <option value="en">English</option>
+        <option value="ar">العربية</option>
+    </select>
+
     <div class="container">
         <h1 class="logo">LifeOS</h1>
-        <p class="tagline">Your personal knowledge system</p>
+        <p class="tagline" data-i18n="tagline">Your personal knowledge system</p>
 
         <div class="cards">
             <a href="/chat" class="card">
                 <div class="card-icon">💬</div>
-                <div class="card-title">Chat</div>
-                <div class="card-description">Ask questions about your notes, calendar, and emails</div>
+                <div class="card-title" data-i18n="chat">Chat</div>
+                <div class="card-description" data-i18n="chat_description">Ask questions about your notes, calendar, and emails</div>
             </a>
 
             <a href="/crm" class="card">
                 <div class="card-icon">👥</div>
-                <div class="card-title">CRM</div>
-                <div class="card-description">Manage relationships and view your network</div>
+                <div class="card-title" data-i18n="crm">CRM</div>
+                <div class="card-description" data-i18n="crm_description">Manage relationships and view your network</div>
             </a>
 
             <a href="/agents" class="card">
                 <div class="card-icon">🛠️</div>
-                <div class="card-title">Agents</div>
-                <div class="card-description">See what your agents are working on right now</div>
+                <div class="card-title" data-i18n="agents">Agents</div>
+                <div class="card-description" data-i18n="agents_description">See what your agents are working on right now</div>
             </a>
 
             <!-- Trend views live one level down, linked from /journal's own
@@ -201,23 +227,19 @@
                  separate destination worth a top-level card. -->
             <a href="/journal" class="card">
                 <div class="card-icon">🎨</div>
-                <div class="card-title">Journal</div>
-                <div class="card-description">See which emotions dominate your entries, and how they trend</div>
+                <div class="card-title" data-i18n="journal">Journal</div>
+                <div class="card-description" data-i18n="journal_description">See which emotions dominate your entries, and how they trend</div>
             </a>
         </div>
 
         <p class="keyboard-hint">
-            Press <kbd>1</kbd> for Chat, <kbd>2</kbd> for CRM, <kbd>3</kbd> for Agents, or <kbd>4</kbd> for Journal
+            <span data-i18n="press">Press</span>
+            <kbd>1</kbd> <span data-i18n="for_chat">for Chat,</span>
+            <kbd>2</kbd> <span data-i18n="for_crm">for CRM,</span>
+            <kbd>3</kbd> <span data-i18n="for_agents">for Agents, or</span>
+            <kbd>4</kbd> <span data-i18n="for_journal">for Journal</span>
         </p>
     </div>
 
-    <script>
-        document.addEventListener('keydown', (e) => {
-            if (e.key === '1') window.location.href = '/chat';
-            if (e.key === '2') window.location.href = '/crm';
-            if (e.key === '3') window.location.href = '/agents';
-            if (e.key === '4') window.location.href = '/journal';
-        });
-    </script>
 </body>
 </html>

@@ -1,12 +1,16 @@
 // Locale and writing-direction state for the chat surface.
 //
 // English remains the default. A locale changes only when the operator selects
-// one explicitly (currently through ?lang=<locale> or setLocale()). This keeps
-// existing installs stable while providing a deterministic seam for the
-// language picker and translated resources added in later phases.
+// one explicitly through the language picker, ?lang=<locale>, or setLocale().
+// Locale resolution and persistence are shared with the home surface.
 
-const STORAGE_KEY = 'lifeos:locale';
-const SUPPORTED_LOCALES = new Set(['en', 'ar']);
+import {
+  applyDocumentLocale,
+  directionForLocale as sharedDirectionForLocale,
+  normalizeLocale as sharedNormalizeLocale,
+  resolveLocale as sharedResolveLocale,
+  translateAnnotated,
+} from '../i18n/core.js';
 
 const TRANSLATIONS = {
   en: {
@@ -119,18 +123,7 @@ export function t(key) {
 }
 
 export function translateChatUi(root = document) {
-  root.querySelectorAll('[data-i18n]').forEach((el) => {
-    el.textContent = t(el.dataset.i18n);
-  });
-  for (const [attribute, datasetKey] of [
-    ['placeholder', 'i18nPlaceholder'],
-    ['title', 'i18nTitle'],
-    ['aria-label', 'i18nAriaLabel'],
-  ]) {
-    root.querySelectorAll(`[data-${datasetKey.replace(/[A-Z]/g, c => '-' + c.toLowerCase())}]`).forEach((el) => {
-      el.setAttribute(attribute, t(el.dataset[datasetKey]));
-    });
-  }
+  translateAnnotated(root, t);
 }
 
 export function initLocalePicker(picker) {
@@ -144,61 +137,23 @@ export function initLocalePicker(picker) {
 
 
 export function normalizeLocale(value) {
-  if (!value || typeof value !== 'string') return null;
-  const primary = value.trim().toLowerCase().split(/[-_]/, 1)[0];
-  return SUPPORTED_LOCALES.has(primary) ? primary : null;
+  return sharedNormalizeLocale(value);
 }
 
 export function directionForLocale(locale) {
-  return normalizeLocale(locale) === 'ar' ? 'rtl' : 'ltr';
-}
-
-function storedLocale() {
-  try {
-    return normalizeLocale(window.localStorage.getItem(STORAGE_KEY));
-  } catch (e) {
-    return null;
-  }
-}
-
-function queryLocale() {
-  try {
-    const params = new URLSearchParams(window.location.search);
-    return normalizeLocale(params.get('lang'));
-  } catch (e) {
-    return null;
-  }
-}
-
-function persistLocale(locale) {
-  try {
-    window.localStorage.setItem(STORAGE_KEY, locale);
-  } catch (e) {
-    // Storage may be unavailable in private/locked-down browsing contexts.
-  }
+  return sharedDirectionForLocale(locale);
 }
 
 export function resolveLocale() {
-  const explicit = queryLocale();
-  if (explicit) {
-    persistLocale(explicit);
-    return explicit;
-  }
-  return storedLocale() || 'en';
+  return sharedResolveLocale();
 }
 
 export const localeState = { locale: 'en', direction: 'ltr' };
 
 export function applyLocale(locale = resolveLocale(), { persist = false } = {}) {
-  const normalized = normalizeLocale(locale) || 'en';
-  const direction = directionForLocale(normalized);
-
-  document.documentElement.lang = normalized;
-  document.documentElement.dir = direction;
-  localeState.locale = normalized;
-  localeState.direction = direction;
-
-  if (persist) persistLocale(normalized);
+  const next = applyDocumentLocale(locale, { persist });
+  localeState.locale = next.locale;
+  localeState.direction = next.direction;
   return localeState;
 }
 
