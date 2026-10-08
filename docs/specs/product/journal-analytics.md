@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** Journal
-**Last Updated:** 2026-08-12
+**Last Updated:** 2026-10-08
 
 A set of views over the daily journal, in two generations:
 
@@ -161,6 +161,22 @@ A single self-contained page (`web/journal.html`, vanilla JS + inline SVG, no bu
 
 Color is assigned by hashing each value's text to a hue (`fnv1aHue` in `web/journal.html`), not by a hardcoded emotion→color table — so any new value the journal template introduces gets a stable, consistent color with no code change.
 
+### Language and writing direction
+
+The emotion-wheel page supports explicit English and Arabic selection, shared
+with Home and Chat. English is the default. The selected locale controls page
+copy, writing direction, calendar dates, counts, percentages, loading feedback
+and errors. Changing language reformats the current response without another
+API request. Calendar dates retain their original day across browser time zones;
+English displays the original ISO date labels.
+
+Emotion names are authored data: they remain literal and use content-aware
+writing direction. Wedge paths, angles and hash-derived colors are independent
+of the UI language. Sample-size and coverage caveats retain the same meaning in
+both languages, including the distinction between total entries and entries
+with emotion data. The separate trend page does not yet use this locale layer.
+
+
 ## Sample Size Honesty
 
 The journal has produced entries sporadically since it started, and any given window can easily contain zero, one, or a handful of entries — and not every entry that exists carries emotion data. A wheel built from three entries visually resembles a wheel built from three hundred if nothing calls that out — the same "presenting a thin answer as a complete one" failure mode this codebase has been auditing for elsewhere in chat responses this week.
@@ -315,6 +331,7 @@ The Google Form question backing the `Bad` branch is titled **"Bad feelings"** (
 ### Code References
 - [api/routes/journal.py](../../../api/routes/journal.py) — Wheel aggregation endpoint, chain parser, wheel builder; also the shared window/file-walk/disclosure-policy logic the trend views reuse
 - [web/journal.html](../../../web/journal.html) — Wheel frontend view
+- [web/journal-locale.js](../../../web/journal-locale.js) — Wheel copy and locale-aware formatting
 - [tests/test_journal_emotions.py](../../../tests/test_journal_emotions.py) — Wheel unit coverage (synthetic fixtures only)
 - [tests/test_journal_wheel_ui_browser.py](../../../tests/test_journal_wheel_ui_browser.py) — Wheel self-contained browser test
 - [api/routes/journal_trends.py](../../../api/routes/journal_trends.py) — The strip, the unexplored wheel, and the scalar stack
