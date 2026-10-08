@@ -1,0 +1,17 @@
+# Dockerfile-specific filter: build with repository root as context but send
+# only Android sources. Prevent leakage of vaults, keys and backend state.
+**
+!mobile/
+!mobile/android/
+!mobile/android/**
+mobile/android/.gradle/
+mobile/android/.gradle-dist/
+mobile/android/.kotlin/
+mobile/android/.cxx/
+mobile/android/.speech-model-cache/
+mobile/android/**/build/
+mobile/android/local.properties
+mobile/android/**/*.jks
+mobile/android/**/*.keystore
+mobile/android/**/.env
+mobile/android/**/.env.*
