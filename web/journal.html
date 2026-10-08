@@ -6,7 +6,8 @@
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="apple-mobile-web-app-title" content="Journal">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>LifeOS · Journal Emotion Wheel</title>
+    <title data-i18n="page_title">LifeOS · Journal Emotion Wheel</title>
+    <script src="/static/i18n/prepaint.js"></script>
     <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
     <link rel="apple-touch-icon" href="/static/icons/apple-touch-icon.png">
     <link rel="manifest" href="/manifests/journal.webmanifest">
@@ -223,6 +224,30 @@
             pointer-events: none;
         }
 
+        .header-controls {
+            display: flex;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 0.75rem;
+        }
+
+        #localePicker {
+            background: var(--bg-card);
+            color: var(--text-primary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 0.3rem;
+            font: inherit;
+        }
+
+        [dir="rtl"] .nav-arrow { transform: scaleX(-1); }
+        .nav-arrow { display: inline-block; }
+        /* Label alignment follows the UI, independently of authored text direction. */
+        .legend-value { min-width: 0; overflow-wrap: anywhere; text-align: left; }
+        [dir="rtl"] .legend-value { text-align: right; }
+        .legend-count { white-space: nowrap; }
+        .wedge-label { unicode-bidi: plaintext; }
+
         #tooltip {
             position: fixed;
             background: var(--bg-secondary);
@@ -239,20 +264,24 @@
 <body>
     <div class="page">
         <header>
-            <h1>Journal Emotion Wheel</h1>
-            <span>
-                <a class="forward-link" href="/journal/trends">Trend views &rarr;</a>
-                &nbsp;&nbsp;
-                <a class="back-link" href="/">&larr; Home</a>
-            </span>
+            <h1 data-i18n="title">Journal Emotion Wheel</h1>
+            <div class="header-controls">
+                <label for="localePicker" data-i18n="language">Language</label>
+                <select id="localePicker" data-i18n-aria-label="language">
+                    <option value="en" lang="en">English</option>
+                    <option value="ar" lang="ar">العربية</option>
+                </select>
+                <a class="forward-link" href="/journal/trends"><span data-i18n="trends">Trend views</span> <span class="nav-arrow" aria-hidden="true">&rarr;</span></a>
+                <a class="back-link" href="/"><span class="nav-arrow" aria-hidden="true">&larr;</span> <span data-i18n="home">Home</span></a>
+            </div>
         </header>
 
         <div class="window-selector" id="windowSelector">
-            <button class="window-pill" data-window="day">Day</button>
-            <button class="window-pill" data-window="week">Week</button>
-            <button class="window-pill" data-window="month">Month</button>
-            <button class="window-pill" data-window="quarter">Quarter</button>
-            <button class="window-pill active" data-window="all-time">All-time</button>
+            <button class="window-pill" data-window="day" data-i18n="day">Day</button>
+            <button class="window-pill" data-window="week" data-i18n="week">Week</button>
+            <button class="window-pill" data-window="month" data-i18n="month">Month</button>
+            <button class="window-pill" data-window="quarter" data-i18n="quarter">Quarter</button>
+            <button class="window-pill active" data-window="all-time" data-i18n="all_time">All-time</button>
         </div>
 
         <div class="sample-banner" id="sampleBanner">Loading…</div>
@@ -263,15 +292,20 @@
         </div>
     </div>
 
-    <div id="tooltip"></div>
+    <div id="tooltip" dir="auto"></div>
 
-    <script>
+    <script type="module">
+        import { t, formatNumber, formatPercent, formatDate, initJournalLocale } from '/static/journal-locale.js';
+
         const SVG_SIZE = 560;
         const CENTER = SVG_SIZE / 2;
         const OUTER_RADIUS = 250;
         const INNER_HOLE = 50;
 
         let currentWindow = 'all-time';
+        let currentData = null;
+        let loading = true;
+        let failure = null;
 
         function fnv1aHue(str) {
             // Deterministic hash -> hue (0-360). No hardcoded emotion->color
@@ -352,12 +386,12 @@
                     const rInner = INNER_HOLE + (level - 1) * ringThickness;
                     const rOuter = INNER_HOLE + level * ringThickness;
                     const d = arcPath(CENTER, CENTER, rInner, rOuter, a0, a1);
-                    const pct = ((node.count / emotionEntries) * 100).toFixed(1);
+                    const pct = formatPercent(node.count / emotionEntries);
                     const nodePath = [...path, node.value];
                     const wedgeId = `wedge-${parts.length}`;
                     parts.push(
                         `<path id="${wedgeId}" class="wedge" d="${d}" fill="${colorFor(node.value, level)}" ` +
-                        `data-tooltip="${escapeHtml(nodePath.join(' → '))}: ${node.count} (${pct}%)"></path>`
+                        `data-tooltip="${escapeHtml(nodePath.join(' → '))}: ${escapeHtml(formatNumber(node.count))} (${escapeHtml(pct)})"></path>`
                     );
 
                     const midAngle = (a0 + a1) / 2;
@@ -408,11 +442,11 @@
                 return;
             }
             const rows = wheel.map((n) => {
-                const pct = ((n.count / emotionEntries) * 100).toFixed(1);
+                const pct = formatPercent(n.count / emotionEntries);
                 return `<div class="legend-row">` +
                     `<span class="legend-swatch" style="background:${colorFor(n.value, 1)}"></span>` +
-                    `<span class="legend-value">${escapeHtml(n.value)}</span>` +
-                    `<span class="legend-count">${n.count} (${pct}%)</span>` +
+                    `<span class="legend-value" dir="auto">${escapeHtml(n.value)}</span>` +
+                    `<span class="legend-count" dir="ltr">${escapeHtml(formatNumber(n.count))} (${escapeHtml(pct)})</span>` +
                     `</div>`;
             });
             legend.innerHTML = rows.join('');
@@ -421,26 +455,51 @@
         function renderSampleBanner(data) {
             const banner = document.getElementById('sampleBanner');
             const { total_entries, emotion_entries, start_date, end_date } = data;
-            const rangeText = start_date ? `${start_date} to ${end_date}` : `through ${end_date}`;
-            // Percentages in the wheel/legend are always out of
-            // emotion_entries (the emotion-bearing subset) — the thin-sample
-            // caveat is keyed to that same denominator, not the raw file count.
+            const range = start_date
+                ? t('date_range', { start: formatDate(start_date), end: formatDate(end_date) })
+                : t('through', { end: formatDate(end_date) });
+            // The caveat uses the same emotion-bearing denominator as the wheel.
             const thin = emotion_entries > 0 && emotion_entries < 5;
             banner.classList.toggle('sample-thin', thin);
-            if (total_entries === 0) {
-                banner.innerHTML = `No journal entries in this window (${rangeText}).`;
-            } else if (emotion_entries === 0) {
-                banner.innerHTML = `<strong>${total_entries}</strong> journal entr${total_entries === 1 ? 'y' : 'ies'} ` +
-                    `in this window (${rangeText}), but none logged emotion data.`;
-            } else if (emotion_entries === total_entries) {
-                banner.innerHTML = `<strong>${total_entries}</strong> journal entr${total_entries === 1 ? 'y' : 'ies'} ` +
-                    `in this window (${rangeText})` +
-                    (thin ? ' — small sample, read the wheel loosely.' : '.');
-            } else {
-                banner.innerHTML = `<strong>${emotion_entries}</strong> of <strong>${total_entries}</strong> ` +
-                    `entries had emotion data in this window (${rangeText}) — percentages below are out of ` +
-                    `${emotion_entries}` +
-                    (thin ? '; small sample, read the wheel loosely.' : '.');
+            const key = total_entries === 0 ? 'no_entries'
+                : emotion_entries === 0 ? 'no_emotions'
+                : emotion_entries === total_entries ? 'all_emotions' : 'some_emotions';
+            const values = {
+                range,
+                total: formatNumber(total_entries),
+                emotion: formatNumber(emotion_entries),
+                entry_word: t(total_entries === 1 ? 'entry_one' : 'entry_many'),
+                caveat: thin ? t(key === 'all_emotions' ? 'thin_all' : 'thin_some') : '.',
+            };
+            // Translation and response text enter the DOM as text nodes only;
+            // counts receive emphasis without accepting HTML in either source.
+            banner.replaceChildren(...t(key).split(/(\{\w+\})/).map((part) => {
+                const name = /^\{(\w+)\}$/.exec(part)?.[1];
+                if (name === 'total' || name === 'emotion') {
+                    const count = document.createElement('strong');
+                    count.textContent = values[name];
+                    return count;
+                }
+                return document.createTextNode(name ? values[name] : part);
+            }));
+        }
+
+        function renderCurrentView() {
+            document.getElementById('tooltip').style.display = 'none';
+            if (currentData) {
+                renderWheel(currentData.wheel, currentData.emotion_entries);
+                renderLegend(currentData.wheel, currentData.emotion_entries);
+            }
+            const banner = document.getElementById('sampleBanner');
+            if (loading) {
+                banner.textContent = t('loading');
+            } else if (failure) {
+                const error = failure.status
+                    ? t('api_error', { status: formatNumber(failure.status) })
+                    : t('network_error');
+                banner.textContent = t('failed', { error });
+            } else if (currentData) {
+                renderSampleBanner(currentData);
             }
         }
 
@@ -449,23 +508,21 @@
             document.querySelectorAll('.window-pill').forEach((p) => {
                 p.classList.toggle('active', p.dataset.window === win);
             });
-            const banner = document.getElementById('sampleBanner');
-            banner.textContent = 'Loading…';
+            loading = true;
+            failure = null;
+            renderCurrentView();
             try {
                 const res = await fetch(`/api/journal/emotions?window=${encodeURIComponent(win)}`);
-                if (!res.ok) throw new Error(`API error: ${res.status}`);
-                const data = await res.json();
-                renderSampleBanner(data);
-                if (data.emotion_entries === 0) {
-                    document.getElementById('wheelSvg').style.display = 'none';
-                    document.getElementById('legend').innerHTML = '';
+                if (!res.ok) {
+                    failure = { status: res.status };
                 } else {
-                    renderWheel(data.wheel, data.emotion_entries);
-                    renderLegend(data.wheel, data.emotion_entries);
+                    currentData = await res.json();
                 }
             } catch (err) {
-                banner.textContent = `Failed to load: ${err.message}`;
+                failure = { status: null };
             }
+            loading = false;
+            renderCurrentView();
         }
 
         document.getElementById('windowSelector').addEventListener('click', (e) => {
@@ -473,6 +530,7 @@
             if (pill) loadWindow(pill.dataset.window);
         });
 
+        initJournalLocale(renderCurrentView);
         loadWindow(currentWindow);
     </script>
 </body>
