@@ -27,38 +27,41 @@ export function setupSwipeGestures() {
   let touchStartX = 0;
   let touchStartY = 0;
   let isSwiping = false;
-  const edgeThreshold = 30; // px from left edge to trigger
+  let openingDirection = 1;
+  const edgeThreshold = 30; // px from the locale's start edge to trigger
   const swipeThreshold = 50; // px movement to complete swipe
 
   document.addEventListener('touchstart', (e) => {
+    isSwiping = false;
+    if (e.touches.length !== 1) return;
     touchStartX = e.touches[0].clientX;
     touchStartY = e.touches[0].clientY;
-    // Only track swipes starting from left edge (when sidebar closed)
-    // or from sidebar area (when open)
-    isSwiping = touchStartX < edgeThreshold || elements.sidebar.classList.contains('open');
+    const rtl = document.documentElement.dir === 'rtl';
+    openingDirection = rtl ? -1 : 1;
+    const startEdgeDistance = rtl ? window.innerWidth - touchStartX : touchStartX;
+    isSwiping = startEdgeDistance < edgeThreshold || elements.sidebar.classList.contains('open');
   }, { passive: true });
 
   document.addEventListener('touchend', (e) => {
     if (!isSwiping) return;
+    isSwiping = false;
 
     const touchEndX = e.changedTouches[0].clientX;
     const touchEndY = e.changedTouches[0].clientY;
-    const deltaX = touchEndX - touchStartX;
+    const deltaX = (touchEndX - touchStartX) * openingDirection;
     const deltaY = Math.abs(touchEndY - touchStartY);
 
     // Ignore if vertical movement is greater (scrolling)
     if (deltaY > Math.abs(deltaX)) return;
 
-    if (!elements.sidebar.classList.contains('open') && touchStartX < edgeThreshold && deltaX > swipeThreshold) {
-      // Swipe right from left edge - open sidebar
+    if (!elements.sidebar.classList.contains('open') && deltaX > swipeThreshold) {
       openSidebar();
     } else if (elements.sidebar.classList.contains('open') && deltaX < -swipeThreshold) {
-      // Swipe left when sidebar open - close it
       closeSidebar();
     }
-
-    isSwiping = false;
   }, { passive: true });
+
+  document.addEventListener('touchcancel', () => { isSwiping = false; }, { passive: true });
 }
 
 export async function loadConversations() {
