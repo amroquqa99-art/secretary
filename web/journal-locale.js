@@ -1,5 +1,6 @@
 import {
   applyDocumentLocale,
+  formattingLocale,
   normalizeLocale,
   resolveLocale,
   translateAnnotated,
@@ -61,18 +62,24 @@ const TRANSLATIONS = {
 };
 
 let locale = 'en';
+let pageTranslations = {};
 
 export function t(key, values = {}) {
-  const template = TRANSLATIONS[locale][key] ?? TRANSLATIONS.en[key] ?? key;
+  const template = pageTranslations[locale]?.[key] ?? TRANSLATIONS[locale][key]
+    ?? pageTranslations.en?.[key] ?? TRANSLATIONS.en[key] ?? key;
   return template.replace(/\{(\w+)\}/g, (match, name) => values[name] ?? match);
 }
 
-export function formatNumber(value) {
-  return new Intl.NumberFormat(locale).format(value);
+export function formatNumber(value, options = {}) {
+  return new Intl.NumberFormat(formattingLocale(locale), options).format(value);
+}
+
+export function formatMonth(value) {
+  return new Intl.DateTimeFormat(formattingLocale(locale), { month: 'short', timeZone: 'UTC' }).format(value);
 }
 
 export function formatPercent(value) {
-  return new Intl.NumberFormat(locale, {
+  return new Intl.NumberFormat(formattingLocale(locale), {
     style: 'percent', minimumFractionDigits: 1, maximumFractionDigits: 1,
   }).format(value);
 }
@@ -81,12 +88,13 @@ export function formatDate(value) {
   // English retains the ISO labels. Calendar dates have no time zone:
   // formatting at UTC prevents a west-of-UTC browser showing the prior day.
   if (locale === 'en' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return value;
-  return new Intl.DateTimeFormat(locale, {
+  return new Intl.DateTimeFormat(formattingLocale(locale), {
     year: 'numeric', month: 'long', day: 'numeric', timeZone: 'UTC',
   }).format(new Date(`${value}T00:00:00Z`));
 }
 
-export function initJournalLocale(onChange) {
+export function initJournalLocale(onChange, translations = {}) {
+  pageTranslations = translations;
   const picker = document.getElementById('localePicker');
   function apply(value, persist = false) {
     locale = applyDocumentLocale(value, { persist }).locale;

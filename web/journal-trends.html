@@ -6,7 +6,8 @@
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="apple-mobile-web-app-title" content="Trends">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>LifeOS · Journal Trends</title>
+    <title data-i18n="page_title">LifeOS · Journal Trends</title>
+    <script src="/static/i18n/prepaint.js"></script>
     <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
     <link rel="apple-touch-icon" href="/static/icons/apple-touch-icon.png">
     <link rel="manifest" href="/manifests/journal-trends.webmanifest">
@@ -100,7 +101,7 @@
             border: 1px solid var(--border);
             border-radius: 999px;
             padding: 0.15rem 0.55rem;
-            margin-left: 0.5rem;
+            margin-inline-start: 0.5rem;
             vertical-align: middle;
         }
 
@@ -265,7 +266,7 @@
             width: 10px;
             height: 10px;
             border-radius: 2px;
-            margin-right: 0.35rem;
+            margin-inline-end: 0.35rem;
             vertical-align: middle;
         }
 
@@ -409,7 +410,7 @@
         .taxonomy-extra {
             color: var(--text-secondary);
             font-size: 0.72rem;
-            margin-left: 0.25rem;
+            margin-inline-start: 0.25rem;
             vertical-align: super;
         }
 
@@ -503,66 +504,99 @@
         }
 
         .taxonomy-count {
-            margin-left: auto;
+            margin-inline-start: auto;
             color: var(--text-secondary);
             font-size: 0.76rem;
             font-variant-numeric: tabular-nums;
         }
 
         @media (max-width: 720px) {
+            body { padding: 1rem; }
+            section.view { padding: 1rem; }
+            .wheel-figure { min-width: 0; max-width: 100%; }
+            .scatter-grid { grid-template-columns: minmax(0, 1fr); }
             .taxonomy-legend { columns: 1; }
             #taxonomySvg { width: 300px; height: 300px; }
         }
+
+        .header-controls { display: flex; gap: 0.75rem; flex-wrap: wrap; align-items: center; }
+        #localePicker { background: var(--bg-card); color: var(--text-primary); border: 1px solid var(--border); border-radius: 8px; padding: 0.3rem; font: inherit; }
+        .nav-arrow { display: inline-block; }
+        [dir="rtl"] .nav-arrow { transform: scaleX(-1); }
+        /* Time and numeric coordinates retain their ordering in either UI language. */
+        .strip-scroll, .scalar-row svg, .scatter-chart-row, #taxonomySvg { direction: ltr; }
+        .strip-month-label { text-align: start; }
+        .taxonomy-name { min-width: 0; }
     </style>
 </head>
 <body>
     <div class="page">
         <header>
-            <h1>Journal Trends</h1>
-            <span>
-                <a class="back-link" href="/journal">Emotion wheel</a>
-                &nbsp;·&nbsp;
-                <a class="back-link" href="/">&larr; Home</a>
-            </span>
+            <h1 data-i18n="title">Journal Trends</h1>
+            <div class="header-controls">
+                <label for="localePicker" data-i18n="language">Language</label>
+                <select id="localePicker" data-i18n-aria-label="language">
+                    <option value="en" lang="en">English</option>
+                    <option value="ar" lang="ar">العربية</option>
+                </select>
+                <a class="back-link" href="/journal" data-i18n="emotion_wheel">Emotion wheel</a>
+                <a class="back-link" href="/"><span class="nav-arrow" aria-hidden="true">&larr;</span> <span data-i18n="home">Home</span></a>
+            </div>
         </header>
 
         <div class="window-selector" id="windowSelector">
-            <span class="window-label">Window &mdash; sets the range for the two lower sections:</span>
-            <button class="window-pill" data-window="day">Day</button>
-            <button class="window-pill" data-window="week">Week</button>
-            <button class="window-pill" data-window="month">Month</button>
-            <button class="window-pill" data-window="quarter">Quarter</button>
-            <button class="window-pill active" data-window="all-time">All-time</button>
+            <span class="window-label" data-i18n="window_label">Window &mdash; sets the range for the two lower sections:</span>
+            <button class="window-pill" data-window="day" data-i18n="day">Day</button>
+            <button class="window-pill" data-window="week" data-i18n="week">Week</button>
+            <button class="window-pill" data-window="month" data-i18n="month">Month</button>
+            <button class="window-pill" data-window="quarter" data-i18n="quarter">Quarter</button>
+            <button class="window-pill active" data-window="all-time" data-i18n="all_time">All-time</button>
         </div>
 
         <section class="view" id="stripSection">
-            <h2>The Strip <span class="section-badge">Always full history</span></h2>
+            <h2><span data-i18n="strip">The Strip</span> <span class="section-badge" data-i18n="full_history">Always full history</span></h2>
             <div class="sample-note" id="stripNote">Loading…</div>
             <div id="stripBody"></div>
         </section>
 
         <section class="view" id="scalarSection">
-            <h2>Mood · Stress · Sleep · Body</h2>
+            <h2 data-i18n="scalars">Mood · Stress · Sleep · Body</h2>
             <div class="sample-note" id="scalarNote">Loading…</div>
             <div class="caveat" id="correlationNote"></div>
             <div id="scalarBody"></div>
         </section>
 
         <section class="view" id="taxonomySection">
-            <h2>The Unexplored Wheel</h2>
+            <h2 data-i18n="taxonomy">The Unexplored Wheel</h2>
             <div class="sample-note" id="taxonomyNote">Loading…</div>
             <div id="taxonomyBody"></div>
         </section>
     </div>
 
-    <script>
+    <script type="module">
+        import { t, formatNumber, formatDate, formatMonth, initJournalLocale } from '/static/journal-locale.js';
+        import { TRANSLATIONS } from '/static/journal-trends-locale.js';
+
         let currentWindow = 'all-time';
+        let windowRequest = 0;
+        const viewState = { strip: {}, window: {} };
 
         function escapeHtml(s) {
             return String(s).replace(/[&<>"']/g, (c) => ({
                 '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
             }[c]));
         }
+
+        // Resource markup is authored code; every substituted value is escaped.
+        const htmlT = (key, values = {}) => t(key, Object.fromEntries(
+            Object.entries(values).map(([k, v]) => [k, escapeHtml(v)])));
+        const number = (value) => `<bdi>${escapeHtml(formatNumber(value))}</bdi>`;
+        const dateRange = (start, end) => start
+            ? t('date_range', { start: formatDate(start), end: formatDate(end) })
+            : t('through', { end: formatDate(end) });
+        const signed = (value) => formatNumber(value, {
+            signDisplay: 'always', minimumFractionDigits: 2, maximumFractionDigits: 2,
+        });
 
         function fnv1aHue(str) {
             let h = 0x811c9dc5;
@@ -636,7 +670,11 @@
 
         async function fetchJson(path) {
             const res = await fetch(path);
-            if (!res.ok) throw new Error(`API error: ${res.status}`);
+            if (!res.ok) {
+                const error = new Error('API error');
+                error.status = res.status;
+                throw error;
+            }
             return res.json();
         }
 
@@ -649,14 +687,14 @@
             if (!d) return '<div class="strip-day hidden-cell"></div>';
             let cls = 'strip-day gap';
             let style = '';
-            let title = d.date + ': no journal entry';
+            let title = `${formatDate(d.date)}: ${t('no_entry')}`;
             if (d.has_entry && d.primary_emotion) {
                 cls = 'strip-day';
                 style = `background:${colorFor(d.primary_emotion)}`;
-                title = `${d.date}: ${d.primary_emotion}`;
+                title = `${formatDate(d.date)}: ${d.primary_emotion}`;
             } else if (d.has_entry) {
                 cls = 'strip-day no-feeling';
-                title = `${d.date}: entry logged, no feeling recorded`;
+                title = `${formatDate(d.date)}: ${t('entry_no_emotion')}`;
             }
             return `<div class="${cls}" style="${style}" title="${escapeHtml(title)}"></div>`;
         }
@@ -680,11 +718,11 @@
             const ordered = [...counts.entries()].sort((a, b) => (b[1] - a[1]) || a[0].localeCompare(b[0]));
             const emotions = ordered.map(([label, count]) =>
                 `<span><span class="strip-legend-swatch" style="background:${colorFor(label)}"></span>` +
-                `${escapeHtml(label)} <span class="strip-legend-count">${count}</span></span>`
+                `<bdi>${escapeHtml(label)}</bdi> <span class="strip-legend-count">${number(count)}</span></span>`
             ).join('');
             return emotions +
-                `<span><span class="strip-legend-swatch" style="background:var(--bg-secondary);border:1px dashed var(--text-secondary)"></span>entry, no feeling</span>` +
-                `<span><span class="strip-legend-swatch" style="background:var(--bg-secondary);border:1px solid var(--border)"></span>no entry</span>`;
+                `<span><span class="strip-legend-swatch" style="background:var(--bg-secondary);border:1px dashed var(--text-secondary)"></span>${htmlT('key_no_emotion')}</span>` +
+                `<span><span class="strip-legend-swatch" style="background:var(--bg-secondary);border:1px solid var(--border)"></span>${htmlT('key_no_entry')}</span>`;
         }
 
         // Cell size floor/ceiling for the strip's auto-scaling. MAX matches
@@ -713,16 +751,17 @@
         function renderStrip(data) {
             const note = document.getElementById('stripNote');
             const body = document.getElementById('stripBody');
+            const scrollLeft = document.getElementById('stripScroll')?.scrollLeft || 0;
             const { total_entries, emotion_entries, start_date, end_date, days } = data;
             if (!days.length) {
-                note.innerHTML = 'No journal entries recorded yet.';
+                note.textContent = t('strip_empty');
                 body.innerHTML = '';
                 return;
             }
-            note.innerHTML = `One square per day from your first entry (<strong>${start_date}</strong>) to today ` +
-                `(<strong>${end_date}</strong>): <strong>${days.length}</strong> days, ` +
-                `<strong>${total_entries}</strong> with an entry, <strong>${emotion_entries}</strong> with a ` +
-                `feeling recorded. Colour is that day's primary emotion; hover any square for its date and label.`;
+            note.innerHTML = htmlT('strip_note', {
+                start: formatDate(start_date), end: formatDate(end_date), days: formatNumber(days.length),
+                total: formatNumber(total_entries), emotion: formatNumber(emotion_entries),
+            });
 
             const byDate = new Map(days.map((d) => [d.date, d]));
             const rangeStart = new Date(days[0].date + 'T00:00:00Z');
@@ -745,7 +784,7 @@
                     if (i === 0 && inRange) {
                         const month = day.getUTCMonth();
                         if (month !== lastMonth) {
-                            monthLabels.push({ colIndex, label: day.toLocaleDateString('en-US', { month: 'short', timeZone: 'UTC' }) });
+                            monthLabels.push({ colIndex, label: formatMonth(day) });
                             lastMonth = month;
                         }
                     }
@@ -758,7 +797,7 @@
             const totalCols = colIndex;
             const monthsHtml = monthLabels.map((m, i) => {
                 const span = (monthLabels[i + 1] ? monthLabels[i + 1].colIndex : totalCols) - m.colIndex;
-                return `<div class="strip-month-label" style="flex:${span}">${m.label}</div>`;
+                return `<div class="strip-month-label" style="flex:${span}">${escapeHtml(m.label)}</div>`;
             }).join('');
 
             body.innerHTML = `<div class="strip-scroll" id="stripScroll"><div class="strip-months">${monthsHtml}</div>` +
@@ -781,6 +820,7 @@
                 const cell = Math.max(STRIP_MIN_CELL_PX, Math.floor(idealCell));
                 gridEl.style.setProperty('--cell', `${cell}px`);
             }
+            scrollEl.scrollLeft = scrollLeft;
         }
 
         // ---- View D: scalar stack ----
@@ -814,7 +854,7 @@
                 }
             }
             for (const p of xy) {
-                parts.push(`<circle cx="${p.x}" cy="${p.y}" r="2.5" fill="${fieldColor(field)}"><title>${escapeHtml(p.date)}: ${p.value}</title></circle>`);
+                parts.push(`<circle cx="${p.x}" cy="${p.y}" r="2.5" fill="${fieldColor(field)}"><title>${escapeHtml(formatDate(p.date))}: ${escapeHtml(formatNumber(p.value))}</title></circle>`);
             }
             return `<svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">${parts.join('')}</svg>`;
         }
@@ -843,13 +883,7 @@
         // times and buried the numbers in scaffolding; the caveat above the
         // grid already establishes that the other three are same-day, so
         // saying it once there beats repeating it in every label.
-        const FIELD_TITLE = {
-            sleep: 'prior-night sleep',
-            mood: 'mood',
-            stress: 'stress',
-            body: 'body',
-        };
-        const fieldTitle = (f) => FIELD_TITLE[f] || f;
+        const fieldTitle = (f) => t(f === 'sleep' ? 'prior_sleep' : f);
         const sentenceCase = (s) => s.charAt(0).toUpperCase() + s.slice(1);
 
         // Plain-language reading of one pair's correlation.
@@ -863,23 +897,21 @@
         // wording stays deliberately symmetric.
         function pairSentence(a, b, n, r) {
             if (r === null || r === undefined) {
-                return `Not enough entries recording both ${fieldTitle(a)} and ${fieldTitle(b)} (n=${n}) to compare.`;
+                return t('pair_short', { a: fieldTitle(a), b: fieldTitle(b), n: formatNumber(n) });
             }
             const aPrior = PRIOR_NIGHT.has(a);
             const bPrior = PRIOR_NIGHT.has(b);
             if (aPrior !== bPrior) {
                 const [first, second] = aPrior ? [a, b] : [b, a];
                 if (Math.abs(r) < R_NONE) {
-                    return `How much ${first} you got shows no clear relationship with ${second} the next day.`;
+                    return t('prior_none', { first: t(first), second: t(second) });
                 }
-                const direction = r > 0 ? 'higher' : 'lower';
-                return `After more ${first}, ${second} that day tends to be rated ${direction}.`;
+                return t(r > 0 ? 'prior_up' : 'prior_down', { first: t(first), second: t(second) });
             }
             if (Math.abs(r) < R_NONE) {
-                return `${a[0].toUpperCase()}${a.slice(1)} and ${b} show no clear relationship on the same day.`;
+                return t('same_none', { a: sentenceCase(t(a)), b: t(b) });
             }
-            const direction = r > 0 ? 'also tends to be rated higher' : 'tends to be rated lower';
-            return `On days rated higher for ${a}, ${b} ${direction}.`;
+            return t(r > 0 ? 'same_up' : 'same_down', { a: t(a), b: t(b) });
         }
 
         // Summary of all six pairs at once, so the grid can be read without
@@ -902,36 +934,35 @@
             const usable = correlations.filter((c) => c.r !== null && c.r !== undefined);
             const short = correlations.filter((c) => c.r === null || c.r === undefined);
             if (!usable.length) {
-                return 'Not enough paired entries in this window to compare any of these measures.';
+                return htmlT('summary_empty');
             }
 
-            const pairName = (c) => `${escapeHtml(fieldTitle(c.pair[0]))} vs. ${escapeHtml(fieldTitle(c.pair[1]))}`;
-            const label = (c) => `${pairName(c)} (${(c.r >= 0 ? '+' : '') + c.r.toFixed(2)})`;
+            const pairName = (c) => htmlT('compare', { a: fieldTitle(c.pair[0]), b: fieldTitle(c.pair[1]) });
+            const label = (c) => `${pairName(c)} (<bdi>${escapeHtml(signed(c.r))}</bdi>)`;
             const ranked = [...usable].sort((x, y) => Math.abs(y.r) - Math.abs(x.r));
             const tier = (lo, hi, sign) => ranked.filter((c) =>
                 Math.abs(c.r) >= lo && Math.abs(c.r) < hi && (sign > 0 ? c.r > 0 : c.r < 0));
 
             const groups = [
-                ['Move together', tier(R_MODERATE, Infinity, 1)],
-                ['Move in opposite directions', tier(R_MODERATE, Infinity, -1)],
-                ['Move together slightly', tier(R_NONE, R_MODERATE, 1)],
-                ['Slightly opposite', tier(R_NONE, R_MODERATE, -1)],
-                ['No clear relationship', ranked.filter((c) => Math.abs(c.r) < R_NONE)],
-                ['Too few paired entries to compare', short],
+                ['together', tier(R_MODERATE, Infinity, 1)],
+                ['opposite', tier(R_MODERATE, Infinity, -1)],
+                ['slight_together', tier(R_NONE, R_MODERATE, 1)],
+                ['slight_opposite', tier(R_NONE, R_MODERATE, -1)],
+                ['no_relationship', ranked.filter((c) => Math.abs(c.r) < R_NONE)],
+                ['short_pairs', short],
             ];
 
             const sentences = groups
                 .filter(([, items]) => items.length)
                 .map(([heading, items]) => {
-                    const body = items.map((c) => (items === short ? pairName(c) : label(c))).join(', ');
-                    return `<strong>${heading}:</strong> ${body}.`;
+                    const body = items.map((c) => (items === short ? pairName(c) : label(c))).join(t('comma'));
+                    return `<strong>${htmlT(heading)}:</strong> ${body}.`;
                 })
                 .join(' ');
 
             const maxN = Math.max(...usable.map((c) => c.n));
-            return `Across up to ${maxN} entr${maxN === 1 ? 'y' : 'ies'} with both values recorded. ` +
-                `${sentences} None of these is strong enough to predict a single day — they describe ` +
-                `tendencies over the window, not rules.`;
+            return htmlT('summary_intro', { n: formatNumber(maxN), entry_word: t(maxN === 1 ? 'entry_one' : 'entry_many') }) +
+                ` ${sentences} ${htmlT('summary_caveat')}`;
         }
 
         // The paired (x, y) points for one field pair, matched by date —
@@ -951,7 +982,7 @@
         // plot is readable without a shared external scale.
         function renderScatterSvg(points, yField) {
             if (!points.length) {
-                return '<div class="scatter-empty">No paired data in this window.</div>';
+                return `<div class="scatter-empty">${htmlT('paired_empty')}</div>`;
             }
             const size = 160;
             const pad = 20;
@@ -965,15 +996,15 @@
             const toY = (v) => (size - pad) - ((v - minY) / spanY) * (size - 2 * pad);
             const dots = points.map((p) =>
                 `<circle cx="${toX(p.x)}" cy="${toY(p.y)}" r="3" fill="${fieldColor(yField)}" opacity="0.8">` +
-                `<title>${escapeHtml(p.date)}: ${p.x} / ${p.y}</title></circle>`
+                `<title>${escapeHtml(formatDate(p.date))}: ${escapeHtml(formatNumber(p.x))} / ${escapeHtml(formatNumber(p.y))}</title></circle>`
             ).join('');
             return `<svg viewBox="0 0 ${size} ${size}" class="scatter-svg" preserveAspectRatio="xMidYMid meet">` +
                 `<line x1="${pad}" y1="${size - pad}" x2="${size - pad}" y2="${size - pad}" stroke="var(--border)" />` +
                 `<line x1="${pad}" y1="${pad}" x2="${pad}" y2="${size - pad}" stroke="var(--border)" />` +
-                `<text x="${pad}" y="${size - 4}" font-size="8" fill="var(--text-secondary)">${minX}</text>` +
-                `<text x="${size - pad - 12}" y="${size - 4}" font-size="8" fill="var(--text-secondary)">${maxX}</text>` +
-                `<text x="2" y="${size - pad}" font-size="8" fill="var(--text-secondary)">${minY}</text>` +
-                `<text x="2" y="${pad + 6}" font-size="8" fill="var(--text-secondary)">${maxY}</text>` +
+                `<text x="${pad}" y="${size - 4}" font-size="8" fill="var(--text-secondary)">${escapeHtml(formatNumber(minX))}</text>` +
+                `<text x="${size - pad - 12}" y="${size - 4}" font-size="8" fill="var(--text-secondary)">${escapeHtml(formatNumber(maxX))}</text>` +
+                `<text x="2" y="${size - pad}" font-size="8" fill="var(--text-secondary)">${escapeHtml(formatNumber(minY))}</text>` +
+                `<text x="2" y="${pad + 6}" font-size="8" fill="var(--text-secondary)">${escapeHtml(formatNumber(maxY))}</text>` +
                 dots + `</svg>`;
         }
 
@@ -982,25 +1013,23 @@
             const corr = document.getElementById('correlationNote');
             const body = document.getElementById('scalarBody');
             const { total_entries, series, start_date, end_date, correlations } = data;
-            const rangeText = start_date ? `${start_date} to ${end_date}` : `through ${end_date}`;
+            const rangeText = dateRange(start_date, end_date);
             const anyPoints = series.some((s) => s.points.length);
             if (!anyPoints) {
-                note.innerHTML = `No mood/stress/sleep/body data in this window (${rangeText}).`;
+                note.textContent = t('scalar_empty', { range: rangeText });
                 corr.innerHTML = '';
                 body.innerHTML = '';
                 return;
             }
-            note.innerHTML = `<strong>${total_entries}</strong> journal entr${total_entries === 1 ? 'y' : 'ies'} ` +
-                `in this window (${rangeText}). Each dot is one entry; lines join consecutive days only, so ` +
-                `a break in the line is a day you didn't log.`;
+            note.innerHTML = htmlT('scalar_note', {
+                total: formatNumber(total_entries), range: rangeText,
+                entry_word: t(total_entries === 1 ? 'entry_one' : 'entry_many'),
+            });
 
             // Stated once, above every pair — identical for all six because
             // every self-reported scalar field shares the same ambiguity,
             // not something worth repeating six times over.
-            corr.innerHTML = `The form asks for sleep <em>yesterday</em> and mood, stress and body <em>today</em>, ` +
-                `so sleep describes the night before the day it sits on. It doesn't record units or say which ` +
-                `end of any scale is "better", so "higher" could mean more hours or a better-rated night. ` +
-                `No trend line is fitted.`;
+            corr.innerHTML = htmlT('scale_caveat');
 
             const seriesByField = {};
             series.forEach((s) => { seriesByField[s.field] = s; });
@@ -1016,18 +1045,18 @@
                 const [a, b] = c.pair;
                 const points = pairedPoints(seriesByField, a, b);
                 const sentence = pairSentence(a, b, c.n, c.r);
-                const rText = c.r === null || c.r === undefined ? 'n/a' : (c.r >= 0 ? '+' : '') + c.r.toFixed(2);
+                const rText = c.r === null || c.r === undefined ? t('not_available') : signed(c.r);
                 return `<div class="scatter-cell">` +
-                    `<div class="scatter-title">${escapeHtml(sentenceCase(fieldTitle(a)))} vs. ${escapeHtml(fieldTitle(b))}</div>` +
+                    `<div class="scatter-title">${htmlT('compare', { a: sentenceCase(fieldTitle(a)), b: fieldTitle(b) })}</div>` +
                     `<div class="scatter-sentence">${escapeHtml(sentence)}</div>` +
-                    `<div class="scatter-chart-row"><span class="scatter-y-label">${escapeHtml(b)}</span>${renderScatterSvg(points, b)}</div>` +
-                    `<div class="scatter-x-label">${escapeHtml(a)}</div>` +
-                    `<div class="scatter-footnote">r = ${rText} (n=${c.n})</div>` +
+                    `<div class="scatter-chart-row"><span class="scatter-y-label">${escapeHtml(t(b))}</span>${renderScatterSvg(points, b)}</div>` +
+                    `<div class="scatter-x-label">${escapeHtml(t(a))}</div>` +
+                    `<div class="scatter-footnote">${htmlT('correlation', { r: rText, n: formatNumber(c.n) })}</div>` +
                     `</div>`;
             }).join('');
 
             body.innerHTML = sparklines +
-                `<h3 style="font-size:0.95rem;margin:1rem 0 0.2rem;">How the four measures relate</h3>` +
+                `<h3 style="font-size:0.95rem;margin:1rem 0 0.2rem;">${htmlT('measures')}</h3>` +
                 `<p class="scatter-summary">${correlationSummary(correlations)}</p>` +
                 `<div class="scatter-grid">${scatterCells}</div>`;
         }
@@ -1060,12 +1089,10 @@
             const { total_entries, emotion_entries, taxonomy_source, branches, extra_used, group_order } = data;
 
             const sourceText = taxonomy_source === 'form'
-                ? `Every wedge is one of the <strong>${branches.length}</strong> feelings the form offers, ` +
-                  `grouped into a colour family per primary emotion. Hover any wedge for its name and count.`
-                : `The form's question list isn't available, so this shows only feelings you've actually ` +
-                  `used — no unexplored branches.`;
-            note.innerHTML = `<strong>${emotion_entries}</strong> of <strong>${total_entries}</strong> entries ` +
-                `recorded a feeling in this window. ${sourceText}`;
+                ? htmlT('form_note', { branches: formatNumber(branches.length) }) : htmlT('observed_note');
+            note.innerHTML = htmlT('taxonomy_note', {
+                emotion: formatNumber(emotion_entries), total: formatNumber(total_entries),
+            }) + ` ${sourceText}`;
 
             // `extra_used` holds values that were logged but match no form
             // branch. They belong on the wheel — they're real feelings that
@@ -1079,7 +1106,7 @@
             const all = branches.map((b) => ({ ...b, extra: false }))
                 .concat(extra_used.map((b) => ({ ...b, extra: true })));
             if (!all.length) {
-                body.innerHTML = '<div class="empty-state">No feelings recorded in this window.</div>';
+                body.innerHTML = `<div class="empty-state">${htmlT('feelings_empty')}</div>`;
                 return;
             }
 
@@ -1138,11 +1165,11 @@
                     // ramp above it is a nicety, not the encoding.
                     const strength = 0.55 + 0.45 * (b.count / maxCount);
                     parts.push(`<path d="${d}" fill="${color}" fill-opacity="${strength.toFixed(2)}">` +
-                        `<title>${escapeHtml(b.label)} (${escapeHtml(b.group)}) — used ${b.count}×</title></path>`);
+                        `<title>${escapeHtml(b.label)} (${escapeHtml(b.group)}) — ${htmlT('used', { count: formatNumber(b.count) })}</title></path>`);
                 } else {
                     parts.push(`<path d="${d}" fill="${color}" fill-opacity="0.1" stroke="${color}" ` +
                         `stroke-opacity="0.4" stroke-width="0.75">` +
-                        `<title>${escapeHtml(b.label)} (${escapeHtml(b.group)}) — never used</title></path>`);
+                        `<title>${escapeHtml(b.label)} (${escapeHtml(b.group)}) — ${htmlT('unused')}</title></path>`);
                 }
             });
 
@@ -1161,12 +1188,12 @@
 
             const formUsed = branches.filter((b) => b.used).length;
             parts.push(
-                `<text x="${cx}" y="${cy - 6}" class="wheel-center-num" text-anchor="middle">${formUsed}<tspan class="wheel-center-of">/${branches.length}</tspan></text>` +
-                `<text x="${cx}" y="${cy + 14}" class="wheel-center-cap" text-anchor="middle">of the form&#39;s feelings</text>`
+                `<text x="${cx}" y="${cy - 6}" class="wheel-center-num" text-anchor="middle">${escapeHtml(formatNumber(formUsed))}<tspan class="wheel-center-of">/${escapeHtml(formatNumber(branches.length))}</tspan></text>` +
+                `<text x="${cx}" y="${cy + 14}" class="wheel-center-cap" text-anchor="middle">${htmlT('form_feelings')}</text>`
             );
 
             const svg = `<svg id="taxonomySvg" viewBox="0 0 340 340" role="img" ` +
-                `aria-label="${formUsed} of ${branches.length} of the form's feelings used at least once">${parts.join('')}</svg>`;
+                `aria-label="${htmlT('wheel_label', { used: formatNumber(formUsed), total: formatNumber(branches.length) })}">${parts.join('')}</svg>`;
 
             const legend = groupsPresent.map((g) => {
                 const items = byGroup.get(g);
@@ -1176,18 +1203,19 @@
                     const cls = b.used ? 'taxonomy-row' : 'taxonomy-row unused';
                     const color = familyColor(b.group, b.label);
                     const swatchStyle = b.used ? `background:${color}` : `border:1px solid ${color};background:none`;
-                    const mark = b.extra ? `<span class="taxonomy-extra" title="Logged, but not one of the form&#39;s options">+</span>` : '';
+                    const mark = b.extra ? `<span class="taxonomy-extra" title="${htmlT('extra_title')}">+</span>` : '';
                     return `<div class="${cls}"><span class="taxonomy-swatch" style="${swatchStyle}"></span>` +
-                        `<span class="taxonomy-name">${escapeHtml(b.label)}${mark}</span>` +
-                        `<span class="taxonomy-count">${b.used ? b.count : '—'}</span></div>`;
+                        `<span class="taxonomy-name"><bdi>${escapeHtml(b.label)}</bdi>${mark}</span>` +
+                        `<span class="taxonomy-count">${b.used ? number(b.count) : '—'}</span></div>`;
                 }).join('');
                 const hue = g === 'Unplaced' ? null : emotionHue(g);
                 const accent = hue === null ? 'var(--text-secondary)' : `hsl(${hue}, ${emotionSatBase(g) + 6}%, 60%)`;
                 // Denominator counts only the form's own options, matching the
                 // centre readout. Extras are listed but not counted.
-                const tally = fromForm.length ? `${usedFromForm}/${fromForm.length}` : `${items.length} logged`;
+                const tally = fromForm.length ? `<bdi>${escapeHtml(formatNumber(usedFromForm))}/${escapeHtml(formatNumber(fromForm.length))}</bdi>`
+                    : htmlT('logged_count', { count: formatNumber(items.length) });
                 return `<div class="taxonomy-group" style="--family:${accent}">` +
-                    `<div class="taxonomy-group-header"><span>${escapeHtml(g)}</span>` +
+                    `<div class="taxonomy-group-header"><bdi>${escapeHtml(g)}</bdi>` +
                     `<span class="taxonomy-group-count">${tally}</span></div>${rows}</div>`;
             }).join('');
 
@@ -1198,16 +1226,16 @@
             const extraCount = all.filter((b) => b.extra).length;
             const asides = [];
             if (untouched.length) {
-                asides.push(`<div class="wheel-finding">Nothing recorded yet under ` +
-                    `<strong>${untouched.map(escapeHtml).join('</strong>, <strong>')}</strong>.</div>`);
+                asides.push(`<div class="wheel-finding">${htmlT('untouched', { groups: untouched.join(t('comma')) })}</div>`);
             }
             if (extraCount) {
-                asides.push(`<div class="wheel-caption"><span class="taxonomy-extra">+</span> ${extraCount} ` +
-                    `feeling${extraCount === 1 ? '' : 's'} logged that aren't among the form's options — shown, not counted.</div>`);
+                asides.push(`<div class="wheel-caption"><span class="taxonomy-extra">+</span> ${htmlT('extras', {
+                    count: formatNumber(extraCount), feeling_word: t(extraCount === 1 ? 'feeling_one' : 'feeling_many'),
+                })}</div>`);
             }
 
             body.innerHTML = `<div class="wheel-flex"><div class="wheel-figure">${svg}` +
-                `<div class="wheel-caption">Solid = used at least once · faint = never picked</div>` +
+                `<div class="wheel-caption">${htmlT('wheel_caption')}</div>` +
                 `${asides.join('')}</div>` +
                 `<div class="taxonomy-legend">${legend}</div></div>`;
         }
@@ -1219,29 +1247,57 @@
         // window selector, rather than re-fetched on every pill click for
         // data that can never change as a result.
         async function loadStrip() {
+            viewState.strip.loading = true;
+            viewState.strip.error = null;
+            renderCurrentViews();
             try {
-                renderStrip(await fetchJson('/api/journal/strip'));
+                viewState.strip.data = await fetchJson('/api/journal/strip');
             } catch (err) {
-                document.getElementById('stripNote').textContent = `Failed to load: ${err.message}`;
+                viewState.strip.error = { status: err.status };
             }
+            viewState.strip.loading = false;
+            renderCurrentViews();
         }
 
         async function loadAll(win) {
+            const request = ++windowRequest;
             currentWindow = win;
             document.querySelectorAll('.window-pill').forEach((p) => {
                 p.classList.toggle('active', p.dataset.window === win);
             });
 
             const q = `window=${encodeURIComponent(win)}`;
+            viewState.window.loading = true;
+            viewState.window.error = null;
+            renderCurrentViews();
             try {
                 const [scalars, taxonomy] = await Promise.all([
                     fetchJson(`/api/journal/scalars?${q}`),
                     fetchJson(`/api/journal/taxonomy?${q}`),
                 ]);
-                renderScalars(scalars);
-                renderTaxonomy(taxonomy);
+                if (request !== windowRequest) return;
+                viewState.window.data = { scalars, taxonomy };
             } catch (err) {
-                document.getElementById('scalarNote').textContent = `Failed to load: ${err.message}`;
+                if (request !== windowRequest) return;
+                viewState.window.error = { status: err.status };
+            }
+            viewState.window.loading = false;
+            renderCurrentViews();
+        }
+
+        function renderCurrentViews() {
+            const { strip, window: win } = viewState;
+            if (strip.data) renderStrip(strip.data);
+            if (win.data) {
+                renderScalars(win.data.scalars);
+                renderTaxonomy(win.data.taxonomy);
+            }
+            for (const [state, ids] of [[strip, ['stripNote']], [win, ['scalarNote', 'taxonomyNote']]]) {
+                if (!state.loading && !state.error) continue;
+                const message = state.loading ? t('loading') : t('failed', {
+                    error: state.error.status ? t('api_error', { status: formatNumber(state.error.status) }) : t('network_error'),
+                });
+                ids.forEach((id) => { document.getElementById(id).textContent = message; });
             }
         }
 
@@ -1250,6 +1306,7 @@
             if (pill) loadAll(pill.dataset.window);
         });
 
+        initJournalLocale(renderCurrentViews, TRANSLATIONS);
         loadStrip();
         loadAll(currentWindow);
     </script>

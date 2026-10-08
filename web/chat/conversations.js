@@ -6,6 +6,7 @@ import { state, config, elements, endpoints } from './session.js';
 import { addMessage, escapeHtml } from './thread.js';
 import { startPendingQuestionPolling, stopPendingQuestionPolling } from './pending-question.js';
 import { localeState, t, translateChatUi } from './locale.js';
+import { formattingLocale } from '../i18n/core.js';
 
 export function toggleSidebar() {
   elements.sidebar.classList.toggle('open');
@@ -273,7 +274,7 @@ export function formatDate(dateStr) {
   const diff = now - date;
   const locale = localeState.locale === 'ar' ? 'ar' : 'en-US';
   const relative = (amount, unit, english) => locale === 'ar'
-    ? new Intl.RelativeTimeFormat(locale, { numeric: 'always' }).format(-amount, unit)
+    ? new Intl.RelativeTimeFormat(formattingLocale(locale), { numeric: 'always' }).format(-amount, unit)
     : english;
 
   // Under 1 minute: "Just now"
@@ -300,7 +301,7 @@ export function formatDate(dateStr) {
   const isYesterday = date.toDateString() === yesterday.toDateString();
 
   // Format wall-clock time in the selected locale.
-  const timeStr = date.toLocaleTimeString(locale, {
+  const timeStr = date.toLocaleTimeString(formattingLocale(locale), {
     hour: 'numeric',
     minute: '2-digit',
     hour12: true
@@ -312,7 +313,7 @@ export function formatDate(dateStr) {
   }
 
   // Older dates use the selected locale's month and numeral conventions.
-  const monthDay = date.toLocaleDateString(locale, {
+  const monthDay = date.toLocaleDateString(formattingLocale(locale), {
     month: 'short',
     day: 'numeric'
   });
@@ -331,7 +332,7 @@ export function formatDate(dateStr) {
   }
 
   // Older (different year): "Jan 8, 2025"
-  return date.toLocaleDateString(locale, {
+  return date.toLocaleDateString(formattingLocale(locale), {
     month: 'short',
     day: 'numeric',
     year: 'numeric'

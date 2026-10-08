@@ -108,6 +108,7 @@ CLI handoffs run as async worker sessions and report results via Telegram and `/
 - List all conversations with timestamps
 - Sidebar timestamps follow the selected Arabic or English locale. Changing
   language refreshes visible relative-time labels and dates without reloading.
+  Counts, clock times and calendar dates use digits 0–9 in both languages.
 - Empty-list/search labels, untitled conversation labels and delete confirmation
   follow the selected language. Starting a new chat preserves localized welcome
   text and suggestions; changing the language refreshes them in place.

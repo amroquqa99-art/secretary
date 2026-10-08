@@ -169,12 +169,31 @@ copy, writing direction, calendar dates, counts, percentages, loading feedback
 and errors. Changing language reformats the current response without another
 API request. Calendar dates retain their original day across browser time zones;
 English displays the original ISO date labels.
+Both languages use digits 0–9 for counts, percentages and calendar dates;
+Arabic month names and writing direction remain localized.
 
 Emotion names are authored data: they remain literal and use content-aware
 writing direction. Wedge paths, angles and hash-derived colors are independent
 of the UI language. Sample-size and coverage caveats retain the same meaning in
 both languages, including the distinction between total entries and entries
-with emotion data. The separate trend page does not yet use this locale layer.
+with emotion data.
+
+The trend page shares this language selection across its day strip, scalar
+comparisons and unexplored wheel. Month labels, calendar dates, values,
+correlation summaries, accessible wheel descriptions and status messages use
+the selected locale. Emotion and taxonomy names remain authored data.
+Changing language uses the cached responses without refetching. The strip
+still spans full history independently of the two window-selected sections.
+Its horizontal scroll position is retained when the language or window changes.
+Only the latest selected window can update data and error feedback.
+
+Time runs left-to-right within the strip and sparklines in both languages;
+numeric scatter coordinates and wheel geometry retain their ordering. The
+surrounding layout and controls follow the UI direction. Negative correlations
+are isolated from surrounding text so their signs remain readable. Sleep
+continues to describe the prior night; the localized explanation preserves
+the distinction between association and prediction, the gap-aware sparklines
+and the form-only denominator of the unexplored wheel.
 
 
 ## Sample Size Honesty
@@ -331,10 +350,12 @@ The Google Form question backing the `Bad` branch is titled **"Bad feelings"** (
 ### Code References
 - [api/routes/journal.py](../../../api/routes/journal.py) — Wheel aggregation endpoint, chain parser, wheel builder; also the shared window/file-walk/disclosure-policy logic the trend views reuse
 - [web/journal.html](../../../web/journal.html) — Wheel frontend view
-- [web/journal-locale.js](../../../web/journal-locale.js) — Wheel copy and locale-aware formatting
+- [web/journal-locale.js](../../../web/journal-locale.js) — Shared journal language selection and locale-aware formatting
+- [web/journal-trends-locale.js](../../../web/journal-trends-locale.js) — Trend-view English and Arabic copy
 - [tests/test_journal_emotions.py](../../../tests/test_journal_emotions.py) — Wheel unit coverage (synthetic fixtures only)
 - [tests/test_journal_wheel_ui_browser.py](../../../tests/test_journal_wheel_ui_browser.py) — Wheel self-contained browser test
 - [api/routes/journal_trends.py](../../../api/routes/journal_trends.py) — The strip, the unexplored wheel, and the scalar stack
 - [web/journal-trends.html](../../../web/journal-trends.html) — Trend views frontend page
 - [tests/test_journal_trends.py](../../../tests/test_journal_trends.py) — Trend views unit coverage (synthetic fixtures only — never `data/`)
+- [tests/test_journal_trends_locale_ui_browser.py](../../../tests/test_journal_trends_locale_ui_browser.py) — Bilingual trend-view browser scenarios with synthetic responses
 - [api/services/gsheet_sync.py](../../../api/services/gsheet_sync.py) — `data/gsheet_sync.db` schema (`synced_rows.raw_data`) read by view B

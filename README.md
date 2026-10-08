@@ -13,18 +13,20 @@ Upstream contributions are held until the fork passes integrated acceptance.
 | Arabic chat copy, language selection, RTL and mixed-direction messages | Implemented; broader product localization is incomplete. |
 | Shared locale runtime and Arabic Home | Implemented with persisted language selection across Home and Chat. |
 | Mobile sidebar gestures for Arabic and English | Implemented with direction-aware opening and closing; synthetic Chromium touch scenarios are covered. |
-| Arabic/English journal emotion wheel | Implemented with live locale switching, localized dates/counts and preserved authored labels; the trend page remains untranslated. |
+| Arabic/English journal emotion wheel | Implemented with live locale switching, localized dates/counts and preserved authored labels. |
+| Arabic/English journal trends | Implemented across the day strip, scalar comparisons and unexplored wheel; coordinate ordering, correlation thresholds and form-only denominators are preserved. |
 | Locale-aware conversation dates | Implemented with Arabic relative-time grammar and immediate refresh when the language changes. |
+| Numerals in localized UI | Arabic and English use digits 0–9 in journal counts, percentages, dates and conversation timestamps. |
 | Arabic retrieval and tool-use benchmark harnesses | Implemented with synthetic fixtures; real-model quality is unmeasured. |
 | Retrieval model profiles and standalone benchmark CLI | Implemented; Qwen3 and BGE profiles are evaluation candidates, not selected production defaults. |
 | Native Android companion, offline operation and Arabic voice | Not delivered by this fork. Pairing and companion design documents do not constitute an Android implementation. |
 
-The combined implementation is covered by 76 focused tests: 64 browser scenarios
+The combined implementation is covered by 106 focused tests: 94 browser scenarios
 and 12 retrieval-harness tests. Eight adjacent localization-audit/tool-use-harness
 tests cover the supporting tools. These checks do not replace the retained hosted
 test lanes or real-device and real-model acceptance.
 
-Remaining work includes Journal trends, Agents/Tasks and CRM localization,
+Remaining work includes Agents/Tasks and CRM localization,
 Arabic retrieval/model measurement, voice, and Android. See the [Arabic and Android roadmap](docs/roadmap/arabic-android-fork.md),
 [model provider strategy](docs/roadmap/model-provider-strategy.md), and
 [mobile pairing protocol](docs/roadmap/mobile-pairing-protocol.md).
