@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Chat
-> **Last Updated:** 2026-08-26
+> **Last Updated:** 2026-10-08
 
 The primary chat interface for LifeOS, providing AI-powered search and synthesis across your personal knowledge base.
 
@@ -108,6 +108,10 @@ CLI handoffs run as async worker sessions and report results via Telegram and `/
 - List all conversations with timestamps
 - Sidebar timestamps follow the selected Arabic or English locale. Changing
   language refreshes visible relative-time labels and dates without reloading.
+- Empty-list/search labels, untitled conversation labels and delete confirmation
+  follow the selected language. Starting a new chat preserves localized welcome
+  text and suggestions; changing the language refreshes them in place.
+  User-authored conversation titles remain unchanged.
 - Resume previous conversations
 - Delete conversations
 - Search across conversation history

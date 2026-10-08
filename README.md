@@ -18,7 +18,7 @@ Upstream contributions are held until the fork passes integrated acceptance.
 | Retrieval model profiles and standalone benchmark CLI | Implemented; Qwen3 and BGE profiles are evaluation candidates, not selected production defaults. |
 | Native Android companion, offline operation and Arabic voice | Not delivered by this fork. Pairing and companion design documents do not constitute an Android implementation. |
 
-The combined implementation is covered by 48 focused tests: 36 browser scenarios
+The combined implementation is covered by 54 focused tests: 42 browser scenarios
 and 12 retrieval-harness tests. Eight adjacent localization-audit/tool-use-harness
 tests cover the supporting tools. These checks do not replace the retained hosted
 test lanes or real-device and real-model acceptance.

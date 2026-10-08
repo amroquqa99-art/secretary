@@ -10,7 +10,7 @@ import threading
 from pathlib import Path
 
 import pytest
-from playwright.sync_api import Page
+from playwright.sync_api import Page, expect
 
 pytestmark = [pytest.mark.browser, pytest.mark.slow]
 
@@ -312,3 +312,63 @@ def test_mobile_sidebar_discards_interrupted_gestures(page: Page, locale_chat_ba
         target.dispatchEvent(new TouchEvent('touchend', {changedTouches: [end], bubbles: true}));
     }""", interruption)
     assert not page.locator(".sidebar").evaluate("el => el.classList.contains('open')")
+
+
+@pytest.mark.parametrize("locale", ["en", "ar"])
+def test_new_chat_keeps_selected_language(page: Page, locale_chat_base_url, locale):
+    _open(page, locale_chat_base_url, f"?lang={locale}")
+    page.evaluate("window.newChat()")
+    expected = "مرحبًا بك في LifeOS" if locale == "ar" else "Welcome to LifeOS"
+    assert page.locator(".welcome h2").inner_text() == expected
+    assert page.locator("#inputField").get_attribute("placeholder") == (
+        "اكتب سؤالك..." if locale == "ar" else "Ask a question..."
+    )
+    page.locator("#localePicker").select_option("en" if locale == "ar" else "ar")
+    assert page.locator(".welcome h2").inner_text() == (
+        "Welcome to LifeOS" if locale == "ar" else "مرحبًا بك في LifeOS"
+    )
+    assert page.locator(".suggestion").first.inner_text() == (
+        "📅 Calendar tomorrow" if locale == "ar" else "📅 تقويم الغد"
+    )
+
+
+@pytest.mark.parametrize("locale", ["en", "ar"])
+def test_sidebar_dynamic_labels_follow_locale_without_changing_titles(page: Page, locale_chat_base_url, locale):
+    _open(page, locale_chat_base_url, f"?lang={locale}")
+    empty = page.locator("#conversationsList .empty-conversations")
+    assert empty.inner_text() == ("لا توجد محادثات بعد" if locale == "ar" else "No conversations yet")
+    page.locator("#conversationSearch").fill("synthetic missing phrase")
+    expect(empty).to_have_text("لا توجد محادثات مطابقة" if locale == "ar" else "No matching conversations")
+    page.locator("#conversationSearch").fill("")
+    expect(empty).to_have_text("لا توجد محادثات بعد" if locale == "ar" else "No conversations yet")
+    page.evaluate("""() => {
+        window.lifeChat.state.allConversations = [
+            {id: 'synthetic-untitled', title: '', updated_at: ''},
+            {id: 'synthetic-titled', title: '<img src=x> خطة Release', updated_at: ''},
+        ];
+        window.filterConversations();
+    }""")
+    titles = page.locator(".conversation-title")
+    assert titles.nth(0).inner_text() == ("محادثة جديدة" if locale == "ar" else "New conversation")
+    assert titles.nth(1).inner_text() == "<img src=x> خطة Release"
+    assert page.locator(".conversation-title img").count() == 0
+    page.locator("#localePicker").select_option("en" if locale == "ar" else "ar")
+    assert titles.nth(0).inner_text() == ("New conversation" if locale == "ar" else "محادثة جديدة")
+    assert titles.nth(1).inner_text() == "<img src=x> خطة Release"
+
+
+@pytest.mark.parametrize("locale", ["en", "ar"])
+def test_delete_confirmation_uses_selected_language_and_cancel_prevents_delete(page: Page, locale_chat_base_url, locale):
+    _open(page, locale_chat_base_url, f"?lang={locale}")
+    deletes = []
+    page.on("request", lambda request: deletes.append(request.url) if request.method == "DELETE" else None)
+    dialogs = []
+
+    def dismiss(dialog):
+        dialogs.append(dialog.message)
+        dialog.dismiss()
+
+    page.once("dialog", dismiss)
+    page.evaluate("window.deleteConversation('synthetic-untitled')")
+    assert dialogs == ["هل تريد حذف هذه المحادثة؟" if locale == "ar" else "Delete this conversation?"]
+    assert deletes == []
