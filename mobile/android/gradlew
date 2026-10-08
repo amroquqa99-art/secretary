@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+VER="9.6.0"
+BASE="$ROOT/.gradle-dist"
+ZIP="$BASE/gradle-$VER-bin.zip"
+HOME_DIR="$BASE/gradle-$VER"
+mkdir -p "$BASE"
+if [ ! -x "$HOME_DIR/bin/gradle" ]; then
+  echo "Downloading Gradle $VER..."
+  if command -v curl >/dev/null 2>&1; then
+    curl --fail --location --connect-timeout 15 --max-time 180 "https://services.gradle.org/distributions/gradle-$VER-bin.zip" -o "$ZIP.part"
+    echo "bbaeb2fef8710818cf0e261201dab964c572f92b942812df0c3620d62a529a01  $ZIP.part" | sha256sum --check -
+    mv "$ZIP.part" "$ZIP"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -O "$ZIP.part" "https://services.gradle.org/distributions/gradle-$VER-bin.zip"
+    echo "bbaeb2fef8710818cf0e261201dab964c572f92b942812df0c3620d62a529a01  $ZIP.part" | sha256sum --check -
+    mv "$ZIP.part" "$ZIP"
+  else
+    echo "Need curl or wget to bootstrap Gradle." >&2; exit 1
+  fi
+  if command -v unzip >/dev/null 2>&1; then
+    unzip -q -o "$ZIP" -d "$BASE"
+  else
+    echo "Need unzip to bootstrap Gradle." >&2; exit 1
+  fi
+fi
+exec "$HOME_DIR/bin/gradle" "$@"
