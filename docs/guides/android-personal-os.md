@@ -15,9 +15,26 @@ cd mobile/android
 ```
 
 Minimum Android is 8.0/API 26. Native inference supports arm64-v8a and x86_64.
-GGUF models are separate explicit downloads/imports. Offline TTS needs an
-installed local voice; system on-device recognition requires Android 12 and a
-compatible installed provider.
+GGUF models are separate explicit downloads/imports. Arabic/English speech
+recognition models are bundled in the APK and verified/extracted on first use.
+The build downloads checksum-pinned speech assets into an ignored cache;
+`SECRETARY_SPEECH_CACHE_DIR` can point to an existing verified cache. Offline TTS
+needs an installed local system voice, and never falls back to a network voice.
+
+In **أنا → السكرتير**, select a language and press **أمر صوتي**. Recognition fills
+the input for review before sending. In **أنا → الإعدادات → التنبيه الصوتي
+الاختياري**, choose a 2–5-word phrase and start listening. Grant microphone and
+notification permissions. Say the phrase followed by a command, or speak the
+command within 15 seconds of the phrase. Review pending changes in the app.
+Use the notification's **إيقاف** action to stop; each session ends after one hour
+and does not restart on boot. Starting foreground voice or typing in the
+assistant stops background listening.
+
+Arabic first-use extraction requires about 1.3 GB free space. Recognition is
+refused when Android reports low memory or less than 1.1 GB available for Arabic
+(500 MB for English). These limits do not certify operation on a 4 GB phone.
+If notifications for **استماع السكرتير** are disabled, enable that channel in
+Android app notification settings before starting a microphone session.
 
 In **أنا → الإعدادات → ذاكرة LifeOS على الكمبيوتر**, export the life record ZIP to
 a private location. Extract into a dedicated directory in the LifeOS vault and

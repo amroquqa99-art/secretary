@@ -28,4 +28,17 @@ class LocalVoiceTest {
     @Test fun deniedPermissionNeverStartsMic(){grant();Shadows.shadowOf(RuntimeEnvironment.getApplication()).denyPermissions(Manifest.permission.RECORD_AUDIO);voice.listen("ar") { fail("Permission denied") };assertNull(ShadowSpeechRecognizer.getLatestSpeechRecognizer());assertTrue(status.contains("إذن"))}
     @Test fun stoppedSessionCannotFeedNewConfirmation(){grant();var oldCount=0;var received="";voice.listen("ar") { oldCount++ };val old=Shadows.shadowOf(ShadowSpeechRecognizer.getLatestSpeechRecognizer());voice.stop();voice.listen("ar") { received=it };old.triggerOnResults(results("أكد التنفيذ"));assertEquals(0,oldCount);assertEquals("",received);val current=Shadows.shadowOf(ShadowSpeechRecognizer.getLatestSpeechRecognizer());current.triggerOnResults(results("قراءة"));assertEquals("قراءة",received);assertTrue(old.isDestroyed)}
     @Test fun stalledRecognitionExpiresAndDestroysMic(){grant();var received=false;voice.listen("ar") { received=true };val recognizer=Shadows.shadowOf(ShadowSpeechRecognizer.getLatestSpeechRecognizer());ShadowLooper.idleMainLooper(60,java.util.concurrent.TimeUnit.SECONDS);assertTrue(recognizer.isDestroyed);recognizer.triggerOnResults(results("أكد التنفيذ"));assertFalse(received);assertTrue(status.contains("مهلة"))}
+    @Test fun matchingTtsErrorRunsFailureOnceAndStoppedErrorsCannotResumeOldSession() {
+        ShadowTextToSpeech.addVoice(Voice("local",Locale.US,300,300,false,emptySet()))
+        var failures=0;var completed=0
+        assertTrue(voice.speak("test","en-US",onFailure={failures++},onDone={completed++}))
+        val id=LocalVoice::class.java.getDeclaredField("speechId").apply {isAccessible=true}.get(voice) as String
+        val listener=Shadows.shadowOf(ShadowTextToSpeech.getLastTextToSpeechInstance()).utteranceProgressListener
+        listener.onError(id);ShadowLooper.idleMainLooper()
+        assertEquals(1,failures);assertEquals(0,completed)
+        listener.onError(id);ShadowLooper.idleMainLooper();assertEquals(1,failures)
+        assertTrue(voice.speak("new","en-US",onFailure={failures++}))
+        val stopped=LocalVoice::class.java.getDeclaredField("speechId").apply {isAccessible=true}.get(voice) as String
+        voice.stop();listener.onError(stopped);ShadowLooper.idleMainLooper();assertEquals(1,failures)
+    }
 }

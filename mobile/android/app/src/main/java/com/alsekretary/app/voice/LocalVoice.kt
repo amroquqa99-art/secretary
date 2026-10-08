@@ -29,17 +29,24 @@ class LocalVoice(private val context: Context,private val onStatus: (String)->Un
     private var spoken: (() -> Unit)?=null
     private var generation=0
     private var result: ((String) -> Unit)?=null
+    private val bundled=OfflineSpeech(context,onStatus)
+    private var failed: (() -> Unit)?=null
     init {
         tts=TextToSpeech(context) { status -> handler.post {
             if(!closed){ready=status==TextToSpeech.SUCCESS;onStatus(if(ready) "الصوت المحلي جاهز للفحص" else "تعذر تشغيل محرك النطق المحلي")}
         } }
         tts?.setOnUtteranceProgressListener(object: UtteranceProgressListener() {
             override fun onStart(id: String?) {}
-            override fun onDone(id: String?) {handler.post {if(!closed && id==speechId){val callback=spoken;spoken=null;speechId=null;callback?.invoke()} } }
-            @Deprecated("Legacy callback") override fun onError(id: String?) {handler.post {if(!closed && id==speechId){spoken=null;speechId=null;onStatus("فشل النطق؛ لم يبدأ تأكيد صوتي")}}}
+            override fun onDone(id: String?) {handler.post {if(!closed && id!=null && id==speechId){val callback=spoken;failed=null;spoken=null;speechId=null;callback?.invoke()} } }
+            @Deprecated("Legacy callback") override fun onError(id: String?) {handler.post {if(!closed && id!=null && id==speechId){val callback=failed;failed=null;spoken=null;speechId=null;onStatus("فشل النطق؛ لم يبدأ تأكيد صوتي");callback?.invoke()}}}
         })
     }
     fun recognitionAvailable(): Boolean=Build.VERSION.SDK_INT>=31 && SpeechRecognizer.isOnDeviceRecognitionAvailable(context)
+    fun listenOffline(language: String,callback: (String)->Unit) {
+        if(closed)return
+        stop()
+        bundled.listen(language) { text -> onStatus("سمعت: $text");callback(text) }
+    }
     fun listen(language: String,callback: (String)->Unit) {
         check(Looper.myLooper()==Looper.getMainLooper())
         if(closed)return
@@ -80,7 +87,7 @@ class LocalVoice(private val context: Context,private val onStatus: (String)->Un
             })
         } catch(e: Exception) {recording=false;result=null;recognizer?.destroy();recognizer=null;onStatus("تعذر بدء التعرف المحلي؛ استخدم الكتابة")}
     }
-    fun speak(text: String,language: String,onDone: (() -> Unit)?=null): Boolean {
+    fun speak(text: String,language: String,onFailure: (() -> Unit)?=null,onDone: (() -> Unit)?=null): Boolean {
         if(closed || !ready){onStatus("محرك النطق لم يجهز بعد");return false}
         stop()
         val engine=tts ?: return false
@@ -90,10 +97,10 @@ class LocalVoice(private val context: Context,private val onStatus: (String)->Un
         if(engine.setVoice(voice)!=TextToSpeech.SUCCESS){onStatus("تعذر اختيار الصوت المحلي");return false}
         val limit=TextToSpeech.getMaxSpeechInputLength()
         if(text.length>limit){onStatus("النص أطول من حد النطق؛ اقرأه على الشاشة");return false}
-        speechId=UUID.randomUUID().toString();spoken=onDone
+        speechId=UUID.randomUUID().toString();spoken=onDone;failed=onFailure
         if(engine.speak(text,TextToSpeech.QUEUE_FLUSH,null,speechId)!=TextToSpeech.SUCCESS){speechId=null;spoken=null;onStatus("تعذر نطق النص");return false}
         onStatus("ينطق محلياً…");return true
     }
-    fun stop() {generation++;result=null;spoken=null;speechId=null;recording=false;recognizer?.cancel();recognizer?.destroy();recognizer=null;tts?.stop()}
-    fun close() {if(closed)return;stop();closed=true;tts?.shutdown();tts=null;handler.removeCallbacksAndMessages(null)}
+    fun stop() {generation++;bundled.stop();result=null;spoken=null;failed=null;speechId=null;recording=false;recognizer?.cancel();recognizer?.destroy();recognizer=null;tts?.stop()}
+    fun close() {if(closed)return;stop();closed=true;bundled.close();tts?.shutdown();tts=null;handler.removeCallbacksAndMessages(null)}
 }
