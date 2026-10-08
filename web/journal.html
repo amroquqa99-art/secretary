@@ -242,7 +242,9 @@
 
         [dir="rtl"] .nav-arrow { transform: scaleX(-1); }
         .nav-arrow { display: inline-block; }
-        .legend-value { min-width: 0; overflow-wrap: anywhere; text-align: match-parent; }
+        /* Label alignment follows the UI, independently of authored text direction. */
+        .legend-value { min-width: 0; overflow-wrap: anywhere; text-align: left; }
+        [dir="rtl"] .legend-value { text-align: right; }
         .legend-count { white-space: nowrap; }
         .wedge-label { unicode-bidi: plaintext; }
 

@@ -24,8 +24,8 @@ and 12 retrieval-harness tests. Eight adjacent localization-audit/tool-use-harne
 tests cover the supporting tools. These checks do not replace the retained hosted
 test lanes or real-device and real-model acceptance.
 
-Remaining work includes other UI surfaces, Arabic retrieval/model measurement,
-voice, and Android. See the [Arabic and Android roadmap](docs/roadmap/arabic-android-fork.md),
+Remaining work includes Journal trends, Agents/Tasks and CRM localization,
+Arabic retrieval/model measurement, voice, and Android. See the [Arabic and Android roadmap](docs/roadmap/arabic-android-fork.md),
 [model provider strategy](docs/roadmap/model-provider-strategy.md), and
 [mobile pairing protocol](docs/roadmap/mobile-pairing-protocol.md).
 
