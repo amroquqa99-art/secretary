@@ -1,0 +1,14 @@
+name: secretary-android-dev
+
+services:
+  android-build:
+    platform: linux/amd64
+    build:
+      context: ../..
+      dockerfile: mobile/android/Dockerfile
+    image: secretary-android-dev:local
+    init: true
+    # Debug build output remains accessible after the container exits.
+    volumes:
+      - ./app/build/outputs:/workspace/mobile/android/app/build/outputs
+    command: ["./gradlew", "--no-daemon", ":app:testDebugUnitTest", ":app:assembleDebug"]
