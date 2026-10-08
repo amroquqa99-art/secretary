@@ -10,21 +10,21 @@ Upstream contributions are held until the fork passes integrated acceptance.
 
 | Capability | Current state |
 | --- | --- |
-| Arabic chat copy, language selection, RTL and mixed-direction messages | Available on `main`; broader product localization is incomplete. |
-| Arabic retrieval and tool-use benchmark harnesses | Available on `main` with synthetic fixtures; real-model quality is unmeasured. |
-| Shared locale runtime and Arabic Home | [Candidate implementation](https://github.com/amroquqa99-art/secretary/pull/18); focused browser checks pass, hosted acceptance is pending. |
-| Retrieval model profiles and standalone benchmark CLI | [Candidate implementation](https://github.com/amroquqa99-art/secretary/pull/17); Qwen3 and BGE profiles are evaluation candidates, not selected production defaults. |
-| Mobile sidebar gestures for Arabic and English | [Candidate implementation](https://github.com/amroquqa99-art/secretary/pull/19); synthetic Chromium touch scenarios pass, hosted acceptance is pending. |
+| Arabic chat copy, language selection, RTL and mixed-direction messages | Implemented; broader product localization is incomplete. |
+| Shared locale runtime and Arabic Home | Implemented with persisted language selection across Home and Chat. |
+| Mobile sidebar gestures for Arabic and English | Implemented with direction-aware opening and closing; synthetic Chromium touch scenarios are covered. |
+| Locale-aware conversation dates | Implemented with Arabic relative-time grammar and immediate refresh when the language changes. |
+| Arabic retrieval and tool-use benchmark harnesses | Implemented with synthetic fixtures; real-model quality is unmeasured. |
+| Retrieval model profiles and standalone benchmark CLI | Implemented; Qwen3 and BGE profiles are evaluation candidates, not selected production defaults. |
 | Native Android companion, offline operation and Arabic voice | Not delivered by this fork. Pairing and companion design documents do not constitute an Android implementation. |
 
-The combined candidate passes 45 focused tests: 33 browser scenarios and 12
-retrieval-harness tests. Eight adjacent localization-audit/tool-use-harness
-tests also pass. These checks do not replace the retained hosted test lanes or
-real-device and real-model acceptance.
+The combined implementation is covered by 54 focused tests: 42 browser scenarios
+and 12 retrieval-harness tests. Eight adjacent localization-audit/tool-use-harness
+tests cover the supporting tools. These checks do not replace the retained hosted
+test lanes or real-device and real-model acceptance.
 
-The next gate is to resolve hosted verification and integrate the candidate
-branches. Remaining work includes other UI surfaces, Arabic retrieval/model
-measurement, voice, and Android. See the [Arabic and Android roadmap](docs/roadmap/arabic-android-fork.md),
+Remaining work includes other UI surfaces, Arabic retrieval/model measurement,
+voice, and Android. See the [Arabic and Android roadmap](docs/roadmap/arabic-android-fork.md),
 [model provider strategy](docs/roadmap/model-provider-strategy.md), and
 [mobile pairing protocol](docs/roadmap/mobile-pairing-protocol.md).
 

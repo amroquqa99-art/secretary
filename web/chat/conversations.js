@@ -5,6 +5,7 @@
 import { state, config, elements, endpoints } from './session.js';
 import { addMessage, escapeHtml } from './thread.js';
 import { startPendingQuestionPolling, stopPendingQuestionPolling } from './pending-question.js';
+import { localeState, t, translateChatUi } from './locale.js';
 
 export function toggleSidebar() {
   elements.sidebar.classList.toggle('open');
@@ -106,7 +107,7 @@ export function filterConversations() {
 async function filterConversationsAsync(searchTerm) {
   // First, filter by title (immediate results)
   const titleMatches = state.allConversations.filter(conv => {
-    const title = (conv.title || 'New conversation').toLowerCase();
+    const title = (conv.title || t('new_conversation')).toLowerCase();
     return title.includes(searchTerm);
   });
 
@@ -115,7 +116,7 @@ async function filterConversationsAsync(searchTerm) {
 
   // Then search in message content for remaining conversations
   const nonTitleMatches = state.allConversations.filter(conv => {
-    const title = (conv.title || 'New conversation').toLowerCase();
+    const title = (conv.title || t('new_conversation')).toLowerCase();
     return !title.includes(searchTerm);
   });
 
@@ -170,8 +171,8 @@ function renderConversations(conversations, isPartial = false) {
   if (conversations.length === 0 && !isPartial) {
     const searchInput = document.getElementById('conversationSearch');
     const isSearching = searchInput?.value?.trim();
-    const emptyText = isSearching ? 'No matching conversations' : 'No conversations yet';
-    conversationsList.innerHTML = `<div class="empty-conversations">${emptyText}</div>`;
+    const emptyText = t(isSearching ? 'no_matching_conversations' : 'no_conversations');
+    conversationsList.innerHTML = `<div class="empty-conversations">${escapeHtml(emptyText)}</div>`;
     return;
   }
 
@@ -180,10 +181,10 @@ function renderConversations(conversations, isPartial = false) {
                      onclick="loadConversation('${conv.id}')">
                     <div class="conversation-icon">💬</div>
                     <div class="conversation-info">
-                        <div class="conversation-title" title="${escapeHtml(conv.title || 'New conversation')}">${escapeHtml(conv.title || 'New conversation')}</div>
+                        <div class="conversation-title" title="${escapeHtml(conv.title || t('new_conversation'))}">${escapeHtml(conv.title || t('new_conversation'))}</div>
                         <div class="conversation-date">${escapeHtml(formatDate(conv.updated_at) + personaSubtitleSuffix(conv))}</div>
                     </div>
-                    <button class="conversation-delete" onclick="event.stopPropagation(); deleteConversation('${conv.id}')" title="Delete">✕</button>
+                    <button class="conversation-delete" onclick="event.stopPropagation(); deleteConversation('${conv.id}')" title="${escapeHtml(t('delete'))}">✕</button>
                 </div>
             `).join('');
 }
@@ -203,7 +204,7 @@ export async function loadConversation(id) {
     const response = await fetch(`${endpoints.conversations}/${encodeURIComponent(id)}`);
     if (response.ok) {
       const data = await response.json();
-      elements.chatTitle.textContent = data.title || 'Conversation';
+      elements.chatTitle.textContent = data.title || t('conversation');
 
       // Clear and render messages
       elements.messagesEl.innerHTML = '';
@@ -228,7 +229,7 @@ export async function loadConversation(id) {
 }
 
 export async function deleteConversation(id) {
-  if (!confirm('Delete this conversation?')) return;
+  if (!confirm(t('delete_conversation'))) return;
 
   try {
     await fetch(`${endpoints.conversations}/${id}`, { method: 'DELETE' });
@@ -245,20 +246,21 @@ export function newChat() {
   state.currentConversationId = null;
   state.currentAgentThread = null; // leave agent-thread mode
   stopPendingQuestionPolling();   // no active conversation → no answer affordance
-  elements.inputField.placeholder = 'Ask a question...';
-  elements.chatTitle.textContent = 'New conversation';
+  elements.inputField.placeholder = t('ask_question');
+  elements.chatTitle.textContent = t('new_conversation');
   elements.messagesEl.innerHTML = `
                 <div class="welcome">
                     <div class="welcome-icon">🧠</div>
-                    <h2>Welcome to LifeOS</h2>
-                    <p>Your personal knowledge assistant. Ask about your notes, calendar, emails, or anything in your vault.</p>
+                    <h2 data-i18n="welcome_title">Welcome to LifeOS</h2>
+                    <p data-i18n="welcome_body">Your personal knowledge assistant. Ask about your notes, calendar, emails, or anything in your vault.</p>
                     <div class="suggestions">
-                        <button class="suggestion" onclick="askQuestion('What\\'s on my calendar tomorrow?')">📅 Calendar tomorrow</button>
-                        <button class="suggestion" onclick="askQuestion('What are my open action items?')">✅ Open action items</button>
-                        <button class="suggestion" onclick="askQuestion('Summarize my recent meeting notes')">📝 Recent meetings</button>
+                        <button class="suggestion" onclick="askQuestion('What\\'s on my calendar tomorrow?')" data-i18n="calendar_tomorrow">📅 Calendar tomorrow</button>
+                        <button class="suggestion" onclick="askQuestion('What are my open action items?')" data-i18n="open_action_items">✅ Open action items</button>
+                        <button class="suggestion" onclick="askQuestion('Summarize my recent meeting notes')" data-i18n="recent_meetings">📝 Recent meetings</button>
                     </div>
                 </div>
             `;
+  translateChatUi(elements.messagesEl);
   loadConversations();
   closeSidebar();
   elements.inputField.focus();
@@ -269,19 +271,27 @@ export function formatDate(dateStr) {
   const date = new Date(dateStr);
   const now = new Date();
   const diff = now - date;
+  const locale = localeState.locale === 'ar' ? 'ar' : 'en-US';
+  const relative = (amount, unit, english) => locale === 'ar'
+    ? new Intl.RelativeTimeFormat(locale, { numeric: 'always' }).format(-amount, unit)
+    : english;
 
   // Under 1 minute: "Just now"
-  if (diff < 60000) return 'Just now';
+  if (diff < 60000) return t('just_now');
 
   // Under 1 hour: "5m ago", "23m ago"
-  if (diff < 3600000) return Math.floor(diff / 60000) + 'm ago';
+  if (diff < 3600000) {
+    const minutes = Math.floor(diff / 60000);
+    return relative(minutes, 'minute', minutes + 'm ago');
+  }
 
   // Check if date is today (same calendar day in local timezone)
   const isToday = date.toDateString() === now.toDateString();
 
   // Under 24 hours AND today: "2h ago", "11h ago"
   if (diff < 86400000 && isToday) {
-    return Math.floor(diff / 3600000) + 'h ago';
+    const hours = Math.floor(diff / 3600000);
+    return relative(hours, 'hour', hours + 'h ago');
   }
 
   // Check if date is yesterday
@@ -289,20 +299,20 @@ export function formatDate(dateStr) {
   yesterday.setDate(yesterday.getDate() - 1);
   const isYesterday = date.toDateString() === yesterday.toDateString();
 
-  // Format time as "3:15 PM"
-  const timeStr = date.toLocaleTimeString('en-US', {
+  // Format wall-clock time in the selected locale.
+  const timeStr = date.toLocaleTimeString(locale, {
     hour: 'numeric',
     minute: '2-digit',
     hour12: true
   });
 
-  // Yesterday: "Yesterday 3:15 PM"
+  // The localized yesterday label includes wall-clock time.
   if (isYesterday) {
-    return 'Yesterday ' + timeStr;
+    return t('yesterday') + ' ' + timeStr;
   }
 
-  // Format month and day as "Jan 8"
-  const monthDay = date.toLocaleDateString('en-US', {
+  // Older dates use the selected locale's month and numeral conventions.
+  const monthDay = date.toLocaleDateString(locale, {
     month: 'short',
     day: 'numeric'
   });
@@ -314,14 +324,14 @@ export function formatDate(dateStr) {
   if (isSameYear) {
     // For dates within the last week, include time
     if (diff < 604800000) {
-      return monthDay + ', ' + timeStr;
+      return monthDay + (locale === 'ar' ? '، ' : ', ') + timeStr;
     }
     // Older this-year dates: just "Jan 8"
     return monthDay;
   }
 
   // Older (different year): "Jan 8, 2025"
-  return date.toLocaleDateString('en-US', {
+  return date.toLocaleDateString(locale, {
     month: 'short',
     day: 'numeric',
     year: 'numeric'

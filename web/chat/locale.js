@@ -14,7 +14,14 @@ import {
 
 const TRANSLATIONS = {
   en: {
+    just_now: 'Just now',
+    yesterday: 'Yesterday',
     new_chat: 'New chat',
+    new_conversation: 'New conversation',
+    conversation: 'Conversation',
+    no_matching_conversations: 'No matching conversations',
+    delete_conversation: 'Delete this conversation?',
+    delete: 'Delete',
     search_conversations: 'Search conversations...',
     no_conversations: 'No conversations yet',
     agent_threads: 'Agent threads',
@@ -64,7 +71,14 @@ const TRANSLATIONS = {
     language: 'Language',
   },
   ar: {
+    just_now: 'الآن',
+    yesterday: 'أمس',
     new_chat: 'محادثة جديدة',
+    new_conversation: 'محادثة جديدة',
+    conversation: 'محادثة',
+    no_matching_conversations: 'لا توجد محادثات مطابقة',
+    delete_conversation: 'هل تريد حذف هذه المحادثة؟',
+    delete: 'حذف',
     search_conversations: 'ابحث في المحادثات...',
     no_conversations: 'لا توجد محادثات بعد',
     agent_threads: 'جلسات الوكلاء',
@@ -163,6 +177,7 @@ export function setLocale(locale) {
   applyLocale(normalized, { persist: true });
   translateChatUi();
   if (localePicker) localePicker.value = normalized;
+  document.dispatchEvent(new CustomEvent('lifeos:localechange'));
   return true;
 }
 
