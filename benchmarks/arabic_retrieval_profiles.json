@@ -1,0 +1,65 @@
+{
+  "version": 1,
+  "name": "LifeOS Arabic retrieval model profiles",
+  "profiles": {
+    "current_lifeos": {
+      "description": "Exact current LifeOS production embedding/reranker behavior; no embedding query prompt is added by EmbeddingService.",
+      "embedding_model": "mixedbread-ai/mxbai-embed-large-v1",
+      "reranker_model": "cross-encoder/ms-marco-MiniLM-L6-v2",
+      "modes": "bm25,vector,hybrid,rerank",
+      "query_template": "{query}",
+      "licenses": {
+        "embedding": "Apache-2.0",
+        "reranker": "Apache-2.0"
+      },
+      "language_scope": "English-focused production control"
+    },
+    "qwen3_0_6b": {
+      "description": "Primary low-memory multilingual candidate for Arabic and cross-lingual retrieval.",
+      "embedding_model": "Qwen/Qwen3-Embedding-0.6B",
+      "reranker_model": "Qwen/Qwen3-Reranker-0.6B",
+      "modes": "bm25,vector,hybrid,rerank",
+      "query_template": "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:{query}",
+      "licenses": {
+        "embedding": "Apache-2.0",
+        "reranker": "Apache-2.0"
+      },
+      "language_scope": "100+ languages",
+      "approximate_weight_gb": {
+        "embedding": 1.19,
+        "reranker": 1.19
+      },
+      "hardware_note": "First candidate for the 6 GB VRAM profile; benchmark latency and peak memory before making it a default.",
+      "min_sentence_transformers": "5.4.0"
+    },
+    "bge_m3": {
+      "description": "Heavier multilingual reference candidate with long-context embedding and a multilingual cross-encoder.",
+      "embedding_model": "BAAI/bge-m3",
+      "reranker_model": "BAAI/bge-reranker-v2-m3",
+      "modes": "bm25,vector,hybrid,rerank",
+      "query_template": "{query}",
+      "licenses": {
+        "embedding": "MIT",
+        "reranker": "Apache-2.0"
+      },
+      "language_scope": "100+ languages",
+      "approximate_weight_gb": {
+        "embedding": 2.27,
+        "reranker": 2.27
+      },
+      "hardware_note": "Reference-quality candidate; measure whether sequential loading or CPU fallback is needed on 6 GB VRAM."
+    },
+    "mxbai_recommended": {
+      "description": "Current LifeOS models with mxbai's documented retrieval query prompt, isolating prompt usage from a model swap.",
+      "embedding_model": "mixedbread-ai/mxbai-embed-large-v1",
+      "reranker_model": "cross-encoder/ms-marco-MiniLM-L6-v2",
+      "modes": "bm25,vector,hybrid,rerank",
+      "query_template": "Represent this sentence for searching relevant passages: {query}",
+      "licenses": {
+        "embedding": "Apache-2.0",
+        "reranker": "Apache-2.0"
+      },
+      "language_scope": "English-focused prompted control"
+    }
+  }
+}
