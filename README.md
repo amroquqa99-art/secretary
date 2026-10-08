@@ -4,6 +4,8 @@
 
 ## Arabic and Android fork status
 
+The native personal OS is documented in [Android features](docs/specs/product/android-personal-os.md) and [Android setup](docs/guides/android-personal-os.md).
+
 This repository is an independent development fork of LifeOS. The original
 Secretary history remains reachable on `archive/pre-lifeos-2026-10-07`.
 Upstream contributions are held until the fork passes integrated acceptance.
@@ -19,7 +21,7 @@ Upstream contributions are held until the fork passes integrated acceptance.
 | Numerals in localized UI | Arabic and English use digits 0–9 in journal counts, percentages, dates and conversation timestamps. |
 | Arabic retrieval and tool-use benchmark harnesses | Implemented with synthetic fixtures; real-model quality is unmeasured. |
 | Retrieval model profiles and standalone benchmark CLI | Implemented; Qwen3 and BGE profiles are evaluation candidates, not selected production defaults. |
-| Native Android companion, offline operation and Arabic voice | Not delivered by this fork. Pairing and companion design documents do not constitute an Android implementation. |
+| Native offline Android personal OS | Source in `mobile/android`: goals, projects, tasks, calendar, habits, knowledge, reviews, approved assistant actions and encrypted recovery. Physical-device acceptance and live LifeOS pairing are pending. |
 
 The combined implementation is covered by 106 focused tests: 94 browser scenarios
 and 12 retrieval-harness tests. Eight adjacent localization-audit/tool-use-harness
@@ -27,7 +29,7 @@ tests cover the supporting tools. These checks do not replace the retained hoste
 test lanes or real-device and real-model acceptance.
 
 Remaining work includes Agents/Tasks and CRM localization,
-Arabic retrieval/model measurement, voice, and Android. See the [Arabic and Android roadmap](docs/roadmap/arabic-android-fork.md),
+Arabic retrieval/model measurement, bundled voice, and authenticated Android integration. See the [Arabic and Android roadmap](docs/roadmap/arabic-android-fork.md),
 [model provider strategy](docs/roadmap/model-provider-strategy.md), and
 [mobile pairing protocol](docs/roadmap/mobile-pairing-protocol.md).
 

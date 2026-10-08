@@ -12,14 +12,17 @@ proposed to the LifeOS upstream repository. It is intentionally stricter than a
 feature wishlist: each phase has compatibility, security, rollback, and
 verification gates.
 
+The native implementation is in `mobile/android`. See [Android features](../specs/product/android-personal-os.md) and [ownership](../adr/027-offline-android-life-records.md). Physical-device acceptance and live pairing remain pending.
+
 ## 1. Goals
 
 The fork should add four capabilities without weakening LifeOS:
 
 1. First-class Arabic support, including RTL, mixed Arabic/English content,
    Arabic search/retrieval, Arabic tool use, and Arabic voice.
-2. A strong Android experience, initially as a secure remote client and later
-   as an optional native companion for capabilities browsers cannot provide.
+2. A native offline Android personal OS with Arabic interaction and `0–9`
+   generated digits, plus authenticated LifeOS integration. ADR-027 defines
+   local-record ownership and the read-only knowledge projection.
 3. Provider-independent model execution, including local OpenAI-compatible
    models and hosted OpenAI-compatible providers.
 4. A contribution path made of small, reviewable, upstream-quality changes.

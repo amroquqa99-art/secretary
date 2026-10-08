@@ -1,0 +1,9 @@
+.gradle/
+.kotlin/
+.gradle-dist/
+.cxx/
+**/build/
+local.properties
+.speech-model-cache/
+*.jks
+*.keystore
