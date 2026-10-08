@@ -428,3 +428,8 @@ Full standards in [docs/AGENTS.md](docs/AGENTS.md). Key rules:
 - [README.md](README.md) — Architecture overview with diagrams
 - [docs/AGENTS.md](docs/AGENTS.md) — Documentation strategy and standards
 - [CLAUDE.md](CLAUDE.md) — Claude Code-specific configuration
+
+
+## Mandatory container/toolchain policy (2026-10-09)
+
+Use the checked-in backend Dockerfile/Compose and [container development guide](docs/guides/container-development.md) when testing Python services; preserve wheel caches and version evidence. Do not repeatedly provision machine-global environments when a project container is suitable. Keep secrets, personal vaults, signed APK keys, datasets and local models outside images; `LIFEOS_TEST_INSTANCE=1` is required for isolated container tests. Do not use this CPU backend image as evidence for Android APK or device compatibility. Create/test an independent Android JDK/SDK/NDK/Gradle image on the branch containing `mobile/android`, then update this policy. Existing floating Python minimum-version constraints mean clean rebuilds are not yet fully deterministic; generate and verify a platform-specific lock before claiming that property.
