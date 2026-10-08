@@ -218,12 +218,12 @@ def test_conversation_dates_follow_locale_with_english_parity(page: Page, locale
         assert "2025" in labels["lastYear"]
     else:
         assert labels["fresh"] == "الآن"
-        five = page.evaluate("new Intl.NumberFormat('ar').format(5)")
+        five = page.evaluate("new Intl.NumberFormat('ar-u-nu-latn').format(5)")
         assert labels["minutes"] == f"قبل {five} دقائق"
         assert labels["hours"] == "قبل ساعتين"
         assert labels["yesterday"].startswith("أمس ")
         assert "سبتمبر" in labels["older"]
-        year = page.evaluate("new Intl.NumberFormat('ar', {useGrouping: false}).format(2025)")
+        year = page.evaluate("new Intl.NumberFormat('ar-u-nu-latn', {useGrouping: false}).format(2025)")
         assert year in labels["lastYear"]
 
 
@@ -239,7 +239,7 @@ def test_language_picker_refreshes_existing_sidebar_dates(page: Page, locale_cha
     label = page.locator(".conversation-date").first
     assert label.inner_text() == "5m ago"
     page.locator("#localePicker").select_option("ar")
-    five = page.evaluate("new Intl.NumberFormat('ar').format(5)")
+    five = page.evaluate("new Intl.NumberFormat('ar-u-nu-latn').format(5)")
     assert label.inner_text() == f"قبل {five} دقائق"
     page.locator("#localePicker").select_option("en")
     assert label.inner_text() == "5m ago"

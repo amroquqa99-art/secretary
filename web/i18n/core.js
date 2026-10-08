@@ -17,6 +17,11 @@ export function directionForLocale(locale) {
   return normalizeLocale(locale) === 'ar' ? 'rtl' : 'ltr';
 }
 
+// Arabic UI copy and calendar names use the operator's requested 0–9 digits.
+export function formattingLocale(locale) {
+  return normalizeLocale(locale) === 'ar' ? 'ar-u-nu-latn' : 'en';
+}
+
 function storedLocale() {
   try {
     return normalizeLocale(window.localStorage.getItem(STORAGE_KEY));

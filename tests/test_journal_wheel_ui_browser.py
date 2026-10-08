@@ -165,10 +165,10 @@ def test_journal_locale_covers_controls_counts_dates_and_authored_labels(page: P
     expect(page.locator('[data-window="day"]')).to_have_text("يوم" if locale == "ar" else "Day")
     expect(page.locator(".legend-value").first).to_have_text("Happy")
     expect(page.locator(".legend-value").first).to_have_attribute("dir", "auto")
-    expected_count = page.evaluate("locale => new Intl.NumberFormat(locale).format(3)", locale)
-    expected_percent = page.evaluate("locale => new Intl.NumberFormat(locale, {style: 'percent', minimumFractionDigits: 1, maximumFractionDigits: 1}).format(.75)", locale)
+    expected_count = page.evaluate("locale => new Intl.NumberFormat(locale === 'ar' ? 'ar-u-nu-latn' : locale).format(3)", locale)
+    expected_percent = page.evaluate("locale => new Intl.NumberFormat(locale === 'ar' ? 'ar-u-nu-latn' : locale, {style: 'percent', minimumFractionDigits: 1, maximumFractionDigits: 1}).format(.75)", locale)
     expect(page.locator(".legend-count").first).to_have_text(f"{expected_count} ({expected_percent})")
-    date = page.evaluate("new Intl.DateTimeFormat('ar', {year:'numeric', month:'long', day:'numeric', timeZone:'UTC'}).format(new Date('2026-06-30T00:00:00Z'))") if locale == "ar" else "2026-06-30"
+    date = page.evaluate("new Intl.DateTimeFormat('ar-u-nu-latn', {year:'numeric', month:'long', day:'numeric', timeZone:'UTC'}).format(new Date('2026-06-30T00:00:00Z'))") if locale == "ar" else "2026-06-30"
     expect(page.locator("#sampleBanner")).to_contain_text(date)
     page.locator(".wedge").first.dispatch_event("mouseenter")
     expect(page.locator("#tooltip")).to_contain_text(f"Happy: {expected_count} ({expected_percent})")
@@ -204,8 +204,8 @@ def test_arabic_sample_states_preserve_coverage_and_thin_sample_caveat(page: Pag
     _open_journal(page, journal_base_url, suffix="?lang=ar", default=data)
     expect(page.locator("#sampleBanner")).to_contain_text(phrase)
     if emotions:
-        expect(page.locator(".legend-count")).to_contain_text(page.evaluate("new Intl.NumberFormat('ar', {style:'percent', minimumFractionDigits:1, maximumFractionDigits:1}).format(1)"))
-        expected = page.evaluate("n => new Intl.NumberFormat('ar').format(n)", total)
+        expect(page.locator(".legend-count")).to_contain_text(page.evaluate("new Intl.NumberFormat('ar-u-nu-latn', {style:'percent', minimumFractionDigits:1, maximumFractionDigits:1}).format(1)"))
+        expected = page.evaluate("n => new Intl.NumberFormat('ar-u-nu-latn').format(n)", total)
         expect(page.locator("#sampleBanner")).to_contain_text(expected)
     else:
         expect(page.locator(".wedge")).to_have_count(0)
@@ -280,5 +280,5 @@ def test_journal_calendar_date_does_not_shift_in_western_time_zone(browser, jour
     with browser.new_context(timezone_id="America/Los_Angeles") as context:
         page = context.new_page()
         _open_journal(page, journal_base_url, suffix="?lang=ar")
-        expected = page.evaluate("new Intl.DateTimeFormat('ar', {year:'numeric', month:'long', day:'numeric', timeZone:'UTC'}).format(new Date('2026-06-30T00:00:00Z'))")
+        expected = page.evaluate("new Intl.DateTimeFormat('ar-u-nu-latn', {year:'numeric', month:'long', day:'numeric', timeZone:'UTC'}).format(new Date('2026-06-30T00:00:00Z'))")
         expect(page.locator("#sampleBanner")).to_contain_text(expected)
