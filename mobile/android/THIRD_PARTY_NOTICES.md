@@ -14,3 +14,18 @@ The Apache license is bundled as `app/src/main/assets/licenses/APACHE-2.0.txt`.
 
 LiteRT-LM is not an Android dependency. Existing owned `.litertlm` weights remain available for explicit removal; the engine does not load them.
 Other Android/Compose, Kotlin and Gson dependencies retain their own licenses.
+
+Vosk Android 0.3.75, Alpha Cephei contributors, Apache License 2.0.
+Source: https://github.com/alphacep/vosk-api
+JNA 5.18.1, JNA contributors, Apache License 2.0 (chosen from its dual license).
+Source: https://github.com/java-native-access/jna
+The Apache license and dependency notices are bundled in `assets/licenses`.
+
+Bundled recognition models from https://alphacephei.com/vosk/models:
+- `vosk-model-small-en-us-0.15.zip`: 41,205,931 bytes, SHA-256
+  `30f26242c4eb449f948e42cb302dd7a686cb29a3423a8367f99ff41780942498`, Apache 2.0.
+- `vosk-model-ar-mgb2-0.4.zip`: 333,241,610 bytes, SHA-256
+  `357469ae1bb4d7a3810c9cd6b86d33bc135898dfc134e6df8bc2ddd28c5fe77a`, Apache 2.0.
+
+These archives are fetched and checked at build time, not committed to Git.
+Runtime recognition does not download models or send audio over the network.

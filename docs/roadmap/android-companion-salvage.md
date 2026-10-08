@@ -1,6 +1,6 @@
 # Native Android modules and ownership
 
-**Status:** Native source implemented; device acceptance pending
+**Status:** Partial
 **Last Updated:** 2026-10-09
 **Owner:** Secretary fork
 
@@ -22,9 +22,10 @@ not authentication mechanisms. DNS forwarding requires explicit Cloudflare
 consent for each session. Encrypted backups retain exportable previous-state
 snapshots. SQLite itself relies on the application sandbox/device encryption.
 
-System voice depends on installed on-device language services. Bundled offline
-Arabic/English recognition, wake listening and authenticated live integration
-remain under development. The mobile pairing contract remains authoritative for
+Arabic/English recognition is bundled offline; speech output uses installed
+offline system voices. Wake listening is an explicit, visible, bounded microphone
+session. Device acceptance and authenticated live integration remain pending.
+The mobile pairing contract remains authoritative for
 that integration.
 
 ## Related Documents

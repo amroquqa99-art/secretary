@@ -38,4 +38,12 @@ class PersonalOsUiTest {
             assertEquals("محتوى عربي 123\n[[رابط]]",repo.listNotes().single{it.title=="معرفة تجريبية"}.markdown)
         }
     }
+    @Test fun typingAnAssistantCommandStopsAnExplicitBackgroundSession() {
+        compose.onNodeWithText("أنا").performClick()
+        val prefs=com.alsekretary.app.voice.BackgroundVoiceService.prefs(compose.activity)
+        prefs.edit().putBoolean("active",true).commit()
+        compose.onNodeWithText("اكتب أمرك").performTextInput("أضف مهمة قراءة 123")
+        assertFalse(prefs.getBoolean("active",false))
+        compose.onNodeWithText("أضف مهمة قراءة 123").assertExists()
+    }
 }

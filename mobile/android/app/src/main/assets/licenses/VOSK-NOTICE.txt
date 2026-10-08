@@ -1,0 +1,5 @@
+Vosk Android 0.3.75
+Copyright Alpha Cephei Inc. and Vosk contributors
+https://github.com/alphacep/vosk-api
+Licensed under Apache License 2.0; see APACHE-2.0.txt.
+Bundled speech models: vosk-model-small-en-us-0.15 and vosk-model-ar-mgb2-0.4, Apache License 2.0 as listed at https://alphacephei.com/vosk/models.

@@ -6,6 +6,7 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <queries>
         <intent><action android:name="android.speech.RecognitionService" /></intent>
@@ -13,6 +14,7 @@
         <intent><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent>
     </queries>
     <application
+        android:name=".SecretaryApplication"
         android:allowBackup="false"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:icon="@drawable/ic_secretary"
@@ -50,6 +52,7 @@
             </intent-filter>
         </receiver>
         <service android:name=".reminders.ProactiveReviewService" android:permission="android.permission.BIND_JOB_SERVICE" android:exported="true" />
+        <service android:name=".voice.BackgroundVoiceService" android:exported="false" android:foregroundServiceType="microphone" />
         <service android:name=".social.SocialSyncService" android:permission="android.permission.BIND_JOB_SERVICE" android:exported="true" />
         <provider android:name="androidx.core.content.FileProvider" android:authorities="${applicationId}.files" android:exported="false" android:grantUriPermissions="true">
             <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/file_paths" />

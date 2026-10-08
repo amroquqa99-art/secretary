@@ -24,6 +24,7 @@ fun SettingsScreen(state: MainUiState,vm: MainViewModel) {
     val rollback=rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")){uri->if(uri!=null)rollbackName?.let { vm.exportRollback(it,uri) };rollbackName=null}
     LazyColumn(Modifier.fillMaxSize(),contentPadding=PaddingValues(16.dp),verticalArrangement=Arrangement.spacedBy(14.dp)) {
         item{Text("الإعدادات والبيانات",style=MaterialTheme.typography.headlineMedium)}
+        item { BackgroundVoiceSettings() }
         item{GlassCard{
             Text("نسخة احتياطية مشفرة",style=MaterialTheme.typography.titleLarge)
             Text("تشمل بياناتك والمرفقات. احفظ كلمة المرور؛ لا توجد طريقة لاستعادتها. بيانات الدخول وعمليات التعاون المؤجلة لا تدخل النسخة.")
@@ -50,7 +51,7 @@ fun SettingsScreen(state: MainUiState,vm: MainViewModel) {
         }
         item{GlassCard{Text("مواقع مشتتة أثناء الالتزام",style=MaterialTheme.typography.titleLarge);OutlinedTextField(domains,{domains=it},label={Text("نطاق واحد في كل سطر")},modifier=Modifier.fillMaxWidth());Button(onClick={vm.setBlockedDomains(domains)}){Text("حفظ المواقع")};Text("يعمل بمرشح DNS محلي أثناء جلسة صارمة. يحتاج إذن VPN؛ المواقع المسموحة تُرسل استفسارات DNS الخاصة بها إلى Cloudflare؛ المواقع المحجوبة لا تُرسل. Secure DNS أو VPN آخر قد يتجاوز الحجب.")}}
         item{GlassCard{Text("الخصوصية",style=MaterialTheme.typography.titleLarge);Text("بيانات الحياة والملاحظات محلية. رموز الدخول مشفرة بمفتاح الجهاز. لا يرسل التعاون محتوى الملاحظات أو المهام تلقائياً.")}}
-        item{GlassCard{Text("وضع التشغيل");Text("الأهداف والمشاريع والمهام والتقويم والعادات والملاحظات والمراجعات محلية. الحوار الحر يحتاج نموذجاً محلياً مثبتاً.");Text("إصدار 0.9.0 • قاعدة بيانات v7")}}
+        item{GlassCard{Text("وضع التشغيل");Text("الأهداف والمشاريع والمهام والتقويم والعادات والملاحظات والمراجعات محلية. الحوار الحر يحتاج نموذجاً محلياً مثبتاً.");Text("إصدار 0.9.1 • قاعدة بيانات v7")}}
     }
     if(projectionConfirm)AlertDialog(onDismissRequest={projectionConfirm=false},title={Text("تصدير سجل الحياة؟")},text={Text("الملف غير مشفر ويحتوي بياناتك الشخصية. اختر مكاناً خاصاً. لا يشمل بيانات الدخول أو الاقتراحات التنفيذية أو ملفات النماذج.")},confirmButton={TextButton(onClick={projectionConfirm=false;projection.launch("secretary-vault.zip")}) { Text("اختيار مكان وحفظ") }},dismissButton={TextButton(onClick={projectionConfirm=false}) { Text("إلغاء") }})
 
