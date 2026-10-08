@@ -1,0 +1,14 @@
+name: secretary-dev
+
+services:
+  verify:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: secretary-dev:local
+    init: true
+    environment:
+      LIFEOS_TEST_INSTANCE: "1"
+      PYTHONUNBUFFERED: "1"
+    # No vaults, OAuth credentials, host .env files or model sockets mounted.
+    command: ["python", "-m", "pytest", "-q", "-m", "unit and not slow"]

@@ -1,5 +1,9 @@
 # LifeOS
 
+## Docker backend development environment
+
+A Linux CPU container is available for Python backend dependency setup and isolated tests: `docker compose build verify` then `docker compose run --rm verify`. See [container development](docs/guides/container-development.md) for the current dependency-lock limitation, offline image transport, privacy boundaries and the separate Android toolchain requirement. This container is not an APK build environment or a verified production server.
+
 **Your personal operating system, built from the digital exhaust of your life.**
 
 ## Arabic and Android fork status
